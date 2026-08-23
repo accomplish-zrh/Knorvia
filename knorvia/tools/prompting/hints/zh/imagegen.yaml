@@ -1,0 +1,6 @@
+short_description: "通过视觉创作，用已分配的模型生成或修改图片。"
+when_to_use: "用户要生成、编辑、局部重绘、高清增强（1K/2K/4K），基于上一张结果继续改，套用三视图/套图，或把结果放到画布指定卡片时使用。优先出图，不要只用文字描述画面。不要为了补全参数先问一串问题。"
+input_format: "prompt，以及 operation=generate|edit|inpaint|enhance。可选 n、size、aspect_ratio、target_resolution、input_asset_ids、parent_job_id、board_node_id、iterate_from、template、list_board、confirmed。"
+guideline: "所有出图都走 imagegen，结果会进入当前对话的视觉创作画布。用户一句话就能出图：缺省比例、画质和数量用默认值，不要连环追问。新画面用 generate；用户附了参考图或要改上一张结果时用 edit（传入 input_asset_ids 或 parent_job_id）；有蒙版才用 inpaint；清晰度用 enhance。要把结果填进已有卡片时传 board_node_id；要从某张图继续改时传 iterate_from（节点 id 或 asset id）；要角色正侧背时 template=three-view（也可 product-set / picture-book）。需要看板上有哪些卡片时 list_board=true。只有缺少必要素材时才问一句。高消耗或多卡模板会暂停确认：用户选继续后再用相同参数再调一次；选取消则停止。不要编造 confirmed=true 参数。回复时用准确文件名，并说明已保存在视觉创作画布。"
+note: "不要编造模型。工具会选择已授权且能力匹配的视觉创作模型。工具失败时不要声称已经出图。"
+phase: "synthesis"

@@ -1,0 +1,8 @@
+short_description: "Personal library tree: markdown, CSV, HTML, Word, Excel, canvas, and uploaded files. No team spaces."
+when_to_use: "When the user wants to list, read, create, or update documents in the personal library — notes, pages, spreadsheets, Word files, or the library canvas."
+input_format: |
+  {"list": true}
+  {"read_id": "lib_entry_..."}
+  {"create_kind": "markdown|csv|html|word|excel|canvas|folder|text", "title": "...", "content": "...", "parent_id": "optional folder id"}
+  {"write_id": "lib_entry_...", "content": "...", "title": "optional rename"}
+guideline: "Default to list=true if you need ids. Create Word/Excel as real .docx/.xlsx via create_kind=word|excel. There are no team documents. Do not invent entry ids."

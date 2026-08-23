@@ -1,0 +1,61 @@
+{
+  "name": "knorvia-desktop",
+  "version": "1.8.0",
+  "private": true,
+  "description": "Knorvia AI learning and personal knowledge workspace",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "dist": "electron-builder --win nsis",
+    "test": "node --test tests/*.test.js"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.4.1",
+    "electron": "^39.0.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "ai.knorvia.desktop",
+    "productName": "Knorvia",
+    "asar": true,
+    "directories": {
+      "output": "../release"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "frontend-host.js",
+      "protocol-stream.js",
+      "package.json",
+      "build/icon.ico",
+      "build/logo.png"
+    ],
+    "extraResources": [
+      {
+        "from": "frontend-host.js",
+        "to": "desktop/frontend-host.js"
+      },
+      {
+        "from": "../dist/Knorvia-${version}-portable/runtime",
+        "to": "runtime"
+      }
+    ],
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        "nsis"
+      ]
+    },
+    "nsis": {
+      "artifactName": "Knorvia-${version}-setup.${ext}",
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true
+    }
+  },
+  "allowScripts": {
+    "electron@39.8.10": true,
+    "electron-winstaller@5.4.0": true
+  }
+}

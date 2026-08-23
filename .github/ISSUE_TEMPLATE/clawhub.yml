@@ -1,0 +1,78 @@
+name: ClawHub / Skill Registry
+description: Report an issue with ClawHub — the Knorvia skill registry (site, API, CLI, or a published skill)
+title: "[ClawHub]:"
+labels: ["clawhub", "triage"]
+
+body:
+  - type: markdown
+    attributes:
+      value: |
+        ClawHub is Knorvia's skill registry at https://clawhub.ai.
+        Use this template for the ClawHub web site, the ClawHub-compatible API, the `clawhub` CLI,
+        or a specific published skill. For bugs in the Knorvia app itself, use the Bug Report template.
+  - type: checkboxes
+    id: existingcheck
+    attributes:
+      label: Do you need to file an issue?
+      description: Please help us manage our time by avoiding duplicates with the steps below.
+      options:
+        - label: I have searched the existing issues and this is not already filed.
+        - label: I have read the usage guide at https://clawhub.ai/how-to-use
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      description: Which part of ClawHub is this about?
+      options:
+        - Web site (clawhub.ai)
+        - HTTP API (/api/v1)
+        - CLI (clawhub command)
+        - A published skill (install / content / metadata)
+        - Report a skill for removal (policy / copyright / security)
+        - Publishing a skill
+        - Other
+    validations:
+      required: true
+  - type: input
+    id: skill_slug
+    attributes:
+      label: Skill slug
+      description: If this is about a specific skill, its slug (e.g. socratic-tutor). Leave blank otherwise.
+      placeholder: socratic-tutor
+  - type: textarea
+    id: description
+    attributes:
+      label: Describe the issue
+      description: A clear and concise description of the problem.
+      placeholder: What happened? What did you expect to happen?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Steps to reproduce the behavior (if applicable).
+      placeholder: |
+        1. Run `clawhub install <slug>`
+        2. ...
+        3. See error
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs and screenshots
+      description: Paste the full command output or browser console errors.
+      render: shell
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: |
+        - clawhub CLI Version: run `clawhub --version` (CLI issues only)
+        - Operating System: e.g., macOS 14.0, Windows 11, Ubuntu 22.04
+        - Node.js Version: e.g., 20.x
+        - Registry: e.g., https://clawhub.ai
+      value: |
+        - clawhub CLI Version:
+        - Operating System:
+        - Node.js Version:
+        - Registry:

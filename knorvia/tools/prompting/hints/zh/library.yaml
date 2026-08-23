@@ -1,0 +1,8 @@
+short_description: "个人资料库：Markdown、CSV、HTML、Word、Excel、画布和上传文件。没有团队空间。"
+when_to_use: "用户要列出、阅读、新建或改资料库里的文档、页面、表格、Word 或画布时使用。"
+input_format: |
+  {"list": true}
+  {"read_id": "lib_entry_..."}
+  {"create_kind": "markdown|csv|html|word|excel|canvas|folder|text", "title": "...", "content": "...", "parent_id": "可选文件夹 id"}
+  {"write_id": "lib_entry_...", "content": "...", "title": "可选重命名"}
+guideline: "需要 id 时先 list=true。Word/Excel 用 create_kind=word|excel 写出真正的 .docx/.xlsx。没有团队文档。不要编造条目 id。"

@@ -1,0 +1,116 @@
+name: Docker Release
+
+# Triggered when a GitHub Release is published.
+# Builds a multi-platform Docker image and pushes it to GitHub Container Registry (GHCR).
+#
+# Image: ghcr.io/<repository-owner>/knorvia
+# Tags:
+#   - Version tag stripped of 'v' prefix (e.g. release v1.2.3 → image tag 1.2.3)
+#   - latest (stable releases only; never a prerelease)
+#
+# Platforms: linux/amd64, linux/arm64
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+  actions: read
+
+jobs:
+  build-and-push:
+    name: Build and Push Multi-Platform Docker Image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout release tag
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+
+      - name: Verify release tag and CI gate
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.release.tag_name }}"
+          if [[ "$tag" =~ ^v?([0-9]+\.[0-9]+\.[0-9]+)(-[A-Za-z0-9.-]+)?$ ]]; then
+            tag_base="${BASH_REMATCH[1]}"
+          else
+            echo "Release tag $tag is not a supported semantic version." >&2
+            exit 1
+          fi
+          source_version="$(sed -n 's/^__version__ = "\([^"]*\)"/\1/p' knorvia/__version__.py)"
+          if [ "$source_version" != "$tag_base" ]; then
+            echo "Release tag base $tag_base != source version $source_version." >&2
+            exit 1
+          fi
+          git fetch origin main:refs/remotes/origin/main --no-tags
+          sha="$(git rev-list -n 1 "$tag")"
+          if ! git merge-base --is-ancestor "$sha" origin/main; then
+            echo "Release tag $tag is not on origin/main; refusing Docker publish." >&2
+            exit 1
+          fi
+          workflow_id="$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows" \
+            --jq '.workflows[] | select(.path == ".github/workflows/tests.yml") | .id' | head -n1)"
+          [ -n "$workflow_id" ] || { echo "Tests workflow not found" >&2; exit 1; }
+          conclusion="$(gh api \
+            "repos/$GITHUB_REPOSITORY/actions/workflows/$workflow_id/runs?head_sha=$sha&status=completed&per_page=100" \
+            --jq '.workflow_runs | sort_by(.run_started_at) | reverse | .[0].conclusion // ""')"
+          if [ "$conclusion" != "success" ]; then
+            echo "Tests workflow for $sha is '$conclusion', not success; refusing Docker publish." >&2
+            exit 1
+          fi
+
+      - name: Resolve owner-scoped image name
+        id: image
+        shell: bash
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/knorvia" >> "$GITHUB_OUTPUT"
+
+      # Required for linux/arm64 cross-compilation on GitHub-hosted ubuntu runners
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      # Enable BuildKit with multi-platform build support
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Extract tags from the release:
+      #   type=semver strips the leading 'v' (v1.2.3 → 1.2.3)
+      #   type=raw adds latest only for a stable release
+      - name: Extract Docker metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.image.outputs.name }}
+          tags: |
+            type=semver,pattern={{version}}
+            type=raw,value=latest,enable=${{ github.event.release.prerelease == false }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: production
+          platforms: linux/amd64,linux/arm64
+          push: true
+          provenance: mode=max
+          sbom: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          # Use GitHub Actions cache to speed up repeated builds
+          # mode=max caches all intermediate layers (frontend-builder and python-base are expensive)
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

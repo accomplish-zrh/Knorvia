@@ -1,0 +1,8 @@
+cff-version: 1.2.0
+message: "If you use Knorvia, please cite the software and its version."
+title: "Knorvia"
+type: software
+authors:
+  - name: "Knorvia contributors"
+version: 1.8.0
+license: Apache-2.0

@@ -1,0 +1,6 @@
+short_description: "在本机安排定时 Agent 任务。"
+when_to_use: "用户要提醒或定时让这个 Agent 再跑一轮时使用。"
+input_format: |
+  {"action": "list"}
+  {"action": "create", "title": "...", "prompt": "...", "cron": "0 9 * * *"}
+guideline: "新建前先列出已有任务，避免重复。定时提示词要自成一体。不要编造任务 id。"
