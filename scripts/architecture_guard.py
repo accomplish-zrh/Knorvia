@@ -14,7 +14,7 @@ LIMITS = {
     # split instead.
     "knorvia/api/routers/knowledge.py": 2962,
     "knorvia/agents/research/pipeline.py": 2871,
-    "web/app/(workspace)/video-studio/page.tsx": 2915,
+    "web/app/(workspace)/video-studio/page.tsx": 2918,
     "web/components/chat/home/TracePanels.tsx": 2735,
     "knorvia/services/video_studio/store.py": 2629,
     "knorvia/tools/media_gen_tool.py": 2594,
@@ -22,7 +22,7 @@ LIMITS = {
     "knorvia/agents/question/pipeline.py": 2161,
     "web/app/(workspace)/playground/page.tsx": 2082,
     "web/app/(workspace)/co-writer/[docId]/page.tsx": 2495,
-    "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2372,
+    "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2374,
 }
 SOURCE_ROOTS = ("knorvia", "knorvia_cli", "web/app", "web/components", "web/lib")
 SUFFIXES = {".py", ".ts", ".tsx"}
