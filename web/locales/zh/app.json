@@ -3935,5 +3935,16 @@
   "Download all": "全部下载",
   "Immersive reading": "沉浸阅读",
   "Collapse panel": "收起面板",
-  "正在启动桌面 AI 引擎…": "正在启动桌面 AI 引擎…"
+  "正在启动桌面 AI 引擎…": "正在启动桌面 AI 引擎…",
+  "New group room": "新建群聊房间",
+  "Group name": "群组名称",
+  "Create room": "创建房间",
+  "Pick 2 to 6 partners; they take turns answering in the room.": "选择 2-6 个伙伴，它们将在房间里轮流回应你。",
+  "No group rooms yet.": "还没有群聊房间。",
+  "members": "个成员",
+  "No messages yet": "暂无消息",
+  "The partners are thinking…": "伙伴们正在思考…",
+  "Say something to the whole room…": "对整个房间说点什么…",
+  "Group rooms": "群聊房间",
+  "Put 2-6 partners in one room; they take turns coordinating on what you ask.": "把 2-6 个伙伴放进一个房间，它们会围绕你的问题接力协作。"
 }

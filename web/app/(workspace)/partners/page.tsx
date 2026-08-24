@@ -20,6 +20,7 @@ import {
 import { useAuthStatus } from "@/hooks/useAuthStatus";
 import ChannelIcon from "@/components/partners/ChannelIcon";
 import PartnerAvatar from "@/components/partners/PartnerAvatar";
+import GroupRooms from "@/components/partners/GroupRooms";
 
 function channelNames(partner: PartnerInfo): string[] {
   if (Array.isArray(partner.channels)) {
@@ -262,6 +263,20 @@ export default function PartnersPage() {
           })}
         </div>
       )}
+
+      {isAdmin ? (
+        <section className="mt-8 border-t border-[var(--border)]/60 pt-6">
+          <h2 className="mb-1 text-[15px] font-semibold tracking-tight text-[var(--foreground)]">
+            {t("Group rooms")}
+          </h2>
+          <p className="mb-4 text-[12px] text-[var(--muted-foreground)]">
+            {t(
+              "Put 2-6 partners in one room; they take turns coordinating on what you ask.",
+            )}
+          </p>
+          <GroupRooms />
+        </section>
+      ) : null}
     </div>
   );
 }
