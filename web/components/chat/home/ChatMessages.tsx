@@ -54,6 +54,7 @@ import type { SpaceMemoryFile } from '@/lib/space-items'
 import { AskUserOptions, extractAskUserPayload, extractMessageSegments } from './AskUserOptions'
 import ContextReferenceTree, { type ContextTreeItem } from './ContextReferenceTree'
 import { AssistantActivity } from './TracePanels'
+import CitationCards, { extractRagCitations } from './CitationCards'
 import { agentGlyph } from '@/components/agents/agent-icons'
 import { useConnectedAgentKinds } from '@/hooks/useConnectedAgentKinds'
 
@@ -329,6 +330,9 @@ const AssistantMessage = memo(function AssistantMessage({
     [msg.events]
   )
 
+  // KB citations for grounded answers: pulled from rag tool_result metadata.
+  const citations = useMemo(() => extractRagCitations(events), [events])
+
   const outlinePreview = useMemo(() => {
     if (msg.capability !== 'deep_research' || !resultEvent) return null
     const meta = resultEvent.metadata as Record<string, unknown> | undefined
@@ -508,6 +512,7 @@ const AssistantMessage = memo(function AssistantMessage({
           }}
         />
       ) : null}
+      {citations.length > 0 ? <CitationCards citations={citations} /> : null}
     </>
   )
 })

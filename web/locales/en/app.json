@@ -3909,5 +3909,11 @@
   "Pin": "Pin",
   "Archive": "Archive",
   "Unarchive": "Unarchive",
-  "title": "title"
+  "title": "title",
+  "page": "page",
+  "Full chunk stored in the knowledge base.": "Full chunk stored in the knowledge base.",
+  "Retrieval test": "Retrieval test",
+  "Run a query through the same pipeline chat uses and see exactly which chunks come back.": "Run a query through the same pipeline chat uses and see exactly which chunks come back.",
+  "Test query…": "Test query…",
+  "top-k": "top-k"
 }

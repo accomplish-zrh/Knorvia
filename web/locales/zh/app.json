@@ -3909,5 +3909,11 @@
   "Pin": "置顶",
   "Archive": "归档",
   "Unarchive": "取消归档",
-  "title": "标题"
+  "title": "标题",
+  "page": "页",
+  "Full chunk stored in the knowledge base.": "完整片段已存于知识库。",
+  "Retrieval test": "检索测试",
+  "Run a query through the same pipeline chat uses and see exactly which chunks come back.": "用与聊天完全相同的检索管道试一条查询，看看究竟会召回哪些片段。",
+  "Test query…": "输入测试查询…",
+  "top-k": "top-k"
 }

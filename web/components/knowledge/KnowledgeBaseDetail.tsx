@@ -6,6 +6,7 @@ import {
   ArrowLeft,
   Database,
   FileText,
+  FlaskConical,
   Layers,
   Loader2,
   RefreshCw,
@@ -26,8 +27,14 @@ import KbFilesTab from "./KbFilesTab";
 import KbDocumentsSection from "./KbDocumentsSection";
 import KbIndexVersionsSection from "./KbIndexVersionsSection";
 import KbSettingsSection from "./KbSettingsSection";
+import RetrievalPlayground from "./RetrievalPlayground";
 
-type DetailSection = "files" | "add" | "versions" | "settings";
+type DetailSection =
+  | "files"
+  | "add"
+  | "test"
+  | "versions"
+  | "settings";
 
 interface KnowledgeBaseDetailProps {
   kb: KnowledgeBase | null;
@@ -51,6 +58,7 @@ const SECTIONS: {
 }[] = [
   { key: "files", label: "Files", Icon: FileText },
   { key: "add", label: "Add documents", Icon: Upload },
+  { key: "test", label: "Retrieval test", Icon: FlaskConical },
   { key: "versions", label: "Index versions", Icon: Layers },
   { key: "settings", label: "Settings", Icon: SettingsIcon },
 ];
@@ -253,7 +261,11 @@ export default function KnowledgeBaseDetail({
                   }
                 />
               )}
-              {section === "settings" && (
+              {section === "test" ? (
+            <div className="mx-auto max-w-3xl px-6 py-6">
+              <RetrievalPlayground kbName={kb.name} />
+            </div>
+          ) : section === "settings" && (
                 <KbSettingsSection
                   kb={kb}
                   onSetDefault={() =>
