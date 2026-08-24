@@ -16,7 +16,16 @@ LIMITS = {
     "knorvia/agents/research/pipeline.py": 2871,
     "web/app/(workspace)/video-studio/page.tsx": 2918,
     "web/components/chat/home/TracePanels.tsx": 2735,
-    "knorvia/services/video_studio/store.py": 2629,
+    # Decomposition progress (staged per ARCHITECTURE.md):
+    # - video_studio/store.py split 2026-08 into store_base + three domain
+    #   mixins (_store_storyboard_board/_uploads_assets/_jobs); facade now
+    #   ~590 lines, largest part 723. Budget kept for history until the
+    #   file is deleted from LIMITS entirely (default 2000 then applies).
+    "knorvia/services/video_studio/store.py": 2000,
+    "knorvia/services/video_studio/_store_storyboard_board.py": 2000,
+    "knorvia/services/video_studio/_store_uploads_assets.py": 2000,
+    "knorvia/services/video_studio/_store_jobs.py": 2000,
+    "knorvia/services/video_studio/store_base.py": 2000,
     "knorvia/tools/media_gen_tool.py": 2594,
     "knorvia/services/session/turn_runtime.py": 2212,
     "knorvia/agents/question/pipeline.py": 2161,

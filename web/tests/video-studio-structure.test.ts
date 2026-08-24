@@ -93,8 +93,9 @@ test('agent video tasks deep-link into and focus the exact persisted job', () =>
 })
 
 test('canvas workbench: persisted view toggle, board CAS save chain, node jobs', () => {
-  // §5.2 view toggle persisted under its own storage key
-  assert.match(pageSource, /knorvia\.video-studio\.view/)
+  // §5.2 view toggle persisted under its own storage key (key defined in
+  // lib/video-studio/page-helpers.ts, imported by the page)
+  assert.match(pageSource, /VIDEO_VIEW_STORAGE_KEY/)
   assert.match(pageSource, /changeViewMode\('board'\)/)
   assert.match(pageSource, /changeViewMode\('storyboard'\)/)
   assert.match(pageSource, /changeViewMode\('production'\)/)

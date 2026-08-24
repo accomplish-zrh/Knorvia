@@ -9,6 +9,16 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- **Staged decomposition milestone**: `video_studio/store.py` (2629 lines,
+  the largest Python module) split into a leaf constants/helpers module
+  (`store_base.py`) plus three domain mixins — storyboard/characters/board
+  (`_store_storyboard_board.py`), uploads/assets (`_store_uploads_assets.py`)
+  and job lifecycle (`_store_jobs.py`). The facade keeps projects, sessions,
+  director desk and production; all existing imports and monkeypatch seams
+  keep working (quota constant stays late-bound via the facade).
+- Video-studio page pure helpers (storage key, template labels, default
+  settings, replaceJob/validationLabel/isAbort) extracted to
+  `lib/video-studio/page-helpers.ts`; page component unchanged otherwise.
 - Session store (chat history SQLite) now runs with `journal_mode=WAL`,
   `busy_timeout=30000` and `synchronous=NORMAL` — the standard trio for
   concurrent read/write desktop databases. Reads no longer block while a
