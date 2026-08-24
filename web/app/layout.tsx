@@ -3,6 +3,7 @@ import { Geist, Lora } from "next/font/google";
 import "./globals.css";
 import ThemeScript from "@/components/ThemeScript";
 import ToastViewport from "@/components/common/ToastViewport";
+import BootSplash from "@/components/common/BootSplash";
 import { AppShellProvider } from "@/context/AppShellContext";
 import { I18nClientBridge } from "@/i18n/I18nClientBridge";
 
@@ -52,6 +53,7 @@ export default function RootLayout({
         suppressHydrationWarning
       >
         <AppShellProvider>
+          <BootSplash />
           <I18nClientBridge>{children}</I18nClientBridge>
           <ToastViewport />
         </AppShellProvider>
