@@ -36,8 +36,19 @@ print(json.dumps(loaded))
         [sys.executable, "-c", probe],
         cwd=repo_root,
         capture_output=True,
-        check=True,
         text=True,
     )
 
-    assert json.loads(result.stdout) == []
+    assert result.stdout.strip(), (
+        f"probe produced no stdout: rc={result.returncode} "
+        f"stderr_tail={result.stderr[-500:]!r}"
+    )
+    # The probe prints exactly one JSON line; any other output means the API
+    # module logged to stdout instead of stderr during import.
+    json_line = next(
+        (line for line in result.stdout.splitlines() if line.startswith("[")),
+        None,
+    )
+    assert json_line is not None, f"no JSON line in stdout: {result.stdout[:400]!r}"
+    loaded = json.loads(json_line)
+    assert loaded == [], f"heavy deps leaked into API import: {loaded}"

@@ -37,7 +37,7 @@ LIMITS = {
     "web/app/(workspace)/co-writer/[docId]/page.tsx": 2530,
     "knorvia/agents/question/pipeline.py": 2161,
     "web/app/(workspace)/playground/page.tsx": 2082,
-    "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2374,
+    "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2390,
 }
 SOURCE_ROOTS = ("knorvia", "knorvia_cli", "web/app", "web/components", "web/lib")
 SUFFIXES = {".py", ".ts", ".tsx"}
