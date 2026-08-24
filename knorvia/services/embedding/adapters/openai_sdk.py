@@ -10,8 +10,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Dict
 
-from openai import APIConnectionError, APIError, APIStatusError, AsyncOpenAI
-
 from knorvia.services.llm.openai_http_client import openai_client_kwargs
 
 from .base import (
@@ -22,6 +20,43 @@ from .base import (
 )
 
 logger = logging.getLogger(__name__)
+
+# The openai SDK costs >1s of import time but is only needed when this legacy
+# adapter actually serves an embedding request. Keep it out of server startup:
+# attributes are resolved lazily via module __getattr__, and _build_client
+# prefers an explicit module-level override so tests can still stub
+# ``openai_sdk.AsyncOpenAI`` with monkeypatch.
+_LAZY_SDK_ATTRS = frozenset(
+    {"AsyncOpenAI", "APIConnectionError", "APIError", "APIStatusError"}
+)
+
+
+def __getattr__(name: str):
+    if name in _LAZY_SDK_ATTRS:
+        from openai import (
+            APIConnectionError,
+            APIError,
+            APIStatusError,
+            AsyncOpenAI,
+        )
+
+        return {
+            "AsyncOpenAI": AsyncOpenAI,
+            "APIConnectionError": APIConnectionError,
+            "APIError": APIError,
+            "APIStatusError": APIStatusError,
+        }[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _resolve_async_openai():
+    """Module-level override (test stubs) wins over the deferred SDK import."""
+    override = globals().get("AsyncOpenAI")
+    if override is not None:
+        return override
+    from openai import AsyncOpenAI
+
+    return AsyncOpenAI
 
 
 class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
@@ -46,10 +81,11 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
             return True
         return False
 
-    def _build_client(self) -> AsyncOpenAI:
+    def _build_client(self):
+        client_cls = _resolve_async_openai()
         # OpenRouter / custom gateways often don't validate the key, but the
         # SDK refuses to construct without one. Use a placeholder when empty.
-        return AsyncOpenAI(
+        return client_cls(
             api_key=self.api_key or "sk-no-key-required",
             base_url=self.base_url,
             timeout=max(self.request_timeout, 60),
@@ -83,6 +119,9 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
             kwargs["dimensions"] = dim_value
 
         client = self._build_client()
+        # Error types come from the same deferred SDK import as the client;
+        # fetch them lazily so module import stays SDK-free.
+        from openai import APIConnectionError, APIError, APIStatusError
         try:
             response = await client.embeddings.create(**kwargs)
         except APIStatusError as exc:

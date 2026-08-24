@@ -117,6 +117,10 @@ const nextConfig = {
   // silently truncated when they pass through the proxy.
   experimental: {
     proxyClientMaxBodySize: 210 * 1024 * 1024,
+    // Per-module import optimization: tree-shake barrel files so only the
+    // icons/components actually referenced land in client bundles
+    // (lucide-react is imported across ~170 files).
+    optimizePackageImports: ["lucide-react", "react-i18next"],
   },
 
   // Move dev indicator to bottom-right corner

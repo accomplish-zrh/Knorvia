@@ -432,8 +432,14 @@ class SQLiteSessionStore:
         # transaction semantics and deterministic close. The inner `with conn`
         # commits on clean exit and rolls back on exception, so call sites do
         # NOT need an explicit conn.commit() (any remaining ones are no-ops).
-        conn = sqlite3.connect(self.db_path)
+        conn = sqlite3.connect(self.db_path, timeout=30)
         conn.row_factory = sqlite3.Row
+        # WAL keeps reads flowing while a write is in flight (chat polling
+        # during a save); busy_timeout makes concurrent writers queue instead
+        # of failing; NORMAL is the recommended fsync level under WAL.
+        conn.execute("PRAGMA journal_mode = WAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA synchronous = NORMAL")
         conn.execute("PRAGMA foreign_keys = ON")
         try:
             with conn:

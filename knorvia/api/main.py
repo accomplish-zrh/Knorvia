@@ -4,6 +4,7 @@ import sys
 
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from knorvia.logging import configure_logging
 from knorvia.services.config import (
@@ -311,6 +312,11 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# GZip for large JSON payloads (session lists, KB listings, tool catalogs).
+# Level 1 keeps CPU cost negligible while still shrinking text responses ~5x;
+# small responses are left untouched via minimum_size.
+app.add_middleware(GZipMiddleware, minimum_size=1024, compresslevel=1)
 
 # Initialize user directories on startup
 try:

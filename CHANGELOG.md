@@ -7,6 +7,28 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Performance
+
+- Session store (chat history SQLite) now runs with `journal_mode=WAL`,
+  `busy_timeout=30000` and `synchronous=NORMAL` — the standard trio for
+  concurrent read/write desktop databases. Reads no longer block while a
+  turn is being saved; writers queue instead of erroring under contention.
+- Memory snapshot readers open the chat-history DB with `immutable=1` so
+  point-in-time scans never take shared locks against the writer.
+- API responses larger than 1 KB are GZip-compressed (level 1) when the
+  client sends `Accept-Encoding: gzip`; measured 8.3x smaller on the
+  OpenAPI document and applies to session/KB/tool catalog JSON payloads.
+- Deferred the `openai` SDK import out of server startup
+  (`core/agentic/client.py`, legacy `openai_sdk` embedding adapter):
+  `import knorvia.api.main` drops from ~5.1s to ~1.9s and no longer loads
+  the SDK until the first LLM/embedding client is constructed. The adapter
+  keeps module-level attribute stubs so existing monkeypatch tests pass.
+- Frontend: enabled `optimizePackageImports` for `lucide-react` and
+  `react-i18next` in `next.config.js`, tree-shaking barrel imports across
+  ~170 files at build time.
+- Renamed the video-studio content route handler to
+  `video_asset_content` to remove a duplicate OpenAPI operation ID.
+
 ### Changed
 
 - Architecture size budgets re-pinned for `knorvia/services/video_studio/store.py`

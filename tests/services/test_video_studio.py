@@ -91,7 +91,7 @@ async def test_user_contexts_resolve_isolated_video_stores_and_block_idor(tmp_pa
         assert bob_store.get_asset(asset["id"]) is None
         assert bob_store.get_job(job["id"]) is None
         for request_call in (
-            lambda: router.asset_content(
+            lambda: router.video_asset_content(
                 asset["id"], Request({"type": "http", "method": "GET", "path": "/", "headers": []})
             ),
             lambda: router.export_project(project["id"]),
@@ -1855,14 +1855,14 @@ async def test_range_endpoint_get_head_and_416(
         headers = [] if range_value is None else [(b"range", range_value.encode())]
         return Request({"type": "http", "method": method, "path": "/", "headers": headers})
 
-    partial = await router.asset_content(asset["id"], request("GET", "bytes=4-11"))
+    partial = await router.video_asset_content(asset["id"], request("GET", "bytes=4-11"))
     assert partial.status_code == 206
     assert partial.headers["content-range"] == f"bytes 4-11/{len(MP4)}"
     assert b"".join([chunk async for chunk in partial.body_iterator]) == MP4[4:12]
-    head = await router.asset_content(asset["id"], request("HEAD"))
+    head = await router.video_asset_content(asset["id"], request("HEAD"))
     assert head.status_code == 200
     assert head.headers["accept-ranges"] == "bytes"
     assert head.headers["content-length"] == str(len(MP4))
-    invalid = await router.asset_content(asset["id"], request("GET", "bytes=9999-"))
+    invalid = await router.video_asset_content(asset["id"], request("GET", "bytes=9999-"))
     assert invalid.status_code == 416
     assert invalid.headers["content-range"] == f"bytes */{len(MP4)}"

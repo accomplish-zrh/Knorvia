@@ -20,7 +20,6 @@ from types import SimpleNamespace
 from typing import Any
 
 import httpx
-from openai import AsyncAzureOpenAI, AsyncOpenAI
 
 from knorvia.services.config import load_system_settings
 from knorvia.services.llm import get_token_limit_kwargs, supports_tools
@@ -91,6 +90,11 @@ def _build_openai_client(config: LLMClientConfig, *, disable_ssl_verify: bool) -
     http_client = None
     if disable_ssl_verify:
         http_client = httpx.AsyncClient(verify=False)  # nosec B501
+    # Deferred import: the openai SDK costs >1s of import time and is only
+    # needed when an LLM client is actually constructed (first chat turn),
+    # not at module-import / server-startup time.
+    from openai import AsyncAzureOpenAI, AsyncOpenAI
+
     if config.binding == "azure_openai" or (config.binding == "openai" and config.api_version):
         return AsyncAzureOpenAI(
             api_key=config.api_key or "sk-no-key-required",

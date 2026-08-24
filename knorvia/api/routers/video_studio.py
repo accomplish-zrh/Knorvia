@@ -1084,7 +1084,7 @@ def _file_chunks(path: Path, start: int, end: int):
 
 
 @router.api_route("/assets/{asset_id}/content", methods=["GET", "HEAD"])
-async def asset_content(asset_id: str, request: Request) -> Response:
+async def video_asset_content(asset_id: str, request: Request) -> Response:
     store = get_video_studio_store()
     asset = store.get_asset(asset_id)
     if not asset:
