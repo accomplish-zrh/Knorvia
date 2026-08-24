@@ -36,7 +36,7 @@ WAV = b"RIFF\x10\x00\x00\x00WAVEfmt " + b"\x00" * 16
 KLING_BASE = "https://api.klingai.test"
 WAN_BASE = "https://dashscope.test/api/v1"
 HAILUO_BASE = "https://api.minimax.test/v1"
-AK, SK = "kling-ak", "kling-sk"
+AK, SK = "kling-ak", "kling-signing-secret-key-at-least-32-bytes"
 
 
 class Recorder:

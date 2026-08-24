@@ -40,7 +40,12 @@ if (!fs.existsSync(enRoot) || !fs.existsSync(zhRoot)) {
   process.exit(2);
 }
 
-const enFiles = listJsonFiles(enRoot).map((p) => toRel(p, enRoot)).sort();
+const enFiles = listJsonFiles(enRoot)
+  .map((p) => toRel(p, enRoot))
+  // app.overrides.json is a build artifact of build_en_overrides.mjs (the
+  // non-identity subset of en/app.json); parity is enforced on en/app.json.
+  .filter((f) => f !== "app.overrides.json")
+  .sort();
 const zhFiles = listJsonFiles(zhRoot).map((p) => toRel(p, zhRoot)).sort();
 
 const missingInZh = enFiles.filter((f) => !zhFiles.includes(f));

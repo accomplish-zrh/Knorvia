@@ -612,6 +612,10 @@ class TestDispatchFrame:
             await ch._dispatch_frame('{"post_type": "message", "self_id": 999}')
         assert ch._self_id == 999
         mock_bg.assert_called_once()
+        # The handler is passed as a zero-arg factory (lazy); invoking it here
+        # and closing the coroutine proves no real work was scheduled inline.
+        coro = mock_bg.call_args[0][0]()
+        coro.close()
 
     @pytest.mark.asyncio
     async def test_non_json_frame_dropped(self):

@@ -44,7 +44,10 @@ def _coerce_float(value: Any, default: float) -> float:
 
 
 @dataclass
-class TestRun:
+class TestRun:  # noqa: N801 - domain name, not a pytest test class
+    # pytest collects any class matching Test* inside collected modules;
+    # this is a domain dataclass, not a container of test_ methods.
+    __test__ = False
     id: str
     service: str
     status: str = "running"

@@ -854,7 +854,19 @@ class BookEngine:
         bstream = runtime.stream or BookStream(StreamBus())
         while True:
             try:
-                page_id = await asyncio.wait_for(runtime.queue.get(), timeout=2.0)
+                # Wrap the get() in a task so a timeout cancel is explicitly
+                # awaited below; otherwise the unstarted coroutine would be
+                # garbage-collected and emit "never awaited" RuntimeWarnings.
+                getter = asyncio.ensure_future(runtime.queue.get())
+                try:
+                    page_id = await asyncio.wait_for(getter, timeout=2.0)
+                except asyncio.TimeoutError:
+                    getter.cancel()
+                    try:
+                        await getter
+                    except asyncio.CancelledError:
+                        pass
+                    raise
             except asyncio.TimeoutError:
                 async with runtime.lock:
                     if runtime.queue.empty():

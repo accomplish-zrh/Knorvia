@@ -15,7 +15,7 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Callable, Literal
 import uuid
 
 import aiohttp
@@ -208,13 +208,24 @@ class NapcatChannel(BaseChannel):
                 pass
 
         post_type = payload.get("post_type")
+        # Pass a coroutine FACTORY, not a coroutine object: building the
+        # coroutine eagerly would leak an un-awaited coroutine whenever the
+        # background-task helper is stubbed out (tests) or the payload turns
+        # out to be a duplicate.
+        handler: Any | None = None
         if post_type == "message":
-            self._create_background_task(self._on_message(payload), "message")
+            handler = self._on_message
         elif post_type == "notice":
-            self._create_background_task(self._on_notice(payload), "notice")
+            handler = self._on_notice
+        if handler is not None:
+            # Zero-arg factory keeps coroutine creation lazy: nothing is built
+            # when this method is stubbed out in tests, so no un-awaited
+            # coroutine can ever leak into the GC.
+            self._create_background_task(lambda: handler(payload), post_type)
 
-    def _create_background_task(self, coro: Any, kind: str) -> None:
-        task = asyncio.create_task(coro)
+    def _create_background_task(self, make_coro: Callable[[], Any], kind: str) -> None:
+        """Schedule a background task from a zero-arg coroutine factory."""
+        task = asyncio.create_task(make_coro())
         self._background_tasks.add(task)
 
         def _done(done: asyncio.Task[None]) -> None:

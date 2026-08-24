@@ -675,7 +675,7 @@ async def upload_avatar(
     data = await file.read(_AVATAR_MAX_BYTES + 1)
     if len(data) > _AVATAR_MAX_BYTES:
         raise HTTPException(
-            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+            status_code=status.HTTP_413_CONTENT_TOO_LARGE,
             detail="Avatar image is too large (max 1 MB).",
         )
     ext = _sniff_image(data)

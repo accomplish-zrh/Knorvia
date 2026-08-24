@@ -9,6 +9,15 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Performance
 
+- **Root shell budget fixed (FAIL → OK, 309 KB → 95 KB)**: the English
+  locale (`locales/en/app.json`, 248 KB / 3904 keys) was statically bundled
+  into the root layout even though it is a key==value identity map.
+  `i18n/init.ts` now registers only the 357-key non-identity overrides file
+  plus `parseMissingKeyHandler: (key) => key`, so English renders exactly as
+  before without shipping the full map. `npm run build` regenerates the
+  overrides via `scripts/build_en_overrides.mjs`; i18n parity still enforces
+  en/app.json ↔ zh/app.json key equality. Every route's first-load JS drops
+  by the same ~215 KB because the root shell is shared.
 - **Staged decomposition milestone**: `video_studio/store.py` (2629 lines,
   the largest Python module) split into a leaf constants/helpers module
   (`store_base.py`) plus three domain mixins — storyboard/characters/board
@@ -51,6 +60,25 @@ and versioning follows [Semantic Versioning](https://semver.org/).
   comments; growth is now blocked at the new pins.)
 - Frontend CI lint threshold tightened from `--max-warnings 44` to
   `--max-warnings 0`; all pre-existing ESLint warnings were fixed.
+
+### Fixed
+
+- Test suite warnings reduced 17 → 0:
+  - `tests/**` gained `__init__.py` files, fixing intermittent
+    "import file mismatch" collection errors from duplicate test basenames
+    (test_catalog/test_context/test_oauth/... in different folders).
+  - `napcat.py` background dispatch now passes a zero-arg coroutine factory
+    instead of a ready coroutine, so stubbed spawns never leak un-awaited
+    coroutines (RuntimeWarning).
+  - `book/engine.py` worker loop awaits its cancelled `Queue.get` task
+    explicitly on timeout (no more "coroutine never awaited").
+  - `status.HTTP_413_REQUEST_ENTITY_TOO_LARGE` → `HTTP_413_CONTENT_TOO_LARGE`
+    (Starlette deprecation) in auth and voice routers.
+  - `TestRun` / `TestResponse` set `__test__ = False` so pytest stops trying
+    to collect domain classes as test classes.
+  - Kling adapter tests use a ≥32-byte HS256 sample key
+    (InsecureKeyLengthWarning); dev venv installs `httpx2` per the Starlette
+    testclient deprecation notice.
 
 ## [1.8.0] — the Video Workbench Parity release
 

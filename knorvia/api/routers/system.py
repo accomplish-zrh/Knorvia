@@ -25,6 +25,8 @@ router = APIRouter()
 
 
 class TestResponse(BaseModel):
+    """Pydantic model for connectivity tests (not a pytest test class)."""
+    __test__ = False
     success: bool
     message: str
     model: str | None = None
