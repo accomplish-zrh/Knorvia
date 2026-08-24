@@ -23,6 +23,7 @@ from knorvia.tools.partner_memory import (
     PartnerReadTool,
     PartnerSearchTool,
 )
+from knorvia.tools.partner_message import PartnerMessageTool
 from knorvia.tools.prompting import load_prompt_hints
 
 logger = logging.getLogger(__name__)
@@ -1613,6 +1614,9 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     PartnerReadTool,
     PartnerMemorizeTool,
     PartnerSearchTool,
+    # Bot-to-bot DM (Hermes bot-mode parity): a partner can message another
+    # partner; delivery lands in the target's own session via its runner.
+    PartnerMessageTool,
 )
 
 # No tools are parked right now. When a tool's implementation is being

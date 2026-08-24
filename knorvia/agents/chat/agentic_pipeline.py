@@ -1041,6 +1041,14 @@ class AgenticChatPipeline:
             # written in the turn's language. Injected server-side; the tool
             # exposes no ``language`` parameter for the model to get wrong.
             kwargs["language"] = context.language or "en"
+        elif tool_name == "send_partner_message":
+            # Bot-to-bot DM: stamp the sender's identity server-side so the
+            # receiving side can attribute the message and self-send is
+            # blocked. Partner session ids are "partner:<id>:<key>".
+            if context.session_id.startswith("partner:"):
+                sender_id = context.session_id.split(":", 2)[1]
+                kwargs["_sender_partner_id"] = sender_id
+                kwargs["_sender_name"] = getattr(context, "partner_name", "") or ""
         elif tool_name == "load_tools":
             kwargs["_tool_loader"] = self._deferred_loader
         elif tool_name == "exec":

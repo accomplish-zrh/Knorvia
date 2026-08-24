@@ -28,6 +28,7 @@ PARTNER_BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "partner_read",
     "partner_memorize",
     "partner_search",
+    "send_partner_message",
 )
 
 _SNIPPET_WIDTH = 140
