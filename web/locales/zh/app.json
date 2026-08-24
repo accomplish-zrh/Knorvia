@@ -3915,5 +3915,14 @@
   "Retrieval test": "检索测试",
   "Run a query through the same pipeline chat uses and see exactly which chunks come back.": "用与聊天完全相同的检索管道试一条查询，看看究竟会召回哪些片段。",
   "Test query…": "输入测试查询…",
-  "top-k": "top-k"
+  "top-k": "top-k",
+  "Search sessions and jump to anything…": "搜索会话，或跳转到任意页面…",
+  "Go to": "前往",
+  "Sessions": "会话",
+  "Esc": "Esc",
+  "navigate": "选择",
+  "open": "打开",
+  "Chat history": "聊天历史",
+  "Reuse parameters": "复用参数",
+  "Parameters restored from a previous generation.": "已恢复此前生成的参数。"
 }

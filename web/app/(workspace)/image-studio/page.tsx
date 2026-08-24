@@ -1065,6 +1065,24 @@ export default function ImageStudioPage() {
     if (mode === 'enhance' && resolution === 'native') setResolution('2K')
   }
 
+  // Parameter replay: restore a job's prompt + requested params into the
+  // composer so the user can tweak-and-rerun any past generation.
+  function reuseJobParams(job: StudioJob) {
+    const requested = (job.requested_params || {}) as Record<string, unknown>
+    if (job.prompt) setPrompt(job.prompt)
+    const size = requested.size || requested.image_size
+    if (typeof size === 'string' && size) setSize(size)
+    if (typeof requested.quality === 'string') setQuality(requested.quality)
+    if (typeof requested.style === 'string') setStyle(requested.style)
+    if (typeof requested.output_format === 'string') setOutputFormat(requested.output_format)
+    if (typeof job.profile_id === 'string' && typeof job.model_id === 'string' && job.model_id) {
+      const key = `${job.profile_id}:${job.model_id}`
+      if (models.some(model => studioModelKey(model) === key)) setModelKey(key)
+    }
+    setUiMode('create')
+    setMessage(t('Parameters restored from a previous generation.'))
+  }
+
   function varyFromAsset(assetId: string) {
     const parent = jobs.find(job => (job.outputs || []).some(output => output.asset_id === assetId))
     const nextPrompt = parent?.prompt || prompt
@@ -1375,6 +1393,7 @@ export default function ImageStudioPage() {
                   onSelect={setSelectedAssetId}
                   onEdit={id => enterFromAsset(id, 'edit')}
                   onVary={varyFromAsset}
+                  onReuseParams={reuseJobParams}
                   onReference={id => addAsReference(id, 'subject')}
                   onCanvas={id => enterFromAsset(id, 'canvas')}
                   onEnhance={id => enterFromAsset(id, 'enhance')}

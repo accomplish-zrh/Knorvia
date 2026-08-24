@@ -30,6 +30,7 @@ export function StudioResultGrid({
   onFavorite,
   onDelete,
   onRetry,
+  onReuseParams,
   modelName,
 }: {
   assets: StudioAsset[]
@@ -44,6 +45,8 @@ export function StudioResultGrid({
   onFavorite: (asset: StudioAsset) => void
   onDelete: (assetId: string) => void
   onRetry: (jobId: string) => void
+  /** Restore this job's prompt + requested params into the composer. */
+  onReuseParams: (job: StudioJob) => void
   modelName: (job: StudioJob) => string
 }) {
   const { t } = useTranslation()
@@ -136,6 +139,17 @@ export function StudioResultGrid({
                 />
                 {openMore === asset.id ? (
                   <div className="absolute top-full right-0 z-10 mt-1 w-36 overflow-hidden rounded-xl border border-[var(--border)] bg-[var(--popover)] py-1 shadow-lg">
+                    <button
+                      type="button"
+                      disabled={!job}
+                      onClick={() => {
+                        if (job) onReuseParams(job)
+                        setOpenMore(null)
+                      }}
+                      className="block w-full rounded-lg px-2 py-1.5 text-left text-[11px] hover:bg-[var(--muted)] disabled:opacity-40"
+                    >
+                      {t('Reuse parameters')}
+                    </button>
                     <button
                       type="button"
                       onClick={() => {

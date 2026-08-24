@@ -13,6 +13,9 @@ import { usePathname } from "next/navigation";
 import { Menu } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useDevice } from "@/hooks/useDevice";
+import CommandPalette, {
+  useCommandPaletteHotkey,
+} from "@/components/common/CommandPalette"
 import type { ReactNode } from "react";
 
 /* Lets the sidebar dismiss the drawer after a nav click without every layout
@@ -52,6 +55,8 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
   const pathname = usePathname();
   const { isMobile } = useDevice();
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  useCommandPaletteHotkey(useCallback(() => setPaletteOpen(true), []));
 
   const close = useCallback(() => setDrawerOpen(false), []);
 
@@ -126,6 +131,7 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
 
           <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
         </main>
+        <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
       </div>
     </SidebarDrawerContext.Provider>
   );

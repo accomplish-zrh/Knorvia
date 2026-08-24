@@ -3915,5 +3915,14 @@
   "Retrieval test": "Retrieval test",
   "Run a query through the same pipeline chat uses and see exactly which chunks come back.": "Run a query through the same pipeline chat uses and see exactly which chunks come back.",
   "Test query…": "Test query…",
-  "top-k": "top-k"
+  "top-k": "top-k",
+  "Search sessions and jump to anything…": "Search sessions and jump to anything…",
+  "Go to": "Go to",
+  "Sessions": "Sessions",
+  "Esc": "Esc",
+  "navigate": "navigate",
+  "open": "open",
+  "Chat history": "Chat history",
+  "Reuse parameters": "Reuse parameters",
+  "Parameters restored from a previous generation.": "Parameters restored from a previous generation."
 }
