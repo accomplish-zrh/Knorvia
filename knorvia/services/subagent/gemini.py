@@ -29,6 +29,7 @@ from typing import Any
 
 from knorvia.services.subagent.base import OnEvent, SubagentBackend
 from knorvia.services.subagent.config import BackendConfig
+from knorvia.services.subagent.detect_fallback import enhanced_detail
 from knorvia.services.subagent.process import probe_version, stream_process_lines
 from knorvia.services.subagent.types import (
     EVENT_ERROR,
@@ -78,12 +79,18 @@ class GeminiBackend(SubagentBackend):
 
     async def detect(self) -> DetectResult:
         ok, text = await probe_version([self.cli_command, "--version"])
+        ok, detail = enhanced_detail(
+            self.cli_command,
+            lambda: "gemini CLI not found on PATH",
+            ok,
+            text,
+        )
         return DetectResult(
             kind=self.kind,
             display_name=self.display_name,
             available=ok,
             version=text if ok else "",
-            detail="" if ok else (text or "gemini CLI not found on PATH"),
+            detail=detail,
         )
 
     def _build_command(
