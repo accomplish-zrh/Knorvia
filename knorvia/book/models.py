@@ -415,6 +415,38 @@ class Progress(BaseModel):
     quiz_attempts: list[QuizAttempt] = Field(default_factory=list)
     weak_chapters: list[str] = Field(default_factory=list)
     score: int = 0
+
+    def note_visited(self, page_id: str) -> None:
+        """Record a page visit (idempotent, order-preserving)."""
+        if page_id and page_id not in self.visited_page_ids:
+            self.visited_page_ids.append(page_id)
+
+    def toggle_bookmark(self, page_id: str) -> bool:
+        """Bookmark/unbookmark a page; returns the new state."""
+        if page_id in self.bookmarked_page_ids:
+            self.bookmarked_page_ids.remove(page_id)
+            return False
+        if page_id:
+            self.bookmarked_page_ids.append(page_id)
+            return True
+        return False
+
+    def completion_summary(self, total_pages: int) -> dict[str, Any]:
+        attempts = len(self.quiz_attempts)
+        correct = sum(1 for a in self.quiz_attempts if a.is_correct)
+        visited_ratio = (
+            len(self.visited_page_ids) / total_pages if total_pages > 0 else 0.0
+        )
+        return {
+            "total_pages": total_pages,
+            "visited": len(self.visited_page_ids),
+            "visited_ratio": round(visited_ratio, 3),
+            "bookmarks": len(self.bookmarked_page_ids),
+            "quiz_attempts": attempts,
+            "quiz_correct": correct,
+            "quiz_accuracy": round(correct / attempts, 3) if attempts else None,
+            "weak_chapters": list(self.weak_chapters),
+        }
     updated_at: float = Field(default_factory=_now)
 
 

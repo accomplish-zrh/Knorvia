@@ -64,6 +64,18 @@ class LabelProtocol:
     tool_label: str | None
 
 
+# One continuation pass max: a final answer cut by the token ceiling gets a
+# single "continue where you stopped" follow-up instead of shipping a
+# silently truncated reply. Chained continuations are deliberately not
+# attempted — repeated length-finishes mean the budget itself is wrong.
+MAX_LENGTH_CONTINUATIONS = 1
+
+CONTINUATION_NUDGE = (
+    "Your previous reply hit the output limit and stopped mid-sentence. "
+    "Continue exactly where you stopped without repeating any earlier text."
+)
+
+
 @dataclass(frozen=True)
 class LoopOutcome:
     """Result of one agentic loop run."""
@@ -215,6 +227,7 @@ async def run_agentic_loop(
     completed = False
     iterations_run = 0
     max_iter = max(1, max_iterations)
+    length_continuations = 0
 
     for iteration in range(max_iter):
         await host.guard_context_window(messages)
@@ -289,6 +302,56 @@ async def run_agentic_loop(
                 # ``run_labeled_step``, calling ``host.emit_final`` here
                 # would double-emit the text into the chat bubble.
                 await host.emit_final(step.text, final_meta)
+
+            # Truncated final answer: one continuation pass stitches the
+            # rest on. Works in both emit modes — live mode streams the
+            # extension through another labeled step, buffered mode emits
+            # the combined text once.
+            if (
+                step.finish_reason == "length"
+                and length_continuations < MAX_LENGTH_CONTINUATIONS
+                and step.text
+            ):
+                length_continuations += 1
+                messages.append({"role": "assistant", "content": step.text})
+                messages.append({"role": "user", "content": CONTINUATION_NUDGE})
+                try:
+                    cont_step = await run_labeled_step(
+                        client=client,
+                        model=model,
+                        messages=messages,
+                        completion_kwargs=completion_kwargs,
+                        tool_schemas=tool_schemas,
+                        allowed_labels=protocol.allowed,
+                        final_labels=protocol.final,
+                        tool_label=protocol.tool_label,
+                        stream=stream,
+                        source=source,
+                        stage=stage,
+                        iter_meta=iter_meta,
+                        binding=binding,
+                        usage=usage,
+                        final_meta=final_meta if stream_body_live else None,
+                        eager_sub_trace=eager_sub_trace,
+                        implicit_think_label=implicit_think_label,
+                    )
+                    iterations_run += 1
+                    if not stream_body_live:
+                        await host.emit_final(cont_step.text, final_meta)
+                        final_text = step.text + cont_step.text
+                    else:
+                        final_text = step.text + cont_step.text
+                    final_label_seen = step.label
+                    completed = True
+                    messages.pop()  # drop the nudge from retained history
+                    break
+                except Exception:  # noqa: BLE001 - fall back to what we have
+                    messages.pop()
+                    final_text = step.text
+                    final_label_seen = step.label
+                    completed = True
+                    break
+
             final_text = step.text
             final_label_seen = step.label
             completed = True

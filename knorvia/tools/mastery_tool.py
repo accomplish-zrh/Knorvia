@@ -14,9 +14,11 @@ from knorvia.capabilities.mastery.tools import (
     MasteryGradeTool,
     MasteryQuizTool,
     MasteryStatusTool,
+    QuestionBankOrganizeTool,
 )
 
 __all__ = [
+    "QuestionBankOrganizeTool",
     "MASTERY_TOOL_NAMES",
     "MASTERY_TOOL_TYPES",
     "MasteryStatusTool",

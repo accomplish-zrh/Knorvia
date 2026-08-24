@@ -235,6 +235,140 @@ def _no_path_result() -> ToolResult:
     )
 
 
+class QuestionBankOrganizeTool(BaseTool):
+    """File question-bank entries into categories by name (creates if missing)."""
+
+    def get_definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name="question_bank",
+            description=(
+                "Search and organize the learner's question notebook. Use `list` "
+                "to browse recent entries (optionally filtered to wrong answers) "
+                "and `organize` to file entry ids into a category — the category "
+                "is created automatically when the name does not exist yet."
+            ),
+            parameters=[
+                ToolParameter(
+                    name="action",
+                    type="string",
+                    description="Either 'list' or 'organize'.",
+                    required=True,
+                ),
+                ToolParameter(
+                    name="category",
+                    type="string",
+                    description="Category name for 'organize' (created if missing).",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="entry_ids",
+                    type="array",
+                    description="Entry ids to file, for 'organize'.",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="only_wrong",
+                    type="boolean",
+                    description="For 'list': show only incorrectly answered questions.",
+                    required=False,
+                ),
+                ToolParameter(
+                    name="limit",
+                    type="integer",
+                    description="Max entries returned by 'list' (default 20, max 50).",
+                    required=False,
+                ),
+            ],
+        )
+
+    async def execute(self, **kwargs: Any) -> ToolResult:
+        action = str(kwargs.get("action") or "").strip().lower()
+        from knorvia.services.session import get_sqlite_session_store
+
+        store = get_sqlite_session_store()
+        try:
+            if action == "list":
+                only_wrong = bool(kwargs.get("only_wrong"))
+                try:
+                    limit = max(1, min(int(kwargs.get("limit") or 20), 50))
+                except (TypeError, ValueError):
+                    limit = 20
+                listing = await store.list_notebook_entries(
+                    limit=limit * 3,
+                    is_correct=False if only_wrong else None,
+                )
+                entries = listing.get("items", []) if isinstance(listing, dict) else []
+                return _json_result(
+                    {
+                        "entries": [
+                            {
+                                "id": e["id"],
+                                "question": (e.get("question") or "")[:200],
+                                "is_correct": e.get("is_correct"),
+                                "difficulty": e.get("difficulty") or "",
+                            }
+                            for e in entries[:limit]
+                        ],
+                        "total": len(entries),
+                    },
+                    meta_key="question_bank",
+                )
+
+            if action == "organize":
+                category = str(kwargs.get("category") or "").strip()
+                if not category:
+                    return _json_result(
+                        {"error": "A category name is required for organize."},
+                        meta_key="question_bank",
+                        success=False,
+                    )
+                raw_ids = kwargs.get("entry_ids") or []
+                if isinstance(raw_ids, str):
+                    raw_ids = [part for part in raw_ids.replace("[", "").replace("]", "").split(",") if part.strip()]
+                ids: list[int] = []
+                for value in raw_ids:
+                    try:
+                        ids.append(int(value))
+                    except (TypeError, ValueError):
+                        continue
+                if not ids:
+                    return _json_result(
+                        {"error": "No valid entry_ids supplied."},
+                        meta_key="question_bank",
+                        success=False,
+                    )
+
+                existing = await store.list_categories()
+                match = next((c for c in existing if c["name"] == category), None)
+                if match is None:
+                    match = await store.create_category(category)
+                filed = 0
+                for entry_id in ids:
+                    if await store.add_entry_to_category(entry_id, int(match["id"])):
+                        filed += 1
+                return _json_result(
+                    {
+                        "category": category,
+                        "category_id": int(match["id"]),
+                        "filed": filed,
+                        "requested": len(ids),
+                    },
+                    meta_key="question_bank",
+                )
+
+            return _json_result(
+                {"error": f"Unknown action '{action}'. Use 'list' or 'organize'."},
+                meta_key="question_bank",
+                success=False,
+            )
+        except Exception as exc:  # noqa: BLE001 - tool boundary
+            return _json_result(
+                {"error": f"question_bank failed: {exc}"},
+                meta_key="question_bank",
+                success=False,
+            )
+
+
 class MasteryStatusTool(BaseTool):
     """Read the current objective + map snapshot. Call FIRST every turn."""
 
@@ -711,6 +845,7 @@ MASTERY_TOOL_TYPES: tuple[type[BaseTool], ...] = (
 
 
 __all__ = [
+    "QuestionBankOrganizeTool",
     "MASTERY_TOOL_NAMES",
     "MASTERY_TOOL_TYPES",
     "MasteryStatusTool",

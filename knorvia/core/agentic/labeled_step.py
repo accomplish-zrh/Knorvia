@@ -99,6 +99,11 @@ class LabeledStepResult:
     label: str  # one of allowed_labels, or LABEL_UNKNOWN on protocol failure
     text: str  # post-label content with provider <think> tags cleaned
     tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    # Provider finish reason for the step ("stop", "length", ...). "length"
+    # means the generation hit the token ceiling and was cut mid-sentence —
+    # the loop offers the model one continuation pass instead of shipping
+    # a silently truncated answer.
+    finish_reason: str | None = None
 
 
 async def run_labeled_step(
@@ -563,4 +568,9 @@ async def run_labeled_step(
         text = clean_thinking_tags(text, binding, model)
     ordered_tool_calls = [tc_acc[k] for k in sorted(tc_acc.keys())]
     ordered_tool_calls = [tc for tc in ordered_tool_calls if tc.get("name")]
-    return LabeledStepResult(label=label, text=text, tool_calls=ordered_tool_calls)
+    return LabeledStepResult(
+        label=label,
+        text=text,
+        tool_calls=ordered_tool_calls,
+        finish_reason=finish_reason_seen,
+    )

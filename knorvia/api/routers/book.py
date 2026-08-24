@@ -398,6 +398,39 @@ async def deep_dive(req: DeepDiveRequest) -> dict[str, Any]:
     return {"page": page.model_dump(mode="json")}
 
 
+class PageVisitRequest(BaseModel):
+    book_id: str
+    page_id: str
+
+
+@router.post("/books/visit")
+async def book_mark_visit(req: PageVisitRequest) -> dict[str, Any]:
+    """Record that the reader opened a page (drives completion stats)."""
+    engine = get_book_engine()
+    progress = await engine.mark_page_visited(req.book_id, req.page_id)
+    return {"progress": progress.model_dump(mode="json")}
+
+
+class PageBookmarkRequest(BaseModel):
+    book_id: str
+    page_id: str
+
+
+@router.post("/books/bookmark-toggle")
+async def book_toggle_bookmark(req: PageBookmarkRequest) -> dict[str, Any]:
+    """Toggle a reader bookmark on a page."""
+    engine = get_book_engine()
+    progress = await engine.toggle_page_bookmark(req.book_id, req.page_id)
+    return {"progress": progress.model_dump(mode="json")}
+
+
+@router.get("/books/{book_id}/completion")
+async def book_completion(book_id: str) -> dict[str, Any]:
+    """Completion summary: visited ratio, bookmarks, quiz accuracy, weaknesses."""
+    engine = get_book_engine()
+    return {"completion": engine.completion_report(book_id)}
+
+
 @router.post("/books/quiz-attempt")
 async def quiz_attempt(req: QuizAttemptRequest) -> dict[str, Any]:
     engine = get_book_engine()

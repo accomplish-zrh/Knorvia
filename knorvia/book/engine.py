@@ -1245,6 +1245,34 @@ class BookEngine:
 
     # ── Quiz attempts (Phase 3) ────────────────────────────────────────
 
+    async def mark_page_visited(
+        self, book_id: str, page_id: str, *, persist: bool = True
+    ) -> Progress:
+        """Record that a page has been seen and advance current_page_id."""
+        progress = self.load_progress(book_id)
+        progress.note_visited(page_id)
+        progress.current_page_id = page_id
+        if persist:
+            self.storage.save_progress(progress)
+        return progress
+
+    async def toggle_page_bookmark(self, book_id: str, page_id: str) -> Progress:
+        """Bookmark or unbookmark a page; persists and returns new state."""
+        progress = self.load_progress(book_id)
+        progress.toggle_bookmark(page_id)
+        self.storage.save_progress(progress)
+        return progress
+
+    def completion_report(self, book_id: str) -> dict[str, Any]:
+        """Roll visited pages / bookmarks / quiz results into one summary."""
+        progress = self.load_progress(book_id)
+        try:
+            spine = self.load_spine(book_id)
+            total_pages = len(getattr(spine, "page_ids", []) or [])
+        except Exception:  # noqa: BLE001 - spine may be missing mid-build
+            total_pages = 0
+        return progress.completion_summary(total_pages)
+
     async def record_quiz_attempt(
         self,
         *,

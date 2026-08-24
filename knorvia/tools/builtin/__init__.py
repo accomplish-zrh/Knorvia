@@ -8,6 +8,7 @@ import logging
 from typing import Any
 
 from knorvia.capabilities.mastery import MASTERY_TOOL_TYPES
+from knorvia.capabilities.mastery.tools import QuestionBankOrganizeTool
 from knorvia.capabilities.obsidian import OBSIDIAN_TOOL_TYPES
 from knorvia.capabilities.solve import SOLVE_TOOL_TYPES
 from knorvia.capabilities.subagent import SUBAGENT_TOOL_TYPES
@@ -1594,6 +1595,10 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     # a turn. Obsidian is a knowledge capability: when its vault is selected it
     # runs the turn exclusively on these tools.
     *MASTERY_TOOL_TYPES,
+    # Question-bank filing — DeepTutor-style: the tutor lists wrong answers
+    # and organizes them into named categories (created on demand). Globally
+    # registered; mounting policy lives with the chat capabilities.
+    QuestionBankOrganizeTool,
     *SOLVE_TOOL_TYPES,
     *OBSIDIAN_TOOL_TYPES,
     # Subagent consult tool — globally registered; the subagent knowledge

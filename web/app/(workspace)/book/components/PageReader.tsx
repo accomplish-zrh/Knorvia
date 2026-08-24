@@ -9,6 +9,7 @@ import {
   ChevronUp,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { apiFetch, apiUrl } from "@/lib/api";
 import type { Block, BlockType, Page } from "@/lib/book-types";
 import BlockRenderer from "./blocks/BlockRenderer";
 import PageOutlineNav from "./PageOutlineNav";
@@ -81,6 +82,17 @@ export default function PageReader({
     setUserToggled(false);
     lastScrollTopRef.current = 0;
   }, [page?.id]);
+
+  // Reading progress: fire-and-forget visit report whenever a page loads.
+  useEffect(() => {
+    if (!bookId || !page?.id) return;
+    void apiFetch(apiUrl("/api/v1/book/books/visit"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ book_id: bookId, page_id: page.id }),
+      // Progress reporting must never surface as a reader error.
+    }).catch(() => {});
+  }, [bookId, page?.id]);
 
   useEffect(() => {
     if (!scrollContainer) return;
