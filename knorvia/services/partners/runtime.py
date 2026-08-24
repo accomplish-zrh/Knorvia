@@ -454,10 +454,48 @@ class PartnerRunner:
             knowledge_bases=kb_names,
             attachments=attachments,
             language=self._language(),
-            persona_context=read_soul(self.partner_id).strip(),
+            persona_context=(
+                read_soul(self.partner_id).strip() + self._teammates_context()
+            ),
             skills_manifest=skills_manifest,
             source_manifest=source_manifest,
             metadata=metadata,
+        )
+
+    def _teammates_context(self) -> str:
+        """Roster of the other partners for the bot-mode protocol section.
+
+        Empty when this is the only partner — no protocol noise for a
+        single-agent install.
+        """
+        try:
+            from knorvia.services.partners.manager import get_partner_manager
+
+            partners = get_partner_manager().list_partners()
+        except Exception:  # noqa: BLE001 - roster is best-effort context
+            return ""
+        others = [
+            p for p in partners
+            if str(p.get("id") or "") != self.partner_id and p.get("id")
+        ]
+        if not others:
+            return ""
+        lines = []
+        for p in others:
+            state = "running" if p.get("running") else "stopped"
+            name = str(p.get("name") or p.get("id"))
+            desc = str(p.get("description") or "").strip()
+            line = f"- {name} (id: {p.get('id')}, {state})"
+            if desc:
+                line += f": {desc[:120]}"
+            lines.append(line)
+        return (
+            "\n\n## Teammates (other partners on this machine)\n"
+            "You are not alone. To delegate work or ask a teammate a question, "
+            "call send_partner_message(partner_id=..., message=...). The reply "
+            "arrives as the tool result; messages must be self-contained. "
+            "Do not message a stopped partner without telling the user why.\n"
+            + "\n".join(lines)
         )
 
     def _resolved_enabled_tools(self) -> list[str]:
