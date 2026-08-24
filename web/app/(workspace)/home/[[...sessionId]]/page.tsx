@@ -45,6 +45,7 @@ import SessionLoadingView from "@/components/chat/home/SessionLoadingView";
 import FilePreviewDrawer from "@/components/chat/preview/FilePreviewDrawer";
 import { buildSessionActivity } from "@/components/chat/home/SessionActivityPanel";
 import Tooltip from "@/components/common/Tooltip";
+import ImmersiveReader from '@/components/chat/home/ImmersiveReader'
 import SessionViewerPanel, {
   type SessionViewerPanelHandle,
 } from "@/components/chat/home/SessionViewerPanel";
@@ -422,6 +423,12 @@ export default function ChatPage() {
   // Single right-side panel: the Activity/Viewer. Its home view is the
   // session activity; files and web pages open as tabs alongside it.
   const [viewerPanelOpen, setViewerPanelOpen] = useState(false);
+  // Immersive reading: KB file opened beside the thread (citation jump or
+  // attachment preview promoted to a persistent side panel).
+  const [readerSource, setReaderSource] = useState<FilePreviewSource | null>(null);
+  const openInReader = useCallback((source: FilePreviewSource) => {
+    setReaderSource(source);
+  }, []);
   useEffect(() => {
     if (typeof window === "undefined") return;
     if (window.localStorage.getItem("dt:chat:viewer-panel") === "1") {
@@ -1927,6 +1934,8 @@ export default function ChatPage() {
           messages={state.messages}
           viewerPanelRef={viewerPanelRef}
         />
+        <div className="flex min-h-0 flex-1 overflow-hidden">
+        <ImmersiveReader source={readerSource} onClose={() => setReaderSource(null)} />
         <div
           // When the preview drawer is open AND the viewport is wide enough,
           // push the chat content to the left by the drawer's width so the two
@@ -1937,7 +1946,7 @@ export default function ChatPage() {
           // hand-tune it without fighting Tailwind's arbitrary-value parser.
           data-preview-open={previewSource ? "true" : "false"}
           data-viewer-open={viewerPanelOpen ? "true" : "false"}
-          className="chat-preview-shell flex h-full flex-col overflow-hidden bg-[var(--background)]"
+          className="chat-preview-shell flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]"
         >
           <div className="mx-auto flex w-full max-w-[960px] flex-wrap items-center justify-between gap-x-3 gap-y-1.5 px-6 pt-3 pb-0">
             <div className="group/title min-w-0 flex flex-1 items-center gap-2">
@@ -2238,6 +2247,7 @@ export default function ChatPage() {
             onClose={() => setViewerOpen(false)}
             onAutoOpen={() => setViewerOpen(true)}
           />
+        </div>
         </div>
       </GeogebraTabProvider>
     </QuizFollowupProvider>
