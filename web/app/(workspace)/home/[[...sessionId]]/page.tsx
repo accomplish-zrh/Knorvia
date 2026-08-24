@@ -1934,7 +1934,11 @@ export default function ChatPage() {
           messages={state.messages}
           viewerPanelRef={viewerPanelRef}
         />
-        <div className="flex min-h-0 flex-1 overflow-hidden">
+        {/* h-full is required: AppShell's children slot is a plain block
+            (not a flex container), so flex-1 alone cannot stretch this
+            wrapper — without it the whole chat column collapses to content
+            height and the empty-state composer sticks to the top. */}
+        <div className="flex h-full min-h-0 flex-1 overflow-hidden">
         <ImmersiveReader source={readerSource} onClose={() => setReaderSource(null)} />
         <div
           // When the preview drawer is open AND the viewport is wide enough,
