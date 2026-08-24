@@ -324,6 +324,112 @@ def _load_persona_markdown(name: str) -> str:
 # ── Soul template library (before /{partner_id} routes) ───────
 
 
+# ── Group chat rooms (bot-mode group parity) ─────────────────────
+
+
+class RoomCreateRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    members: list[str] = Field(min_length=2, max_length=6)
+
+
+class RoomMembersRequest(BaseModel):
+    members: list[str] = Field(min_length=2, max_length=6)
+
+
+class RoomRenameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+
+
+class RoomMessageRequest(BaseModel):
+    content: str = Field(min_length=1, max_length=16000)
+    max_speakers: int | None = Field(default=None, ge=1, le=6)
+
+
+@router.get("/groups")
+async def list_group_rooms():
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    return {"rooms": get_group_room_engine().list_rooms()}
+
+
+@router.post("/groups")
+async def create_group_room(payload: RoomCreateRequest):
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    try:
+        room = get_group_room_engine().create_room(payload.name, payload.members)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    return {"room": {"id": room.id, "name": room.name, "members": room.members}}
+
+
+@router.get("/groups/{room_id}")
+async def get_group_room(room_id: str):
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    room = get_group_room_engine().get_room(room_id)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {
+        "room": {
+            "id": room.id,
+            "name": room.name,
+            "members": room.members,
+            "messages": [
+                {"sender": m.sender, "sender_name": m.sender_name,
+                 "content": m.content, "timestamp": m.timestamp}
+                for m in room.messages
+            ],
+        }
+    }
+
+
+@router.patch("/groups/{room_id}/members")
+async def set_group_members(room_id: str, payload: RoomMembersRequest):
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    try:
+        room = get_group_room_engine().set_members(room_id, payload.members)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {"room": {"id": room.id, "name": room.name, "members": room.members}}
+
+
+@router.patch("/groups/{room_id}/name")
+async def rename_group_room(room_id: str, payload: RoomRenameRequest):
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    room = get_group_room_engine().rename_room(room_id, payload.name)
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {"room": {"id": room.id, "name": room.name}}
+
+
+@router.delete("/groups/{room_id}")
+async def delete_group_room(room_id: str):
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    if not get_group_room_engine().delete_room(room_id):
+        raise HTTPException(status_code=404, detail="Room not found")
+    return {"deleted": True}
+
+
+@router.post("/groups/{room_id}/say")
+async def say_in_group(room_id: str, payload: RoomMessageRequest):
+    """User speaks into the room; every member answers once in turn."""
+    from knorvia.services.partners.group_chat import get_group_room_engine
+
+    try:
+        result = await get_group_room_engine().send_user_message(
+            room_id, payload.content, max_speakers=payload.max_speakers
+        )
+    except LookupError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    return result
+
+
 @router.get("/souls")
 async def list_souls():
     return get_partner_manager().list_souls()
