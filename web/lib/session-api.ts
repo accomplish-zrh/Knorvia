@@ -60,6 +60,16 @@ export interface SessionSummary {
     | "rejected";
   active_turn_id?: string;
   preferences?: SessionPreferences;
+  pinned?: number;
+  archived_at?: number | null;
+}
+
+export interface SessionSearchHit {
+  session_id: string;
+  title: string;
+  updated_at: number;
+  snippet: string;
+  match_in: "message" | "title";
 }
 
 export interface ActiveTurnSummary {
@@ -123,14 +133,16 @@ async function expectJson<T>(response: Response): Promise<T> {
 export async function listSessions(
   limit = 50,
   offset = 0,
-  options?: { force?: boolean },
+  options?: { force?: boolean; includeArchived?: boolean },
 ): Promise<SessionSummary[]> {
+  const includeArchived = options?.includeArchived ?? false;
   const qs = new URLSearchParams({
     limit: String(limit),
     offset: String(offset),
   });
+  if (includeArchived) qs.set("include_archived", "true");
   return withClientCache<SessionSummary[]>(
-    `sessions:${limit}:${offset}`,
+    `sessions:${limit}:${offset}:${includeArchived ? "all" : "active"}`,
     async () => {
       const response = await apiFetch(
         apiUrl(`/api/v1/sessions?${qs.toString()}`),
@@ -146,6 +158,51 @@ export async function listSessions(
       ttlMs: 15_000,
     },
   );
+}
+
+/** Full-history search across every message of every session. */
+export async function searchSessions(
+  query: string,
+  limit = 30,
+  signal?: AbortSignal,
+): Promise<SessionSearchHit[]> {
+  const keyword = query.trim();
+  if (!keyword) return [];
+  const qs = new URLSearchParams({ q: keyword, limit: String(limit) });
+  const response = await apiFetch(
+    apiUrl(`/api/v1/sessions/search?${qs.toString()}`),
+    { cache: "no-store", signal },
+  );
+  const data = await expectJson<{ results: SessionSearchHit[] }>(response);
+  return data.results ?? [];
+}
+
+/** Flip pinned / archived without touching the title. */
+export async function updateSessionFlags(
+  sessionId: string,
+  flags: { pinned?: boolean; archived?: boolean },
+): Promise<SessionDetail> {
+  const response = await apiFetch(apiUrl(`/api/v1/sessions/${sessionId}`), {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(flags),
+  });
+  const data = await expectJson<{ session: SessionDetail }>(response);
+  invalidateClientCache("sessions:");
+  return data.session;
+}
+
+/** Fetch the full transcript as Markdown or JSON text for download. */
+export async function exportSession(
+  sessionId: string,
+  format: "md" | "json" = "md",
+): Promise<{ filename: string; mime_type: string; content: string }> {
+  const qs = new URLSearchParams({ format });
+  const response = await apiFetch(
+    apiUrl(`/api/v1/sessions/${sessionId}/export?${qs.toString()}`),
+    { cache: "no-store" },
+  );
+  return expectJson(response);
 }
 
 export async function getSession(

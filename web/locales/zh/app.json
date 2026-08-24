@@ -3902,5 +3902,12 @@
   "4K": "4K",
   "720p": "720p",
   "sk-...": "sk-...",
-  "{\"APP-Code\":\"your-app-code\"}": "{\"APP-Code\":\"your-app-code\"}"
+  "{\"APP-Code\":\"your-app-code\"}": "{\"APP-Code\":\"your-app-code\"}",
+  "Search all history…": "搜索全部历史…",
+  "Session actions": "会话操作",
+  "Unpin": "取消置顶",
+  "Pin": "置顶",
+  "Archive": "归档",
+  "Unarchive": "取消归档",
+  "title": "标题"
 }

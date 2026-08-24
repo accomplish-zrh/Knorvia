@@ -2,10 +2,15 @@
 
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
+  Archive,
+  ArchiveRestore,
   Check,
+  Download,
   History as HistoryIcon,
   Loader2,
   MessageSquare,
+  Pin,
+  PinOff,
   Search,
   Sparkles,
   UserRound,
@@ -14,9 +19,13 @@ import { useTranslation } from "react-i18next";
 import PickerShell from "@/components/common/PickerShell";
 import PickerHeader from "@/components/common/PickerHeader";
 import {
+  exportSession,
   getSession,
   listSessions,
+  searchSessions,
+  updateSessionFlags,
   type SessionDetail,
+  type SessionSearchHit,
   type SessionSummary,
 } from "@/lib/session-api";
 import { normalizeMessageContent, truncateText } from "@/lib/message-content";
@@ -57,6 +66,12 @@ export default function HistorySessionPicker({
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [query, setQuery] = useState("");
   const [loading, setLoading] = useState(false);
+  // Deep search: once the user types >=2 chars we hit the backend FTS index
+  // (all history) instead of filtering the loaded page of summaries.
+  const [searchHits, setSearchHits] = useState<SessionSearchHit[] | null>(null);
+  const [searching, setSearching] = useState(false);
+  const searchSeqRef = useRef(0);
+  const [busyId, setBusyId] = useState<string | null>(null);
 
   // The session shown in the right-hand preview pane. Driven by hover/focus
   // and click so the preview tracks wherever the user's attention is — the
@@ -123,6 +138,82 @@ export default function HistorySessionPicker({
     };
   }, [activeId, open]);
 
+  // Backend full-text search (debounced) whenever the query is long enough.
+  useEffect(() => {
+    if (!open) return;
+    const keyword = query.trim();
+    if (keyword.length < 2) {
+      setSearchHits(null);
+      return;
+    }
+    const seq = ++searchSeqRef.current;
+    const timer = window.setTimeout(() => {
+      setSearching(true);
+      searchSessions(keyword, 30)
+        .then((hits) => {
+          if (seq === searchSeqRef.current) setSearchHits(hits);
+        })
+        .catch(() => {
+          /* keep whatever list is showing; search is best-effort */
+        })
+        .finally(() => {
+          if (seq === searchSeqRef.current) setSearching(false);
+        });
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [query, open]);
+
+  const togglePinned = async (session: SessionSummary) => {
+    const id = sessionKey(session);
+    setBusyId(id);
+    try {
+      await updateSessionFlags(id, { pinned: !(session.pinned ?? 0) });
+      setSessions((prev) =>
+        prev.map((s) =>
+          sessionKey(s) === id ? { ...s, pinned: s.pinned ? 0 : 1 } : s,
+        ),
+      );
+    } catch {
+      /* optimistic UI stays; a reopen refreshes state */
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const toggleArchived = async (session: SessionSummary) => {
+    const id = sessionKey(session);
+    setBusyId(id);
+    try {
+      const willArchive = !session.archived_at;
+      await updateSessionFlags(id, { archived: willArchive });
+      if (willArchive) {
+        // Archived chats leave the default list.
+        setSessions((prev) => prev.filter((s) => sessionKey(s) !== id));
+      } else {
+        setSessions((prev) => [{ ...session, archived_at: null }, ...prev]);
+      }
+    } catch {
+      /* ignore; reopen refreshes */
+    } finally {
+      setBusyId(null);
+    }
+  };
+
+  const downloadExport = async (sessionId: string, format: "md" | "json") => {
+    try {
+      const file = await exportSession(sessionId, format);
+      const blob = new Blob([file.content], { type: file.mime_type });
+      const url = URL.createObjectURL(blob);
+      const anchorEl = document.createElement("a");
+      anchorEl.href = url;
+      anchorEl.download = file.filename;
+      anchorEl.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      /* best-effort */
+    }
+  };
+
   const filteredSessions = useMemo(() => {
     const keyword = query.trim().toLowerCase();
     if (!keyword) return sessions;
@@ -187,7 +278,7 @@ export default function HistorySessionPicker({
                 <input
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  placeholder={t("Search sessions by title or last message")}
+                  placeholder={t("Search all history…")}
                   className="w-full rounded-xl border border-[var(--border)] bg-[var(--card)] py-2.5 pl-9 pr-3 text-[13px] text-[var(--foreground)] outline-none transition focus:border-[var(--primary)]/50 focus:ring-2 focus:ring-[var(--primary)]/15"
                 />
               </div>
@@ -202,7 +293,61 @@ export default function HistorySessionPicker({
             </div>
 
             <div className="min-h-0 flex-1 overflow-y-auto px-2 pb-2">
-              {loading ? (
+              {searchHits !== null ? (
+                /* Deep-search results: every matching session across all history */
+                <div className="flex flex-col gap-0.5">
+                  {searching && (
+                    <div className="flex items-center justify-center py-6">
+                      <Loader2 className="h-4 w-4 animate-spin text-[var(--muted-foreground)]" />
+                    </div>
+                  )}
+                  {!searching && !searchHits.length && (
+                    <div className="px-6 py-14 text-center text-[13px] text-[var(--muted-foreground)]">
+                      {t("No matching sessions found.")}
+                    </div>
+                  )}
+                  {searchHits.map((hit) => {
+                    const id = hit.session_id;
+                    const active = id === activeId;
+                    return (
+                      <button
+                        key={`hit-${id}`}
+                        onClick={() => {
+                          setActiveId(id);
+                          if (!detailsRef.current[id]) {
+                            setDetails((prev) => ({ ...prev }));
+                          }
+                          getSession(id)
+                            .then((detail) =>
+                              setDetails((prev) => ({ ...prev, [id]: detail })),
+                            )
+                            .catch(() => {});
+                        }}
+                        onMouseEnter={() => setActiveId(id)}
+                        className={`group relative flex w-full flex-col gap-0.5 rounded-xl px-2.5 py-2 text-left transition-colors ${
+                          active ? "bg-[var(--muted)]/60" : "hover:bg-[var(--muted)]/35"
+                        }`}
+                      >
+                        <span className="flex items-center justify-between gap-2">
+                          <span className="truncate text-[13px] font-medium text-[var(--foreground)]">
+                            {hit.title || t("Untitled session")}
+                          </span>
+                          <span className="shrink-0 rounded-full border border-[var(--border)] px-1.5 text-[10px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                            {t(hit.match_in === "title" ? "title" : "message")}
+                          </span>
+                        </span>
+                        {hit.snippet && (
+                          <span
+                            className="line-clamp-2 text-[11px] leading-snug text-[var(--muted-foreground)]"
+                            // snippet carries [brackets] around the match
+                            dangerouslySetInnerHTML={{ __html: hit.snippet.replace(/\[|\]/g, "<mark>$&</mark>").replace(/<mark>/g, '<span class="rounded-sm bg-[var(--primary)]/15 px-0.5">').replace(/<\/mark>|\]/g, "</span>").replace(/\[/g, "") }}
+                          />
+                        )}
+                      </button>
+                    );
+                  })}
+                </div>
+              ) : loading ? (
                 <div className="flex min-h-[280px] items-center justify-center">
                   <Loader2 className="h-5 w-5 animate-spin text-[var(--muted-foreground)]" />
                 </div>
@@ -245,13 +390,63 @@ export default function HistorySessionPicker({
                           <Check size={11} strokeWidth={3} />
                         </span>
                         <span className="min-w-0 flex-1">
-                          <span className="block truncate text-[13px] font-medium text-[var(--foreground)]">
-                            {session.title || t("Untitled session")}
+                          <span className="flex items-center gap-1.5">
+                            {(session.pinned ?? 0) === 1 && (
+                              <Pin size={11} className="shrink-0 fill-[var(--primary)] text-[var(--primary)]" />
+                            )}
+                            <span className="truncate text-[13px] font-medium text-[var(--foreground)]">
+                              {session.title || t("Untitled session")}
+                            </span>
                           </span>
                           <span className="mt-0.5 flex items-center gap-1.5 text-[11px] text-[var(--muted-foreground)]/85">
                             <MessageSquare size={11} strokeWidth={1.8} />
                             {session.message_count ?? 0} {t("messages")}
                           </span>
+                        </span>
+                        {/* Row actions appear on hover; stop propagation so the
+                           row's select/preview handlers don't fire. */}
+                        <span
+                          role="group"
+                          aria-label={t("Session actions")}
+                          className="absolute right-1.5 top-1.5 hidden items-center gap-0.5 rounded-lg border border-[var(--border)] bg-[var(--card)] p-0.5 shadow-sm group-hover:flex"
+                        >
+                          <button
+                            title={t(session.pinned ? "Unpin" : "Pin")}
+                            disabled={busyId === id}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void togglePinned(session);
+                            }}
+                            className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                          >
+                            {session.pinned ? <PinOff size={12} /> : <Pin size={12} />}
+                          </button>
+                          <button
+                            title={t("Export Markdown")}
+                            disabled={busyId === id}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void downloadExport(id, "md");
+                            }}
+                            className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                          >
+                            <Download size={12} />
+                          </button>
+                          <button
+                            title={t(session.archived_at ? "Unarchive" : "Archive")}
+                            disabled={busyId === id}
+                            onClick={(event) => {
+                              event.stopPropagation();
+                              void toggleArchived(session);
+                            }}
+                            className="rounded-md p-1 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)] hover:text-[var(--foreground)]"
+                          >
+                            {session.archived_at ? (
+                              <ArchiveRestore size={12} />
+                            ) : (
+                              <Archive size={12} />
+                            )}
+                          </button>
                         </span>
                       </button>
                     );

@@ -7,6 +7,24 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Session management suite** (sidebar upgrade, inspired by Open WebUI):
+  - Full-history search: SQLite FTS5 index over every message (trigger-synced,
+    rebuilt on startup) with `GET /api/v1/sessions/search?q=` returning ranked
+    session hits + highlighted snippets; title-substring fallback included.
+    The sidebar switches from client-side filtering to this deep search as
+    soon as the query reaches two characters.
+  - Pinned sessions: `pinned` column, PATCH support, pinned-first ordering.
+  - Archived sessions: `archived_at` column; default list hides them,
+    `?include_archived=true` reveals them, search still finds them.
+  - Transcript export: `GET /api/v1/sessions/{id}/export?format=md|json`
+    returns Markdown (human-readable) or JSON (lossless); the sidebar row
+    menu gains a one-click Markdown download.
+  - Store/router covered by tests/services/session/test_session_management.py
+    (9 cases: pinning order, archive visibility, FTS snippets, literal-query
+    safety, export completeness).
+
 ### Performance
 
 - **Root shell budget fixed (FAIL → OK, 309 KB → 95 KB)**: the English

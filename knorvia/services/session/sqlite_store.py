@@ -4,6 +4,10 @@ SQLite-backed unified chat session store.
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 import asyncio
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -152,7 +156,9 @@ class SQLiteSessionStore:
                     updated_at REAL NOT NULL,
                     compressed_summary TEXT DEFAULT '',
                     summary_up_to_msg_id INTEGER DEFAULT 0,
-                    preferences_json TEXT DEFAULT '{}'
+                    preferences_json TEXT DEFAULT '{}',
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    archived_at REAL
                 );
 
                 CREATE TABLE IF NOT EXISTS messages (
@@ -260,6 +266,10 @@ class SQLiteSessionStore:
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)").fetchall()}
             if "preferences_json" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN preferences_json TEXT DEFAULT '{}'")
+            if "pinned" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN pinned INTEGER NOT NULL DEFAULT 0")
+            if "archived_at" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN archived_at REAL")
             if "kind" in columns:
                 try:
                     conn.execute("ALTER TABLE sessions DROP COLUMN kind")
@@ -300,10 +310,78 @@ class SQLiteSessionStore:
                 "CREATE INDEX IF NOT EXISTS idx_messages_parent "
                 "ON messages(session_id, parent_message_id)"
             )
+            self._migrate_session_fts(conn)
             self._migrate_notebook_entries_add_turn_id(conn)
             self._migrate_notebook_entries_add_user_answer_images(conn)
             self._migrate_notebook_entries_add_ai_judgment(conn)
             conn.commit()
+
+    @staticmethod
+    def _migrate_session_fts(conn: sqlite3.Connection) -> None:
+        """Full-text index over message content (FTS5) for history search.
+
+        Kept in sync by triggers so every write path is covered without
+        touching call sites. Existing rows are backfilled once; the trigger
+        definitions are (re)created idempotently on every startup.
+        """
+        # FTS5 ships with CPython's bundled SQLite on Windows/macOS and with
+        # every distro build we support; guard anyway so a exotic build only
+        # loses search instead of failing startup.
+        try:
+            capabilities = {
+                row[0]
+                for row in conn.execute("SELECT * FROM pragma_compile_options").fetchall()
+                if row[0]
+            }
+        except sqlite3.Error:
+            capabilities = set()
+        if any(opt == "ENABLE_FTS5" for opt in capabilities):
+            has_fts = True
+        else:
+            try:
+                conn.execute(
+                    'CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts '
+                    'USING fts5(content, content=""'
+                    ")"
+                )
+                conn.execute("DROP TABLE IF EXISTS messages_fts")
+                has_fts = True
+            except sqlite3.Error:
+                logger.warning("SQLite built without FTS5; session search falls back to LIKE")
+                has_fts = False
+        if not has_fts:
+            return
+
+        conn.execute(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+                content,
+                content='messages',
+                content_rowid='id',
+                tokenize='unicode61 remove_diacritics 2'
+            )
+            """
+        )
+        # Rebuild is cheap relative to correctness here and repairs any drift
+        # from a crash between a message write and its trigger.
+        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
+
+        conn.executescript(
+            """
+            CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+            END;
+            CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
+                INSERT INTO messages_fts(messages_fts, rowid, content)
+                VALUES ('delete', old.id, old.content);
+                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
+            END;
+            """
+        )
 
     @staticmethod
     def _migrate_notebook_entries_add_turn_id(conn: sqlite3.Connection) -> None:
@@ -496,6 +574,8 @@ class SQLiteSessionStore:
                     s.compressed_summary,
                     s.summary_up_to_msg_id,
                     s.preferences_json,
+                    COALESCE(s.pinned, 0) AS pinned,
+                    s.archived_at,
                     COALESCE(
                         (
                             SELECT t.status
@@ -1377,6 +1457,8 @@ class SQLiteSessionStore:
             s.title,
             s.created_at,
             s.updated_at,
+            COALESCE(s.pinned, 0) AS pinned,
+            s.archived_at,
             s.compressed_summary,
             s.summary_up_to_msg_id,
             s.preferences_json,
@@ -1406,7 +1488,7 @@ class SQLiteSessionStore:
         LEFT JOIN messages m ON m.session_id = s.id
         {where}
         GROUP BY s.id
-        ORDER BY s.updated_at DESC
+        ORDER BY s.pinned DESC, s.updated_at DESC
         LIMIT ? OFFSET ?
     """
 
@@ -1416,13 +1498,26 @@ class SQLiteSessionStore:
     _WHERE_IMPORTED = r"WHERE s.id LIKE 'imported\_%' ESCAPE '\'"
 
     def _list_session_summaries_sync(
-        self, where_sql: str, limit: int, offset: int
+        self,
+        where_sql: str,
+        limit: int,
+        offset: int,
+        include_archived: bool = False,
+        pinned_first: bool = True,
     ) -> list[dict[str, Any]]:
+        if not include_archived:
+            hide = " AND s.archived_at IS NULL"
+            if "WHERE" in where_sql:
+                where_sql = where_sql + hide
+            else:
+                where_sql = " WHERE s.archived_at IS NULL" if where_sql == "" else where_sql + hide
+        order = "s.pinned DESC, s.updated_at DESC" if pinned_first else "s.updated_at DESC"
+        sql = self._SESSION_SUMMARY_SQL.format(where=where_sql).replace(
+            "ORDER BY s.pinned DESC, s.updated_at DESC",
+            f"ORDER BY {order}",
+        )
         with self._connect() as conn:
-            rows = conn.execute(
-                self._SESSION_SUMMARY_SQL.format(where=where_sql),
-                (limit, offset),
-            ).fetchall()
+            rows = conn.execute(sql, (limit, offset)).fetchall()
         sessions = []
         for row in rows:
             payload = dict(row)
@@ -1435,31 +1530,170 @@ class SQLiteSessionStore:
         self,
         limit: int = 50,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
         # Native chats only — imported histories surface under their own
         # Space category, not the regular history list.
-        return self._list_session_summaries_sync(self._WHERE_NATIVE, limit, offset)
+        return self._list_session_summaries_sync(
+            self._WHERE_NATIVE, limit, offset, include_archived=include_archived
+        )
 
     def _list_imported_sessions_sync(
         self,
         limit: int = 50,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        return self._list_session_summaries_sync(self._WHERE_IMPORTED, limit, offset)
+        return self._list_session_summaries_sync(
+            self._WHERE_IMPORTED, limit, offset, include_archived=include_archived
+        )
 
     async def list_sessions(
         self,
         limit: int = 50,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        return await self._run(self._list_sessions_sync, limit, offset)
+        return await self._run(
+            self._list_sessions_sync, limit, offset, include_archived
+        )
 
     async def list_imported_sessions(
         self,
         limit: int = 50,
         offset: int = 0,
+        include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        return await self._run(self._list_imported_sessions_sync, limit, offset)
+        return await self._run(
+            self._list_imported_sessions_sync, limit, offset, include_archived
+        )
+
+    def _set_flag_sync(self, session_id: str, *, pinned: bool | None = None,
+                       archived: bool | None = None) -> bool:
+        sets: list[str] = []
+        args: list[Any] = []
+        if pinned is not None:
+            sets.append("pinned = ?")
+            args.append(1 if pinned else 0)
+        if archived is not None:
+            sets.append("archived_at = ?")
+            args.append(time.time() if archived else None)
+        if not sets:
+            return False
+        cur = None
+        with self._connect() as conn:
+            cur = conn.execute(
+                f"UPDATE sessions SET {', '.join(sets)} WHERE id = ?",
+                (*args, session_id),
+            )
+            conn.commit()
+        return cur.rowcount > 0
+
+    async def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
+        return await self._run(
+            lambda sid: self._set_flag_sync(sid, pinned=pinned), session_id
+        )
+
+    async def set_session_archived(self, session_id: str, archived: bool) -> bool:
+        return await self._run(
+            lambda sid: self._set_flag_sync(sid, archived=archived), session_id
+        )
+
+    def _search_sessions_sync(
+        self, query: str, limit: int = 30
+    ) -> list[dict[str, Any]]:
+        """Full-text search over message content + title substring fallback.
+
+        Returns compact hits: one row per matching session with the best
+        FTS snippet (or the LIKE-matched title context). Archived sessions
+        are included — search is exactly how you find an archived chat.
+        """
+        query = (query or "").strip()
+        if not query:
+            return []
+        like = f"%{query.lower()}%"
+        with self._connect() as conn:
+            try:
+                rows = conn.execute(
+                    """
+                    SELECT
+                        s.id,
+                        s.title,
+                        s.updated_at,
+                        snippet(messages_fts, 0, '[', ']', ' … ', 12) AS hit,
+                        bm25(messages_fts) AS rank
+                    FROM messages_fts
+                    JOIN messages m ON m.id = messages_fts.rowid
+                    JOIN sessions s ON s.id = m.session_id
+                    WHERE messages_fts MATCH ?
+                    ORDER BY rank
+                    LIMIT ?
+                    """,
+                    (_fts_query(query), limit),
+                ).fetchall()
+            except sqlite3.OperationalError:
+                rows = []
+            hits: dict[str, dict[str, Any]] = {}
+            for row in rows:
+                hits[row["id"]] = {
+                    "session_id": row["id"],
+                    "title": row["title"],
+                    "updated_at": row["updated_at"],
+                    "snippet": row["hit"] or "",
+                    "match_in": "message",
+                }
+            # Title-only matches that FTS missed (short tokens, CJK edge cases).
+            trows = conn.execute(
+                """
+                SELECT id, title, updated_at FROM sessions
+                WHERE lower(title) LIKE ?
+                ORDER BY updated_at DESC LIMIT ?
+                """,
+                (like, limit),
+            ).fetchall()
+            for row in trows:
+                if row["id"] not in hits:
+                    hits[row["id"]] = {
+                        "session_id": row["id"],
+                        "title": row["title"],
+                        "updated_at": row["updated_at"],
+                        "snippet": "",
+                        "match_in": "title",
+                    }
+        out = sorted(hits.values(), key=lambda h: h["updated_at"], reverse=True)
+        return out[:limit]
+
+    async def search_sessions(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
+        return await self._run(self._search_sessions_sync, query, limit)
+
+    def _export_session_sync(self, session_id: str) -> dict[str, Any] | None:
+        """Full transcript for export: every column the UI/LLM ever saw."""
+        with self._connect() as conn:
+            sess = conn.execute(
+                """
+                SELECT id, title, created_at, updated_at, compressed_summary,
+                       COALESCE(pinned, 0) AS pinned, archived_at
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if sess is None:
+                return None
+            msgs = conn.execute(
+                """
+                SELECT id, role, content, capability, metadata_json,
+                       parent_message_id, created_at
+                FROM messages WHERE session_id = ? ORDER BY id ASC
+                """,
+                (session_id,),
+            ).fetchall()
+        return {
+            "session": dict(sess),
+            "messages": [dict(m) for m in msgs],
+        }
+
+    async def export_session(self, session_id: str) -> dict[str, Any] | None:
+        return await self._run(self._export_session_sync, session_id)
 
     def _update_summary_sync(self, session_id: str, summary: str, up_to_msg_id: int) -> bool:
         with self._connect() as conn:
@@ -1920,6 +2154,17 @@ class SQLiteSessionStore:
 
 
 _instances: dict[str, SQLiteSessionStore] = {}
+
+
+def _fts_query(raw: str) -> str:
+    """Make a user string safe for FTS5 MATCH.
+
+    Quote the whole phrase and escape embedded double quotes; this treats the
+    input as a literal phrase (prefix-search friendly enough for history
+    lookup) instead of exposing FTS5's boolean/NEAR syntax to the UI.
+    """
+    escaped = raw.replace('"', '""')
+    return f'"{escaped}"'
 
 
 def get_sqlite_session_store() -> SQLiteSessionStore:

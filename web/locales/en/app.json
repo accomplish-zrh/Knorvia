@@ -3902,5 +3902,12 @@
   "4K": "4K",
   "720p": "720p",
   "sk-...": "sk-...",
-  "{\"APP-Code\":\"your-app-code\"}": "{\"APP-Code\":\"your-app-code\"}"
+  "{\"APP-Code\":\"your-app-code\"}": "{\"APP-Code\":\"your-app-code\"}",
+  "Search all history…": "Search all history…",
+  "Session actions": "Session actions",
+  "Unpin": "Unpin",
+  "Pin": "Pin",
+  "Archive": "Archive",
+  "Unarchive": "Unarchive",
+  "title": "title"
 }

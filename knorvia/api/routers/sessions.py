@@ -4,6 +4,8 @@ Unified session history API.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+import json
 import logging
 from typing import Any
 
@@ -20,6 +22,14 @@ router = APIRouter()
 
 class SessionRenameRequest(BaseModel):
     title: str = Field(..., min_length=1, max_length=100)
+
+
+class SessionUpdateRequest(BaseModel):
+    """Partial session update. Every field optional; at least one required."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    pinned: bool | None = None
+    archived: bool | None = None
 
 
 class BranchSelectionRequest(BaseModel):
@@ -81,10 +91,29 @@ def _format_quiz_results_message(answers: list[QuizResultItem]) -> str:
 async def list_sessions(
     limit: int = Query(default=50, ge=1, le=200),
     offset: int = Query(default=0, ge=0),
+    include_archived: bool = Query(default=False),
 ):
     store = get_session_store()
-    sessions = await store.list_sessions(limit=limit, offset=offset)
+    sessions = await store.list_sessions(
+        limit=limit, offset=offset, include_archived=include_archived
+    )
     return {"sessions": sessions}
+
+
+@router.get("/search")
+async def search_sessions(
+    q: str = Query(min_length=1, max_length=200),
+    limit: int = Query(default=30, ge=1, le=100),
+):
+    """Full-text history search across every message of every session.
+
+    Returns compact hits (session id/title/time + a matched snippet), so the
+    sidebar can offer "search all history" without loading transcripts.
+    Archived sessions are included — search is how you find them again.
+    """
+    store = get_session_store()
+    results = await store.search_sessions(q.strip(), limit=limit)
+    return {"results": results}
 
 
 # Cap (in characters) for a single event payload returned to the UI. RAG
@@ -141,13 +170,27 @@ async def get_session(session_id: str):
 
 
 @router.patch("/{session_id}")
-async def rename_session(session_id: str, payload: SessionRenameRequest):
-    store = get_session_store()
-    updated = await store.update_session_title(session_id, payload.title)
-    if not updated:
-        raise HTTPException(status_code=404, detail="Session not found")
+async def update_session(session_id: str, payload: SessionUpdateRequest):
+    """Rename and/or flip pinned/archived in one call.
+
+    All fields are optional; omitted fields stay untouched. At least one
+    must be present.
+    """
+    store = get_sqlite_session_store()
     session = await store.get_session(session_id)
-    return {"session": session}
+    if session is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    touched = False
+    if payload.pinned is not None:
+        touched = await store.set_session_pinned(session_id, payload.pinned) or touched
+    if payload.archived is not None:
+        touched = await store.set_session_archived(session_id, payload.archived) or touched
+    if payload.title is not None:
+        touched = await store.update_session_title(session_id, payload.title) or touched
+    if not touched:
+        raise HTTPException(status_code=422, detail="No changes requested")
+    return {"session": await store.get_session(session_id)}
 
 
 @router.delete("/{session_id}")
@@ -175,6 +218,56 @@ async def update_branch_selection(session_id: str, payload: BranchSelectionReque
     if not updated:
         raise HTTPException(status_code=404, detail="Session not found")
     return {"selected_branches": payload.selected_branches}
+
+
+def _render_markdown(session: dict, messages: list[dict]) -> str:
+    title = session.get("title") or "Untitled conversation"
+    created = session.get("created_at") or 0
+    stamp = datetime.fromtimestamp(float(created), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    lines = [f"# {title}", "", f"_Exported from Knorvia · started {stamp} · {len(messages)} messages_", ""]
+    for m in messages:
+        role = m.get("role", "?")
+        content = m.get("content") or ""
+        if not content.strip():
+            continue
+        label = {"user": "🧑 User", "assistant": "🤖 Assistant", "system": "⚙️ System"}.get(role, role.title())
+        lines.append(f"### {label}")
+        lines.append("")
+        lines.append(content)
+        lines.append("")
+    return "\n".join(lines)
+
+
+@router.get("/{session_id}/export")
+async def export_session(
+    session_id: str,
+    format: str = Query(default="json", pattern="^(json|md)$"),
+):
+    """Download a full transcript as JSON or Markdown.
+
+    JSON preserves every stored field (roles, capabilities, metadata,
+    branch parents); Markdown is a clean human-readable document.
+    """
+    store = get_sqlite_session_store()
+    data = await store.export_session(session_id)
+    if data is None:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    safe_stem = "".join(c if c.isalnum() or c in "-_ " else "" for c in (data["session"].get("title") or "chat")).strip() or "chat"
+    if format == "md":
+        body = _render_markdown(data["session"], data["messages"])
+        return {
+            "format": "md",
+            "filename": f"{safe_stem}.md",
+            "mime_type": "text/markdown; charset=utf-8",
+            "content": body,
+        }
+    return {
+        "format": "json",
+        "filename": f"{safe_stem}.json",
+        "mime_type": "application/json",
+        "content": json.dumps(data, ensure_ascii=False, indent=2),
+    }
 
 
 @router.delete("/{session_id}/messages/{message_id}")
