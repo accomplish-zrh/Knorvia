@@ -10,7 +10,7 @@ import {
 import Image from "next/image";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { Menu } from "lucide-react";
+import { Menu, WifiOff } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useDevice } from "@/hooks/useDevice";
 import CommandPalette, {
@@ -57,6 +57,19 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
   useCommandPaletteHotkey(useCallback(() => setPaletteOpen(true), []));
+  // Offline banner: navigator.onLine + a manual probe, because the browser
+  // event alone misses "connected to WiFi but no internet" cases.
+  const [offline, setOffline] = useState(false);
+  useEffect(() => {
+    const sync = () => setOffline(!navigator.onLine);
+    sync();
+    window.addEventListener("online", sync);
+    window.addEventListener("offline", sync);
+    return () => {
+      window.removeEventListener("online", sync);
+      window.removeEventListener("offline", sync);
+    };
+  }, []);
 
   const close = useCallback(() => setDrawerOpen(false), []);
 
@@ -82,7 +95,17 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
     <SidebarDrawerContext.Provider value={{ close }}>
       {/* dvh, not vh: iOS Safari's 100vh includes the retracted address bar, so
           a vh-sized shell pushes the composer under it. */}
-      <div className="flex h-dvh overflow-hidden">
+      <div className="flex h-dvh flex-col overflow-hidden">
+        {offline ? (
+          <div
+            role="status"
+            className="flex shrink-0 items-center justify-center gap-2 bg-amber-500/15 px-4 py-1.5 text-[12px] font-medium text-amber-700 dark:text-amber-400"
+          >
+            <WifiOff size={13} />
+            {t("You are offline. Messages will fail until the connection returns.")}
+          </div>
+        ) : null}
+        <div className="flex min-h-0 flex-1 overflow-hidden">
         {drawerOpen ? (
           <div
             onClick={close}
@@ -131,6 +154,7 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
 
           <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
         </main>
+        </div>
         <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
       </div>
     </SidebarDrawerContext.Provider>

@@ -7,6 +7,8 @@ import {
   getCodeBlockThemeBackground,
 } from "./code-block-themes";
 import { useAppShell } from "../../context/AppShellContext";
+import CopyButton from "./CopyButton";
+import { useTranslation } from "react-i18next";
 
 const MONOSPACE =
   'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace';
@@ -40,6 +42,7 @@ export default function RichCodeBlock({
   lang: string;
   className?: string;
 }) {
+  const { t } = useTranslation();
   const { codeBlockTheme, codeBlockShowLineNumbers, codeBlockWrapLongLines } =
     useAppShell();
   const normalizedLang = (lang || "").toLowerCase();
@@ -58,14 +61,19 @@ export default function RichCodeBlock({
       }`}
       style={{ backgroundColor, color: textColor }}
     >
-      {!isPlain ? (
-        <div
-          className="border-b border-[var(--border)] px-3 py-2 text-[11px] font-medium uppercase tracking-wider"
-          style={{ color: textColor, opacity: 0.8 }}
-        >
-          {normalizedLang}
-        </div>
-      ) : null}
+      <div
+        className="flex items-center justify-between border-b px-3 py-1.5 text-[11px] font-medium uppercase tracking-wider"
+        style={{ borderColor: `${textColor}22` }}
+      >
+        <span style={{ color: textColor, opacity: 0.8 }}>
+          {isPlain ? "code" : normalizedLang}
+        </span>
+        <CopyButton
+          text={raw}
+          label={t("Copy")}
+          copiedLabel={t("Copied")}
+        />
+      </div>
       <SyntaxHighlighter
         language={syntaxLanguage}
         style={syntaxTheme}

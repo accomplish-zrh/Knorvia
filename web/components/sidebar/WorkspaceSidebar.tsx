@@ -10,7 +10,9 @@ import { ProfileLink } from "@/components/auth/ProfileLink";
 import { useUnifiedChat } from "@/context/UnifiedChatContext";
 import {
   deleteSession,
+  exportSession,
   listSessions,
+  updateSessionFlags,
   updateSessionTitle,
   type SessionSummary,
 } from "@/lib/session-api";
@@ -126,6 +128,47 @@ export default function WorkspaceSidebar() {
     [cancelStreamingTurn, newSession, router, selectedSessionId, t],
   );
 
+  const handleTogglePin = useCallback(
+    async (sessionId: string, pinned: boolean) => {
+      await updateSessionFlags(sessionId, { pinned });
+      setSessions(await listSessions(50, 0, { force: true }));
+    },
+    [],
+  );
+
+  const handleToggleArchive = useCallback(
+    async (sessionId: string, archived: boolean) => {
+      await updateSessionFlags(sessionId, { archived });
+      const next = await listSessions(50, 0, { force: true });
+      setSessions(next);
+      if (archived && selectedSessionId === sessionId) {
+        cancelStreamingTurn();
+        newSession();
+        router.push("/home");
+      }
+    },
+    [cancelStreamingTurn, newSession, router, selectedSessionId],
+  );
+
+  const handleExport = useCallback(
+    async (sessionId: string, format: "md" | "json") => {
+      try {
+        const file = await exportSession(sessionId, format);
+        const blob = new Blob([file.content], { type: file.mime_type });
+        const url = URL.createObjectURL(blob);
+        const anchorEl = document.createElement("a");
+        anchorEl.href = url;
+        anchorEl.download = file.filename;
+        anchorEl.click();
+        URL.revokeObjectURL(url);
+      } catch (error) {
+        console.error("Failed to export session", error);
+      }
+    },
+    [],
+  );
+
+
   return (
     <SidebarShell
       showSessions
@@ -138,6 +181,9 @@ export default function WorkspaceSidebar() {
       onSelectSession={handleSelectSession}
       onRenameSession={handleRenameSession}
       onDeleteSession={handleDeleteSession}
+      onTogglePin={handleTogglePin}
+      onToggleArchive={handleToggleArchive}
+      onExport={handleExport}
       footerSlot={(collapsed) => (
         <>
           <ProfileLink collapsed={collapsed} />

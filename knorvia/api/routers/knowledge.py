@@ -27,7 +27,7 @@ from fastapi import (
     WebSocketDisconnect,
 )
 from fastapi.responses import FileResponse, PlainTextResponse, StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from knorvia.api.upload_safety import (
     format_bytes_human_readable,
@@ -2099,6 +2099,126 @@ async def stream_task_logs(task_id: str):
         media_type="text/event-stream",
         headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
     )
+
+
+def _html_to_markdown(title: str, html: str) -> str:
+    """Minimal HTML->Markdown for saved pages: strip scripts/styles/tags,
+    keep headings/links/images/paragraph structure. Zero extra dependencies."""
+    import re as _re
+
+    html = _re.sub(r"<(script|style|noscript)[^>]*>[\s\S]*?</\1>", "", html, flags=_re.I)
+    html = _re.sub(r"<!--.*?-->", "", html, flags=_re.S)
+    match = _re.search(r"<title[^>]*>([\s\S]*?)</title>", html, _re.I)
+    page_title = match.group(1).strip() if match else title
+    body_match = _re.search(r"<body[^>]*>([\s\S]*)</body>", html, _re.I)
+    if body_match:
+        html = body_match.group(1)
+
+    # Headings
+    for level in (6, 5, 4, 3, 2, 1):
+        html = _re.sub(
+            rf"<h{level}[^>]*>(.*?)</h{level}>",
+            lambda m, lv=level: "#" * lv + " " + m.group(1).strip(),
+            html,
+            flags=_re.I | _re.S,
+        )
+    # Links + images (best effort; keep href/src text)
+    html = _re.sub(r'<img[^>]*src="([^"]*)"[^>]*alt="([^"]*)"[^>]*>', r"!\2(\1)", html, flags=_re.I)
+    html = _re.sub(r'<img[^>]*alt="([^"]*)"[^>]*src="([^"]*)"[^>]*>', r"！\1(\2)", html, flags=_re.I)
+    html = _re.sub(r'<img[^>]*src="([^"]*)"[^>]*>', r"(\1)", html, flags=_re.I)
+    html = _re.sub(r'<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)</a>', r"[\2](\1)", html, flags=_re.I | _re.S)
+    # Blocks -> paragraphs / breaks
+    html = _re.sub(r"</(p|div|li|tr|h[1-6])>", "\n", html, flags=_re.I)
+    html = _re.sub(r"<(br|hr)\s*/?>", "\n", html, flags=_re.I)
+    html = _re.sub(r"<li[^>]*>", "- ", html, flags=_re.I)
+    html = _re.sub(r"<[^>]+>", "", html)
+
+    import html as _html
+
+    text = _html.unescape(html)
+    text = _re.sub(r"[ \t]+", " ", text)
+    text = _re.sub(r"\n\s*\n\s*", "\n\n", text)
+    return f"# {page_title}\n\n{text.strip()}\n"
+
+
+class UrlImportRequest(BaseModel):
+    url: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/{kb_name}/import-url")
+async def import_url_to_kb(
+    kb_name: str,
+    payload: UrlImportRequest,
+    background_tasks: BackgroundTasks,
+):
+    """Fetch a web page and ingest it into the knowledge base.
+
+    Saves the cleaned Markdown under raw/ then reuses the standard upload
+    processing task, so chunking/indexing/status are identical to a file
+    upload. AnythingLLM-style "clip a URL" flow.
+    """
+    import httpx
+
+    url = payload.url.strip()
+    if not url.lower().startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail="Only http(s) URLs are supported")
+
+    manager, resolved_name, kb_base_dir = _writable_kb(kb_name)
+    kb_entry = _load_kb_entry_or_404(manager, resolved_name)
+    _assert_kb_writable_or_409(resolved_name, kb_entry)
+    kb_provider = _validate_registered_provider(
+        kb_entry.get("rag_provider") or DEFAULT_PROVIDER
+    )
+    _assert_provider_ready(kb_provider)
+
+    try:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
+            response = await client.get(url, headers={"User-Agent": "Knorvia/1.8 (+knowledge-import)"})
+            response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {exc}") from exc
+
+    content_type = response.headers.get("content-type", "")
+    if "html" in content_type or url.lower().endswith((".html", ".htm")):
+        markdown = _html_to_markdown(url.rsplit("/", 1)[-1] or url, response.text)
+        filename = "imported_page.md"
+    else:
+        raise HTTPException(status_code=422, detail="URL must return an HTML page")
+
+    kb_path = manager.get_knowledge_base_path(resolved_name)
+    raw_dir = kb_path / "raw"
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    target = raw_dir / filename
+    # Single rolling file per KB keeps imports idempotent-ish and predictable.
+    counter = 1
+    while target.exists():
+        counter += 1
+        filename = f"imported_page_{counter}.md"
+        target = raw_dir / filename
+    await asyncio.to_thread(target.write_bytes, markdown.encode("utf-8"))
+
+    task_id = _build_unique_task_id("kb_import_url", resolved_name)
+    get_task_stream_manager().ensure_task(task_id)
+    _mark_kb_queued_for_processing(
+        manager,
+        resolved_name,
+        task_id,
+        f"Processing imported page: {url}",
+    )
+    background_tasks.add_task(
+        run_upload_processing_task,
+        kb_name=resolved_name,
+        base_dir=str(kb_base_dir),
+        uploaded_file_paths=[str(target)],
+        task_id=task_id,
+        rag_provider=kb_provider,
+    )
+    return {
+        "task_id": task_id,
+        "file": filename,
+        "bytes": len(markdown),
+        "url": url,
+    }
 
 
 @router.post("/{kb_name}/upload")

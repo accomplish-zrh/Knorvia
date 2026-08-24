@@ -1097,6 +1097,28 @@ export default function ImageStudioPage() {
     })
   }
 
+  async function downloadAllVisible() {
+    for (let index = 0; index < visibleAssets.length; index += 1) {
+      const asset = visibleAssets[index]
+      try {
+        const response = await fetch(studioAssetUrl(asset.id))
+        const blob = await response.blob()
+        const url = URL.createObjectURL(blob)
+        const link = document.createElement('a')
+        link.href = url
+        const extension = asset.mime?.split('/')[1] || 'png'
+        link.download = `knorvia-${index + 1}.${extension}`
+        link.click()
+        URL.revokeObjectURL(url)
+        // Give the browser a beat between downloads; rapid-fire anchors can
+        // be collapsed into a single download on some browsers.
+        await new Promise(resolve => setTimeout(resolve, 250))
+      } catch (error) {
+        console.error('download failed', error)
+      }
+    }
+  }
+
   async function toggleFavorite(asset: StudioAsset) {
     const activeProjectId = projectIdRef.current
     const epoch = projectEpochRef.current
@@ -1352,13 +1374,21 @@ export default function ImageStudioPage() {
           {uiMode === 'create' ? (
             <div className="min-h-0 flex-1 overflow-y-auto px-4 pt-3 pb-44">
               {!showEmpty ? (
-                <div className="mb-3 flex justify-end">
+                <div className="mb-3 flex items-center justify-end gap-2">
                   <button
                     type="button"
                     onClick={() => setFavoriteOnly(value => !value)}
                     className={`rounded-[10px] px-2.5 py-1 text-[12px] ${favoriteOnly ? 'bg-[var(--muted)] text-[var(--foreground)]' : 'text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55'}`}
                   >
                     {t('Favorites only')}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => void downloadAllVisible()}
+                    disabled={!visibleAssets.length}
+                    className="rounded-[10px] px-2.5 py-1 text-[12px] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 disabled:opacity-40"
+                  >
+                    {t('Download all')} ({visibleAssets.length})
                   </button>
                 </div>
               ) : null}

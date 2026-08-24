@@ -3925,5 +3925,12 @@
   "Chat history": "聊天历史",
   "Reuse parameters": "复用参数",
   "Parameters restored from a previous generation.": "已恢复此前生成的参数。",
-  "Insert from library": "从素材库插入"
+  "Insert from library": "从素材库插入",
+  "You are offline. Messages will fail until the connection returns.": "当前处于离线状态，连接恢复前消息将无法发送。",
+  "Pin chat": "置顶聊天",
+  "Unpin chat": "取消置顶",
+  "Archive chat": "归档聊天",
+  "Unarchive chat": "取消归档",
+  "Export chat as Markdown": "导出为 Markdown",
+  "Download all": "全部下载"
 }

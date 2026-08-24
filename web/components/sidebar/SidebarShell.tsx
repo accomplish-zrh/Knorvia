@@ -153,6 +153,9 @@ interface SidebarShellProps {
   onSelectSession?: (sessionId: string) => void | Promise<void>;
   onRenameSession?: (sessionId: string, title: string) => void | Promise<void>;
   onDeleteSession?: (sessionId: string) => void | Promise<void>;
+  onTogglePin?: (sessionId: string, pinned: boolean) => void | Promise<void>;
+  onToggleArchive?: (sessionId: string, archived: boolean) => void | Promise<void>;
+  onExport?: (sessionId: string, format: "md" | "json") => void | Promise<void>;
   /**
    * Footer content rendered below the nav. Pass a render function to receive
    * the current ``collapsed`` state so footer items (e.g. Admin / Sign out) can
@@ -172,6 +175,9 @@ export function SidebarShell({
   onSelectSession,
   onRenameSession,
   onDeleteSession,
+  onTogglePin,
+  onToggleArchive,
+  onExport,
   footerSlot,
 }: SidebarShellProps) {
   const pathname = usePathname();
@@ -639,6 +645,9 @@ export function SidebarShell({
                   }}
                   onRename={onRenameSession}
                   onDelete={onDeleteSession}
+                  onTogglePin={onTogglePin}
+                  onToggleArchive={onToggleArchive}
+                  onExport={onExport}
                   compact
                 />
               )}

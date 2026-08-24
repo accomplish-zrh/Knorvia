@@ -9,6 +9,19 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Fine-grained UX pass** (third sweep, GitHub parity details):
+  - Code blocks in AI answers gained a copy button with copied-state
+    feedback (`RichCodeBlock` header, all markdown surfaces).
+  - Main sidebar session rows now expose pin/unpin, archive/unarchive and
+    Markdown export (previously only the history picker had them); pinned
+    sessions sort first via the backend.
+  - Offline banner across the app shell when `navigator.onLine` flips false
+    (the chat page previously only toasted on a failed stream).
+  - KB URL import: `POST /knowledge/{kb}/import-url` fetches a page,
+    converts HTML to Markdown (zero-dependency converter) and reuses the
+    standard upload-processing task for indexing; status flows unchanged.
+  - Image Studio batch download of visible results with sequential browser
+    downloads (favorites filter respected).
 - **Session management suite** (sidebar upgrade, inspired by Open WebUI):
   - Full-history search: SQLite FTS5 index over every message (trigger-synced,
     rebuilt on startup) with `GET /api/v1/sessions/search?q=` returning ranked

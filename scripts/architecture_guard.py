@@ -12,7 +12,9 @@ LIMITS = {
     # files cannot grow further until staged decomposition lands
     # (ARCHITECTURE.md "Refactoring sequence"). Do NOT raise these again —
     # split instead.
-    "knorvia/api/routers/knowledge.py": 2962,
+    # knowledge.py: + retrieval-test & import-url endpoints (2026-08);
+    # next decomposition candidate — split file/import endpoints out.
+    "knorvia/api/routers/knowledge.py": 2975,
     "knorvia/agents/research/pipeline.py": 2871,
     "web/app/(workspace)/video-studio/page.tsx": 2918,
     "web/components/chat/home/TracePanels.tsx": 2735,

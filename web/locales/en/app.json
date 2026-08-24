@@ -3925,5 +3925,12 @@
   "Chat history": "Chat history",
   "Reuse parameters": "Reuse parameters",
   "Parameters restored from a previous generation.": "Parameters restored from a previous generation.",
-  "Insert from library": "Insert from library"
+  "Insert from library": "Insert from library",
+  "You are offline. Messages will fail until the connection returns.": "You are offline. Messages will fail until the connection returns.",
+  "Pin chat": "Pin chat",
+  "Unpin chat": "Unpin chat",
+  "Archive chat": "Archive chat",
+  "Unarchive chat": "Unarchive chat",
+  "Export chat as Markdown": "Export chat as Markdown",
+  "Download all": "Download all"
 }

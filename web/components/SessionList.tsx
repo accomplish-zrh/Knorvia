@@ -1,6 +1,15 @@
 "use client";
 
-import { Check, Pencil, Trash2 } from "lucide-react";
+import {
+  Archive,
+  ArchiveRestore,
+  Check,
+  Download,
+  Pencil,
+  Pin,
+  PinOff,
+  Trash2,
+} from "lucide-react";
 import { useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { type SessionSummary } from "@/lib/session-api";
@@ -29,6 +38,9 @@ interface SessionListProps {
   onSelect: (sessionId: string) => void | Promise<void>;
   onRename: (sessionId: string, title: string) => void | Promise<void>;
   onDelete: (sessionId: string) => void | Promise<void>;
+  onTogglePin?: (sessionId: string, pinned: boolean) => void | Promise<void>;
+  onToggleArchive?: (sessionId: string, archived: boolean) => void | Promise<void>;
+  onExport?: (sessionId: string, format: "md" | "json") => void | Promise<void>;
 }
 
 function StatusIndicator({ status }: { status?: SessionRuntimeStatus }) {
@@ -78,6 +90,9 @@ export default function SessionList({
   onSelect,
   onRename,
   onDelete,
+  onTogglePin,
+  onToggleArchive,
+  onExport,
 }: SessionListProps) {
   const { t, i18n } = useTranslation();
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -255,6 +270,30 @@ export default function SessionList({
                     <Pencil size={10} />
                   </button>
                 )}
+                {onTogglePin && (
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void onTogglePin(session.session_id, !(session.pinned ?? 0));
+                    }}
+                    className="rounded p-0.5 text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                    aria-label={t(session.pinned ? "Unpin chat" : "Pin chat")}
+                  >
+                    {session.pinned ? <PinOff size={10} /> : <Pin size={10} />}
+                  </button>
+                )}
+                {onExport && (
+                  <button
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void onExport(session.session_id, "md");
+                    }}
+                    className="rounded p-0.5 text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                    aria-label={t("Export chat as Markdown")}
+                  >
+                    <Download size={10} />
+                  </button>
+                )}
                 <button
                   onClick={(event) => {
                     event.stopPropagation();
@@ -383,6 +422,42 @@ export default function SessionList({
                           aria-label={t("Rename chat")}
                         >
                           <Pencil size={11} />
+                        </button>
+                      )}
+                      {onTogglePin && (
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void onTogglePin(session.session_id, !(session.pinned ?? 0));
+                          }}
+                          className="rounded p-0.5 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)]"
+                          aria-label={t(session.pinned ? "Unpin chat" : "Pin chat")}
+                        >
+                          {session.pinned ? <PinOff size={11} /> : <Pin size={11} />}
+                        </button>
+                      )}
+                      {onToggleArchive && (
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void onToggleArchive(session.session_id, !session.archived_at);
+                          }}
+                          className="rounded p-0.5 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)]"
+                          aria-label={t(session.archived_at ? "Unarchive chat" : "Archive chat")}
+                        >
+                          {session.archived_at ? <ArchiveRestore size={11} /> : <Archive size={11} />}
+                        </button>
+                      )}
+                      {onExport && (
+                        <button
+                          onClick={(event) => {
+                            event.stopPropagation();
+                            void onExport(session.session_id, "md");
+                          }}
+                          className="rounded p-0.5 text-[var(--muted-foreground)] hover:bg-[var(--background)] hover:text-[var(--foreground)]"
+                          aria-label={t("Export chat as Markdown")}
+                        >
+                          <Download size={11} />
                         </button>
                       )}
                       <button
