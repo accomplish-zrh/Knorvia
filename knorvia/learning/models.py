@@ -148,6 +148,10 @@ class RepetitionState(BaseModel):
     consecutive_correct: int = 0
     consecutive_wrong: int = 0
     next_review_at: float
+    # SM-2 adaptive fields (optional so legacy persisted states load).
+    ease_factor: float | None = None
+    last_interval_days: float | None = None
+    repetitions: int = 0
 
 
 class ReviewTask(BaseModel):

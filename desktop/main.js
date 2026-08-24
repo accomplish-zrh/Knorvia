@@ -130,6 +130,51 @@ function createWindow() {
       openAllowedExternal(url);
     }
   });
+
+  setupTray();
+  setupGlobalHotkey();
+}
+
+let tray = null;
+
+function setupTray() {
+  try {
+    const { Tray, Menu, nativeImage } = require("electron");
+    const iconPath = path.join(__dirname, "build", "icon.ico");
+    if (!fs.existsSync(iconPath)) return;
+    tray = new Tray(nativeImage.createFromPath(iconPath));
+    tray.setToolTip("Knorvia");
+    tray.setContextMenu(Menu.buildFromTemplate([
+      { label: "Open Knorvia", click: () => {
+          if (!mainWindow) return;
+          if (mainWindow.isMinimized()) mainWindow.restore();
+          mainWindow.show(); mainWindow.focus();
+        } },
+      { type: "separator" },
+      { label: "Quit", click: () => app.quit() },
+    ]));
+    tray.on("click", () => {
+      if (!mainWindow) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show(); mainWindow.focus();
+    });
+  } catch (error) {
+    console.warn("[desktop] tray unavailable:", error.message);
+  }
+}
+
+function setupGlobalHotkey() {
+  try {
+    const { globalShortcut } = require("electron");
+    globalShortcut.register("Control+Alt+K", () => {
+      if (!mainWindow) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    });
+  } catch (error) {
+    console.warn("[desktop] global hotkey unavailable:", error.message);
+  }
 }
 
 function openAllowedExternal(rawUrl) {
@@ -456,5 +501,8 @@ if (!hasSingleInstanceLock) {
     });
   });
 }
-app.on("before-quit", stopKnorvia);
+app.on("before-quit", () => {
+  try { require("electron").globalShortcut.unregisterAll(); } catch {}
+  stopKnorvia();
+});
 app.on("window-all-closed", () => app.quit());

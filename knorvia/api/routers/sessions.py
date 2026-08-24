@@ -289,6 +289,20 @@ async def delete_turn_by_message(session_id: str, message_id: int):
     return result
 
 
+@router.post("/{session_id}/messages/{message_id}/fork")
+async def fork_session_from_message(session_id: str, message_id: int):
+    """Branch a new session from any historical message.
+
+    Copies the conversation path up to and including the target message
+    into an independent "<title> (fork)" session; the original stays put.
+    """
+    store = get_sqlite_session_store()
+    result = await store.fork_from_message(session_id, message_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {"session": result}
+
+
 @router.post("/{session_id}/quiz-results")
 async def record_quiz_results(session_id: str, payload: QuizResultsRequest):
     if not payload.answers:

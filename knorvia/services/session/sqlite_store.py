@@ -1666,6 +1666,119 @@ class SQLiteSessionStore:
     async def search_sessions(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
         return await self._run(self._search_sessions_sync, query, limit)
 
+    def _fork_from_message_sync(
+        self, session_id: str, message_id: int
+    ) -> dict[str, Any] | None:
+        """Copy this session's ancestor chain of ``message_id`` into a new
+        session (Open WebUI-style fork). Returns the new session summary."""
+        with self._connect() as conn:
+            src = conn.execute(
+                """
+                SELECT id, title, created_at, updated_at
+                FROM sessions WHERE id = ?
+                """,
+                (session_id,),
+            ).fetchone()
+            if src is None:
+                return None
+
+            # Walk parents from the target message back to the root — exactly
+            # the chain get_messages_for_context() feeds the model.
+            chain: list[sqlite3.Row] = []
+            current: int | None = int(message_id)
+            safety = 10_000
+            while current is not None and safety > 0:
+                row = conn.execute(
+                    """
+                    SELECT id, role, content, capability, events_json,
+                           attachments_json, metadata_json, created_at,
+                           parent_message_id
+                    FROM messages
+                    WHERE id = ? AND session_id = ?
+                      AND role IN ('user', 'assistant', 'system')
+                    """,
+                    (current, session_id),
+                ).fetchone()
+                if row is None:
+                    break
+                chain.append(row)
+                parent = row["parent_message_id"]
+                current = int(parent) if parent is not None else None
+                safety -= 1
+            chain.reverse()
+
+        if not chain:
+            return None
+
+        now = time.time()
+        new_title = f"{src['title']} (fork)"[:100]
+        with self._connect() as conn:
+            new_sid = f"fork_{int(now * 1000)}_{session_id[:12]}"
+            conn.execute(
+                """
+                INSERT INTO sessions (id, title, created_at, updated_at)
+                VALUES (?, ?, ?, ?)
+                """,
+                (new_sid, new_title, now, now),
+            )
+
+            prev_new_id: int | None = None
+            for row in chain:
+                ins = conn.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id, role, content, capability, events_json,
+                        attachments_json, metadata_json, created_at,
+                        parent_message_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        new_sid,
+                        row["role"],
+                        row["content"],
+                        row["capability"],
+                        row["events_json"],
+                        row["attachments_json"],
+                        row["metadata_json"],
+                        row["created_at"],
+                        prev_new_id,
+                    ),
+                )
+                prev_new_id = int(ins.lastrowid)
+
+            conn.execute(
+                """
+                UPDATE sessions SET preferences_json = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(
+                        {"forked_from": {"session": session_id, "message": int(message_id)}}
+                    ),
+                    new_sid,
+                ),
+            )
+            conn.commit()
+
+        return {
+            "session_id": new_sid,
+            "title": new_title,
+            "created_at": now,
+            "updated_at": now,
+            "message_count": len(chain),
+            "last_message": "",
+            "pinned": 0,
+            "archived_at": None,
+            "preferences": {
+                "forked_from": {"session": session_id, "message": int(message_id)}
+            },
+        }
+
+    async def fork_from_message(
+        self, session_id: str, message_id: int
+    ) -> dict[str, Any] | None:
+        return await self._run(self._fork_from_message_sync, session_id, message_id)
+
     def _export_session_sync(self, session_id: str) -> dict[str, Any] | None:
         """Full transcript for export: every column the UI/LLM ever saw."""
         with self._connect() as conn:

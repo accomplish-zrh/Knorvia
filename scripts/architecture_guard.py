@@ -28,13 +28,13 @@ LIMITS = {
     "knorvia/services/video_studio/store_base.py": 2000,
     "knorvia/tools/media_gen_tool.py": 2594,
     "knorvia/services/session/turn_runtime.py": 2212,
-    # Session management feature (pin/archive/FTS/export) pushed the store
-    # past the default line; next decomposition candidate — extract the
-    # FTS/search + export surface into its own module.
-    "knorvia/services/session/sqlite_store.py": 2200,
+    # Session management feature (pin/archive/FTS/export/fork) pushed the
+    # store past the default line; next decomposition candidate — extract the
+    # FTS/search + export + fork surface into its own module.
+    "knorvia/services/session/sqlite_store.py": 2300,
+    "web/app/(workspace)/co-writer/[docId]/page.tsx": 2530,
     "knorvia/agents/question/pipeline.py": 2161,
     "web/app/(workspace)/playground/page.tsx": 2082,
-    "web/app/(workspace)/co-writer/[docId]/page.tsx": 2495,
     "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2374,
 }
 SOURCE_ROOTS = ("knorvia", "knorvia_cli", "web/app", "web/components", "web/lib")

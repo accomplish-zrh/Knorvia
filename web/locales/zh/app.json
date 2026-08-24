@@ -3924,5 +3924,6 @@
   "open": "打开",
   "Chat history": "聊天历史",
   "Reuse parameters": "复用参数",
-  "Parameters restored from a previous generation.": "已恢复此前生成的参数。"
+  "Parameters restored from a previous generation.": "已恢复此前生成的参数。",
+  "Insert from library": "从素材库插入"
 }

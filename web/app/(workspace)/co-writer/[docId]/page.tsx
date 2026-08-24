@@ -3,6 +3,8 @@
 import dynamic from "next/dynamic";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { StudioLibraryPicker } from "@/components/library/StudioLibraryPicker"
+import { libraryAssetUrl, type LibraryAsset } from "@/lib/creative-library-api"
 import { CreationDeskSwitch } from "@/components/sidebar/CreationDeskSwitch";
 import {
   ArrowRight,
@@ -707,6 +709,17 @@ export default function CoWriterPage() {
     measureSelectionAnchor,
     selectionPopoverPinned,
   ]);
+
+  const [libraryOpen, setLibraryOpen] = useState(false);
+
+  const insertLibraryAsset = (asset: LibraryAsset) => {
+    if ((asset.kind || 'text') === 'image') {
+      const alt = asset.title || asset.source || 'asset';
+      insertSnippet(`![${alt}](${libraryAssetUrl(asset.id)})\n`);
+    } else {
+      insertSnippet(asset.content ?? '');
+    }
+  };
 
   const insertSnippet = useCallback(
     (snippet: string) => {
@@ -1813,6 +1826,15 @@ export default function CoWriterPage() {
         </div>
       </header>
 
+      <StudioLibraryPicker
+        open={libraryOpen}
+        onClose={() => setLibraryOpen(false)}
+        onPickAsset={asset => {
+          insertLibraryAsset(asset)
+          setLibraryOpen(false)
+        }}
+        kinds={['image', 'video', 'text']}
+      />
       {/* ── Toolbar ── */}
       <div className="flex shrink-0 items-center gap-0.5 overflow-x-auto border-b border-[var(--border)] px-3 py-1">
         {TOOLBAR.map((item) => {
@@ -1838,6 +1860,15 @@ export default function CoWriterPage() {
             </button>
           );
         })}
+
+        <button
+          type="button"
+          title={t("Insert from library")}
+          onClick={() => setLibraryOpen(true)}
+          className="ml-1 shrink-0 rounded-md p-1.5 text-[var(--muted-foreground)] transition-colors hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)] active:scale-[0.97]"
+        >
+          <ImageIcon size={16} />
+        </button>
 
         <div className="ml-auto flex shrink-0 items-center gap-1.5 pl-3 text-[10.5px] text-[var(--muted-foreground)]">
           <button
