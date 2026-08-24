@@ -103,9 +103,45 @@ function ensureDesktopDefaults(root) {
 
 function loadingPage() {
   const logo = fs.readFileSync(path.join(__dirname, "build", "logo.png")).toString("base64");
+  // Palette mirrors globals.css: cream light / warm dark, terracotta accent.
   const html = `<!doctype html><meta charset="utf-8"><title>Knorvia</title>
-  <style>body{margin:0;background:#f7f8fc;color:#18181b;font:15px system-ui;display:grid;place-items:center;height:100vh}.box{text-align:center}.logo{width:96px;height:96px;object-fit:contain;filter:drop-shadow(0 16px 22px #24324a24)}h1{font-size:25px;margin:18px 0 8px;letter-spacing:-.03em}.muted{color:#71717a}.dot{display:inline-block;animation:p 1.2s infinite}@keyframes p{50%{opacity:.25}}</style>
-  <div class="box"><img class="logo" src="data:image/png;base64,${logo}" alt=""><h1>Knorvia</h1><div class="muted">正在启动桌面 AI 引擎… <span class="dot">●</span></div></div>`;
+  <style>
+    :root { --bg:#faf7ef; --fg:#1c1816; --muted:#71717a; --track:#f1ede2; --accent:#b0501e; }
+    @media (prefers-color-scheme: dark) {
+      :root { --bg:#191411; --fg:#f3ede4; --muted:#a8a29e; --track:#2b241f; --accent:#d4734b; }
+    }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--fg); font:15px system-ui,-apple-system,"Segoe UI",sans-serif;
+           display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; overflow:hidden; }
+    .ring { position:relative; width:112px; height:112px; display:grid; place-items:center; }
+    .ring img { width:72px; height:72px; object-fit:contain; position:relative; z-index:2;
+                filter:drop-shadow(0 16px 22px rgba(36,50,74,.14)); animation:breathe 1.8s ease-in-out infinite; }
+    .orbit { position:absolute; inset:0; border-radius:9999px; border:1px solid color-mix(in srgb, var(--accent) 28%, transparent); }
+    .orbit::before { content:""; position:absolute; top:-3.5px; left:calc(50% - 3.5px); width:7px; height:7px;
+                     border-radius:9999px; background:var(--accent); opacity:.85; }
+    .orbit.o1 { animation:spin 2.4s linear infinite; }
+    .orbit.o2 { animation:spin 3.4s linear infinite reverse; opacity:.65; }
+    .orbit.o2::before { top:auto; bottom:-3.5px; }
+    h1 { font-size:25px; margin:20px 0 6px; letter-spacing:-.03em; animation:rise .7s cubic-bezier(.16,1,.3,1) both; }
+    .muted { color:var(--muted); font-size:13px; animation:rise .7s .12s cubic-bezier(.16,1,.3,1) both; }
+    .bar { margin-top:24px; width:160px; height:2px; border-radius:9999px; background:var(--track); overflow:hidden; }
+    .bar i { display:block; height:100%; background:var(--accent); border-radius:inherit; transform-origin:left;
+             animation:sweep 1.4s cubic-bezier(.4,0,.2,1) infinite; }
+    @keyframes breathe { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(.94);opacity:.88} }
+    @keyframes spin { to { transform:rotate(360deg) } }
+    @keyframes sweep { 0%{transform:scaleX(0);opacity:.4} 55%{transform:scaleX(.75);opacity:1} 100%{transform:scaleX(1);opacity:.25} }
+    @keyframes rise { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+    @media (prefers-reduced-motion: reduce) {
+      .ring img,.orbit,.bar i,h1,.muted { animation:none !important; }
+    }
+  </style>
+  <div class="ring">
+    <span class="orbit o1"></span><span class="orbit o2"></span>
+    <img src="data:image/png;base64,${logo}" alt="">
+  </div>
+  <h1>Knorvia</h1>
+  <div class="muted">正在启动桌面 AI 引擎…</div>
+  <div class="bar"><i></i></div>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
