@@ -104,6 +104,9 @@ function ensureDesktopDefaults(root) {
 function loadingPage() {
   const logo = fs.readFileSync(path.join(__dirname, "build", "logo.png")).toString("base64");
   // Palette mirrors globals.css: cream light / warm dark, terracotta accent.
+  // Choreography mirrors BootSplash v2 (web/components/common/BootSplash.tsx):
+  // settle-in logo -> conic ring wipe -> orbit motes with glow -> wordmark
+  // letter-spacing tighten -> gradient shimmer bar. Pure CSS, no deps.
   const html = `<!doctype html><meta charset="utf-8"><title>Knorvia</title>
   <style>
     :root { --bg:#faf7ef; --fg:#1c1816; --muted:#71717a; --track:#f1ede2; --accent:#b0501e; }
@@ -113,30 +116,53 @@ function loadingPage() {
     * { box-sizing:border-box; }
     body { margin:0; background:var(--bg); color:var(--fg); font:15px system-ui,-apple-system,"Segoe UI",sans-serif;
            display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; overflow:hidden; }
-    .ring { position:relative; width:112px; height:112px; display:grid; place-items:center; }
-    .ring img { width:72px; height:72px; object-fit:contain; position:relative; z-index:2;
-                filter:drop-shadow(0 16px 22px rgba(36,50,74,.14)); animation:breathe 1.8s ease-in-out infinite; }
-    .orbit { position:absolute; inset:0; border-radius:9999px; border:1px solid color-mix(in srgb, var(--accent) 28%, transparent); }
-    .orbit::before { content:""; position:absolute; top:-3.5px; left:calc(50% - 3.5px); width:7px; height:7px;
-                     border-radius:9999px; background:var(--accent); opacity:.85; }
-    .orbit.o1 { animation:spin 2.4s linear infinite; }
-    .orbit.o2 { animation:spin 3.4s linear infinite reverse; opacity:.65; }
-    .orbit.o2::before { top:auto; bottom:-3.5px; }
-    h1 { font-size:25px; margin:20px 0 6px; letter-spacing:-.03em; animation:rise .7s cubic-bezier(.16,1,.3,1) both; }
-    .muted { color:var(--muted); font-size:13px; animation:rise .7s .12s cubic-bezier(.16,1,.3,1) both; }
-    .bar { margin-top:24px; width:160px; height:2px; border-radius:9999px; background:var(--track); overflow:hidden; }
-    .bar i { display:block; height:100%; background:var(--accent); border-radius:inherit; transform-origin:left;
-             animation:sweep 1.4s cubic-bezier(.4,0,.2,1) infinite; }
-    @keyframes breathe { 0%,100%{transform:scale(1);opacity:1} 50%{transform:scale(.94);opacity:.88} }
+    .emblem { position:relative; width:128px; height:128px; display:grid; place-items:center; }
+    .emblem img { width:76px; height:76px; object-fit:contain; position:relative; z-index:2;
+                  filter:drop-shadow(0 16px 22px rgba(36,50,74,.14));
+                  animation:settle .65s cubic-bezier(.16,1,.3,1) both, breathe 2.2s .65s ease-in-out infinite; }
+    .ring { position:absolute; border-radius:9999px; pointer-events:none;
+            animation:ringIn .8s cubic-bezier(.16,1,.3,1) both; }
+    .ring.outer { inset:0;
+      background:conic-gradient(from 180deg, var(--accent) 0deg, color-mix(in srgb, var(--accent) 26%, transparent) 110deg, transparent 200deg, transparent 360deg);
+      -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px));
+              mask:radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px)); }
+    .ring.inner { inset:14px; animation-delay:.12s;
+      background:conic-gradient(from 0deg, color-mix(in srgb, var(--accent) 55%, transparent) 0deg, transparent 140deg, transparent 360deg);
+      -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 1px), #000 calc(100% - 1px));
+              mask:radial-gradient(farthest-side, transparent calc(100% - 1px), #000 calc(100% - 1px)); }
+    .orbit { position:absolute; inset:0; animation:spin 1.9s linear infinite; }
+    .orbit.rev { inset:14px; animation-duration:2.9s; animation-direction:reverse; }
+    .mote { position:absolute; top:-2.5px; left:calc(50% - 2.5px); width:5px; height:5px; border-radius:9999px;
+            background:var(--accent); box-shadow:0 0 10px 1px color-mix(in srgb, var(--accent) 55%, transparent);
+            animation:moteIn .5s .35s both; }
+    .orbit.rev .mote { width:4px; height:4px; top:auto; bottom:-2px; opacity:.6; box-shadow:none; }
+    h1 { font-size:25px; font-weight:600; margin:28px 0 6px; font-family:Georgia,'Times New Roman',serif;
+         animation:riseTrack .75s .18s cubic-bezier(.16,1,.3,1) both; }
+    .muted { color:var(--muted); font-size:13px; line-height:1;
+             animation:riseTrack .75s .3s cubic-bezier(.16,1,.3,1) both; }
+    .bar { margin-top:28px; width:176px; height:3px; border-radius:9999px; background:var(--track);
+           overflow:hidden; opacity:0; animation:fadeIn .4s .5s ease-out both; }
+    .bar i { display:block; height:100%; width:100%; border-radius:inherit;
+             background:linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--accent) 70%, transparent) 30%, var(--accent) 50%, color-mix(in srgb, var(--accent) 70%, transparent) 70%, transparent 100%);
+             background-size:220% 100%; animation:shimmer 1.25s linear infinite; }
+    @keyframes settle { from{opacity:0;transform:scale(.86)} to{opacity:1;transform:scale(1)} }
+    @keyframes breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(.955)} }
+    @keyframes ringIn { from{opacity:0;transform:rotate(-120deg) scale(.92)} to{opacity:1;transform:rotate(0) scale(1)} }
     @keyframes spin { to { transform:rotate(360deg) } }
-    @keyframes sweep { 0%{transform:scaleX(0);opacity:.4} 55%{transform:scaleX(.75);opacity:1} 100%{transform:scaleX(1);opacity:.25} }
-    @keyframes rise { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+    @keyframes moteIn { from{opacity:0} to{opacity:1} }
+    @keyframes riseTrack { from{opacity:0;transform:translateY(10px);letter-spacing:.14em}
+                           to{opacity:1;transform:none;letter-spacing:-.02em} }
+    @keyframes shimmer { from{background-position:130% 0} to{background-position:-90% 0} }
+    @keyframes fadeIn { from{opacity:0} to{opacity:1} }
     @media (prefers-reduced-motion: reduce) {
-      .ring img,.orbit,.bar i,h1,.muted { animation:none !important; }
+      .emblem img,.ring,.orbit,.bar i,h1,.muted,.bar { animation:none !important; }
+      .ring,.bar,.mote,h1,.muted { opacity:1 !important; }
     }
   </style>
-  <div class="ring">
-    <span class="orbit o1"></span><span class="orbit o2"></span>
+  <div class="emblem">
+    <span class="ring outer"></span><span class="ring inner"></span>
+    <span class="orbit"><i class="mote"></i></span>
+    <span class="orbit rev"><i class="mote"></i></span>
     <img src="data:image/png;base64,${logo}" alt="">
   </div>
   <h1>Knorvia</h1>
