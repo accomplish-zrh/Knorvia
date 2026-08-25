@@ -151,7 +151,14 @@ export type Catalog = {
 }
 
 export type UiSettings = {
-  theme: 'light' | 'dark' | 'glass' | 'snow'
+  theme:
+    | 'light'
+    | 'dark'
+    | 'glass'
+    | 'snow'
+    | 'ocean-glass'
+    | 'aurora-glass'
+    | 'rose-glass'
   language: 'en' | 'zh'
   response_language: 'en' | 'zh'
   code_block_theme: string

@@ -3,7 +3,14 @@
  * Handles light/dark theme with localStorage fallback and system preference detection
  */
 
-export type Theme = "light" | "dark" | "glass" | "snow";
+export type Theme =
+  | "light"
+  | "dark"
+  | "glass"
+  | "snow"
+  | "ocean-glass"
+  | "aurora-glass"
+  | "rose-glass";
 
 export const THEME_STORAGE_KEY = "knorvia-theme";
 
@@ -39,7 +46,10 @@ export function getStoredTheme(): Theme | null {
       stored === "light" ||
       stored === "dark" ||
       stored === "glass" ||
-      stored === "snow"
+      stored === "snow" ||
+      stored === "ocean-glass" ||
+      stored === "aurora-glass" ||
+      stored === "rose-glass"
     ) {
       return stored;
     }
@@ -86,15 +96,34 @@ export function applyThemeToDocument(theme: Theme): void {
 
   const html = document.documentElement;
 
-  html.classList.remove("dark", "theme-glass", "theme-snow");
+  html.classList.remove(
+    "dark",
+    "theme-glass",
+    "theme-snow",
+    "theme-ocean-glass",
+    "theme-aurora-glass",
+    "theme-rose-glass",
+  );
 
   if (theme === "dark") {
     html.classList.add("dark");
   } else if (theme === "glass") {
     html.classList.add("dark", "theme-glass");
+  } else if (theme === "ocean-glass") {
+    html.classList.add("dark", "theme-ocean-glass");
+  } else if (theme === "aurora-glass") {
+    html.classList.add("dark", "theme-aurora-glass");
+  } else if (theme === "rose-glass") {
+    html.classList.add("dark", "theme-rose-glass");
   } else if (theme === "snow") {
     html.classList.add("theme-snow");
   }
+
+  // Native translucency (desktop shell): glass themes ask the main process
+  // for the acrylic backdrop; everything else restores the opaque backing.
+  import("@/lib/native-glass")
+    .then(({ applyNativeGlassForTheme }) => applyNativeGlassForTheme(theme))
+    .catch(() => {});
 }
 
 /**

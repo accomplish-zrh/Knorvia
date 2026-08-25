@@ -28,12 +28,18 @@ export default function ThemeScript() {
         }
         const stored = localStorage.getItem('knorvia-theme');
 
-        document.documentElement.classList.remove('dark', 'theme-glass', 'theme-snow');
+        document.documentElement.classList.remove('dark', 'theme-glass', 'theme-snow', 'theme-ocean-glass', 'theme-aurora-glass', 'theme-rose-glass');
 
         if (stored === 'dark') {
           document.documentElement.classList.add('dark');
         } else if (stored === 'glass') {
           document.documentElement.classList.add('dark', 'theme-glass');
+        } else if (stored === 'ocean-glass') {
+          document.documentElement.classList.add('dark', 'theme-ocean-glass');
+        } else if (stored === 'aurora-glass') {
+          document.documentElement.classList.add('dark', 'theme-aurora-glass');
+        } else if (stored === 'rose-glass') {
+          document.documentElement.classList.add('dark', 'theme-rose-glass');
         } else if (stored === 'snow') {
           document.documentElement.classList.add('theme-snow');
         } else if (stored === 'light') {
