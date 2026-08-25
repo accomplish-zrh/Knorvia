@@ -145,80 +145,10 @@ function loadingPage() {
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
-// ── Window translucency (Hermes-style native glass) ────────────────
-// Windows: acrylic/mica system backdrop via setBackgroundMaterial — needs
-// Win11 build >= 22621. macOS: vibrancy. The web layer must keep its field
-// surfaces translucent for the material to read; it keys off the
-// 'data-knorvia-glass' attribute set from the chosen theme.
-const GLASS_MIN_WINDOWS_BUILD = 22621;
-const GLASS_SUPPORTED = (() => {
-  if (process.platform === "darwin") return true;
-  if (process.platform !== "win32") return false;
-  const build = Number.parseInt(os.release().split(".")[2] ?? "", 10);
-  return Number.isFinite(build) && build >= GLASS_MIN_WINDOWS_BUILD;
-})();
-const TRANSLUCENCY_CONFIG_PATH = path.join(app.getPath("userData"), "translucency.json");
-let translucencyState = (() => {
-  try {
-    const parsed = JSON.parse(fs.readFileSync(TRANSLUCENCY_CONFIG_PATH, "utf8"));
-    return { mode: parsed.mode === "glass" ? "glass" : "clear", intensity: Number(parsed.intensity) || 0 };
-  } catch {
-    return { mode: "clear", intensity: 0 };
-  }
-})();
-
-function glassActive() {
-  return GLASS_SUPPORTED && translucencyState.mode === "glass" && translucencyState.intensity > 0;
-}
-
-function writeTranslucencyState() {
-  try {
-    fs.mkdirSync(path.dirname(TRANSLUCENCY_CONFIG_PATH), { recursive: true });
-    fs.writeFileSync(TRANSLUCENCY_CONFIG_PATH, JSON.stringify(translucencyState, null, 2), "utf8");
-  } catch (_err) { /* best effort */ }
-}
-
-function applyWindowTranslucency(win) {
-  if (!win || win.isDestroyed()) return;
-  try {
-    const active = glassActive();
-    if (!active && typeof win.setBackgroundColor === "function") {
-      // Restore an opaque backing when glass turns off.
-      win.setBackgroundColor("#f7f8fc");
-    }
-    if (process.platform === "win32" && typeof win.setBackgroundMaterial === "function") {
-      win.setBackgroundMaterial(active ? "acrylic" : "none");
-    }
-    if (process.platform === "darwin" && typeof win.setVibrancy === "function") {
-      win.setVibrancy(active ? "under-window" : null);
-    }
-  } catch (err) {
-    console.warn("[translucency] apply failed:", err.message);
-  }
-}
-
-ipcMain.on("knorvia:translucency:support", (event) => {
-  event.returnValue = { glass: GLASS_SUPPORTED };
-});
-
-ipcMain.on("knorvia:translucency:set", (_event, payload) => {
-  const mode = payload && payload.mode === "glass" ? "glass" : "clear";
-  let intensity = Number(payload && payload.intensity);
-  if (!Number.isFinite(intensity)) intensity = mode === "glass" ? 100 : 0;
-  intensity = Math.max(0, Math.min(100, Math.round(intensity)));
-  if (mode === translucencyState.mode && intensity === translucencyState.intensity) return;
-  translucencyState = { mode, intensity };
-  writeTranslucencyState();
-  for (const win of BrowserWindow.getAllWindows()) applyWindowTranslucency(win);
-});
-
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1440, height: 920, minWidth: 1050, minHeight: 700, show: false,
-    autoHideMenuBar: true,
-    ...(glassActive()
-      ? {} // glass boot: omit the opaque backing so the material reads
-      : { backgroundColor: "#f7f8fc" }),
+    autoHideMenuBar: true, backgroundColor: "#f7f8fc",
     icon: path.join(__dirname, "build", "icon.ico"),
     webPreferences: {
       preload: path.join(__dirname, "preload.js"), contextIsolation: true,
@@ -226,10 +156,7 @@ function createWindow() {
     },
   });
   mainWindow.loadURL(loadingPage());
-  mainWindow.once("ready-to-show", () => {
-    if (glassActive()) applyWindowTranslucency(mainWindow);
-    mainWindow.show();
-  });
+  mainWindow.once("ready-to-show", () => mainWindow.show());
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     openAllowedExternal(url); return { action: "deny" };
   });
