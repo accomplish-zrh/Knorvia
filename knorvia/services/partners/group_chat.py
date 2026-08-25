@@ -9,6 +9,7 @@ so transcripts persist per-partner exactly like botdm sessions.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from typing import Any
@@ -17,6 +18,18 @@ from knorvia.partners.bus.events import InboundMessage
 from knorvia.services.partners.group_rooms import GroupRoomStore, Room, RoomMessage, new_room
 
 logger = logging.getLogger(__name__)
+
+GROUP_TRANSCRIPT_MAX = 200
+MEMBER_TURN_TIMEOUT_SECONDS = 300
+
+_room_locks: dict[str, asyncio.Lock] = {}
+
+
+def _lock_for(room_id: str) -> asyncio.Lock:
+    lock = _room_locks.get(room_id)
+    if lock is None:
+        lock = _room_locks[room_id] = asyncio.Lock()
+    return lock
 
 
 class GroupChatEngine:
@@ -94,6 +107,18 @@ class GroupChatEngine:
         max_speakers: int | None = None,
     ) -> dict[str, Any]:
         """User speaks into the room; every member answers once in turn."""
+        async with _lock_for(room_id):
+            return await self._send_user_message_locked(
+                room_id, content, max_speakers=max_speakers
+            )
+
+    async def _send_user_message_locked(
+        self,
+        room_id: str,
+        content: str,
+        *,
+        max_speakers: int | None = None,
+    ) -> dict[str, Any]:
         from knorvia.services.partners import get_partner_manager
 
         manager = get_partner_manager()
@@ -132,7 +157,14 @@ class GroupChatEngine:
                 session_key_override=f"group:{room.id}",
             )
             try:
-                reply = await instance.runner.process_message(msg)
+                reply = await asyncio.wait_for(
+                    instance.runner.process_message(msg),
+                    timeout=MEMBER_TURN_TIMEOUT_SECONDS,
+                )
+            except asyncio.TimeoutError:
+                logger.warning("group turn timed out for %s in %s", pid, room.id)
+                replies.append({"partner": pid, "status": "timeout", "reply": ""})
+                continue
             except Exception as exc:  # noqa: BLE001 - one bad member must not kill the room
                 logger.exception("group turn failed for %s in %s", pid, room.id)
                 replies.append({"partner": pid, "status": "error", "reply": str(exc)})
@@ -141,6 +173,8 @@ class GroupChatEngine:
             room.messages.append(RoomMessage(pid, name, reply, time.time()))
             replies.append({"partner": pid, "status": "ok", "reply": reply})
 
+        if len(room.messages) > GROUP_TRANSCRIPT_MAX:
+            room.messages = room.messages[-GROUP_TRANSCRIPT_MAX:]
         self._store.save(room)
         return {
             "room_id": room.id,
