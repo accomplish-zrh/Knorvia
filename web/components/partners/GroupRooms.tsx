@@ -40,6 +40,7 @@ export default function GroupRooms() {
   const [transcript, setTranscript] = useState<RoomTranscriptMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [speaking, setSpeaking] = useState(false);
+  const [mentionOpen, setMentionOpen] = useState(false);
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const refresh = useCallback(async () => {
@@ -106,6 +107,22 @@ export default function GroupRooms() {
     } finally {
       setCreating(false);
     }
+  };
+
+  const activeRoom = rooms.find(room => room.id === activeId) ?? null;
+
+  const onDraftChange = (value: string) => {
+    setDraft(value);
+    // Open the picker when "@" was just typed at start or after whitespace.
+    const charAt = value[value.length - 1];
+    setMentionOpen(charAt === "@");
+  };
+
+  const insertMention = (name: string) => {
+    setDraft(prev =>
+      prev.endsWith("@") ? `${prev}${name} ` : `${prev}@${name} `,
+    );
+    setMentionOpen(false);
   };
 
   const say = async () => {
@@ -274,14 +291,30 @@ export default function GroupRooms() {
             )}
             <div ref={bottomRef} />
           </div>
+          {mentionOpen && activeRoom && (
+            <div className="flex flex-wrap gap-1 border-b border-[var(--border)] px-3 pb-2 pt-2">
+              {activeRoom.members.map(pid => (
+                <button
+                  key={pid}
+                  type="button"
+                  onClick={() =>
+                    insertMention(activeRoom.member_names[pid] || pid)
+                  }
+                  className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11.5px] text-[var(--muted-foreground)] transition-colors hover:border-[var(--primary)]/50 hover:text-[var(--foreground)]"
+                >
+                  @{activeRoom.member_names[pid] || pid}
+                </button>
+              ))}
+            </div>
+          )}
           <div className="flex items-center gap-2 border-t border-[var(--border)] p-2">
             <input
               value={draft}
-              onChange={event => setDraft(event.target.value)}
+              onChange={event => onDraftChange(event.target.value)}
               onKeyDown={event => {
                 if (event.key === "Enter") void say();
               }}
-              placeholder={t("Say something to the whole room…")}
+              placeholder={t("Say something — use @ to address one partner")}
               className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-[12.5px] outline-none focus:border-[var(--primary)]/50"
             />
             <button

@@ -99,6 +99,30 @@ class GroupChatEngine:
 
     # ── Conversation ─────────────────────────────────────────────
 
+    def _resolve_mentions(
+        self, room: "Room", content: str
+    ) -> list[str] | None:
+        """Member ids explicitly @addressed in *content*, or None for all."""
+        import re
+
+        tokens = {t.lower() for t in re.findall(r"@([\w\-\u4e00-\u9fff]+)", content)}
+        if not tokens:
+            return None
+
+        from knorvia.services.partners import get_partner_manager
+
+        manager = get_partner_manager()
+        named: list[str] = []
+        for pid in room.members:
+            instance = manager.get_partner(pid)
+            display = ""
+            if instance and getattr(instance, "config", None):
+                display = getattr(instance.config, "name", "") or ""
+            haystacks = {pid.lower(), str(display).strip().lower()}
+            if tokens & haystacks:
+                named.append(pid)
+        return named or None
+
     async def send_user_message(
         self,
         room_id: str,
@@ -128,7 +152,11 @@ class GroupChatEngine:
 
         now = time.time()
         room.messages.append(RoomMessage("user", "user", content, now))
-        speakers = [pid for pid in room.members]
+        mentioned = self._resolve_mentions(room, content)
+        if mentioned is not None:
+            speakers = mentioned
+        else:
+            speakers = [pid for pid in room.members]
         if max_speakers is not None:
             speakers = speakers[: max(1, max_speakers)]
 
@@ -142,11 +170,17 @@ class GroupChatEngine:
                 getattr(getattr(instance, "config", None), "name", "") or pid
             )
             transcript = self._render_transcript(room)
+            addressed = mentioned is not None and pid in mentioned
             prompt = (
                 f"You are in a group chat with other partners and the user. "
                 f"Transcript so far:\n\n{transcript}\n\n"
-                f"It is your turn to speak. Answer the latest message directly "
-                f"and concisely; do not repeat what others said."
+                + (
+                    "You were @addressed by name. Respond to the point raised. "
+                    if addressed
+                    else "It is your turn to speak. "
+                )
+                + "Answer the latest message directly and concisely; do not "
+                "repeat what others said."
             )
             msg = InboundMessage(
                 channel="group",
