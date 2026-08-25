@@ -1,21 +1,29 @@
 "use client";
 
 /**
- * Group chat rooms UI — roster row type + chat surface for 2-6 partners
- * coordinating in one shared space (Hermes bot-mode group parity).
+ * Group chat rooms v2 — rooms start empty; the user seats CLI-backed
+ * members (claude/codex/grok/... or a partner), gives each a room-local
+ * display name and identity word, and chats. Every member's CLI session
+ * is anchored to this room: reopening resumes exactly that history.
  */
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Loader2, Send, Users, X } from "lucide-react";
+import { Loader2, Send, Trash2, Users, X } from "lucide-react";
 import { apiFetch, apiUrl } from "@/lib/api";
-import { listPartners, type PartnerInfo } from "@/lib/partners-api";
+import { listSubagentConnections } from "@/lib/subagents-api";
+
+interface RoomMemberInfo {
+  backend: string;
+  connection: string;
+  display_name: string;
+  persona: string;
+}
 
 interface RoomSummary {
   id: string;
   name: string;
-  members: string[];
-  member_names: Record<string, string>;
+  members: RoomMemberInfo[];
   message_count: number;
   last_message: string;
   last_timestamp: number;
@@ -28,30 +36,51 @@ interface RoomTranscriptMessage {
   timestamp?: number;
 }
 
+const BACKEND_OPTIONS = [
+  { value: "claude_code", label: "Claude Code" },
+  { value: "codex", label: "Codex CLI" },
+  { value: "gemini", label: "Gemini CLI" },
+  { value: "grok_build", label: "Grok Build" },
+  { value: "kimi", label: "Kimi CLI" },
+  { value: "opencode", label: "opencode" },
+  { value: "mimo", label: "MiMo Code" },
+  { value: "partner", label: "Partner" },
+];
+
 export default function GroupRooms() {
   const { t } = useTranslation();
   const [rooms, setRooms] = useState<RoomSummary[]>([]);
-  const [partners, setPartners] = useState<PartnerInfo[]>([]);
+  const [connections, setConnections] = useState<
+    { name: string; agent_kind?: string }[]
+  >([]);
   const [loading, setLoading] = useState(true);
-  const [creating, setCreating] = useState(false);
   const [newName, setNewName] = useState("");
-  const [selected, setSelected] = useState<string[]>([]);
+  const [creating, setCreating] = useState(false);
+
   const [activeId, setActiveId] = useState<string | null>(null);
+  const [members, setMembers] = useState<RoomMemberInfo[]>([]);
   const [transcript, setTranscript] = useState<RoomTranscriptMessage[]>([]);
   const [draft, setDraft] = useState("");
   const [speaking, setSpeaking] = useState(false);
   const [mentionOpen, setMentionOpen] = useState(false);
+
+  // add-member form state
+  const [showAdd, setShowAdd] = useState(false);
+  const [addBackend, setAddBackend] = useState("claude_code");
+  const [addConnection, setAddConnection] = useState("");
+  const [addDisplay, setAddDisplay] = useState("");
+  const [addPersona, setAddPersona] = useState("");
+
   const bottomRef = useRef<HTMLDivElement>(null);
 
   const refresh = useCallback(async () => {
     try {
-      const data = (await apiFetch(
-        apiUrl("/api/v1/partners/groups"),
-        { cache: "no-store" },
-      )) as unknown as { rooms: RoomSummary[] };
+      const data = (await apiFetch(apiUrl("/api/v1/partners/groups"), {
+        cache: "no-store",
+      })) as unknown as { rooms: RoomSummary[] };
       setRooms(data.rooms ?? []);
     } catch {
-      /* roster refresh is best-effort */
+      /* best effort */
     } finally {
       setLoading(false);
     }
@@ -59,8 +88,15 @@ export default function GroupRooms() {
 
   useEffect(() => {
     void refresh();
-    listPartners()
-      .then(setPartners)
+    listSubagentConnections()
+      .then((conns: unknown) =>
+        setConnections(
+          (Array.isArray(conns) ? conns : []) as {
+            name: string;
+            agent_kind?: string;
+          }[],
+        ),
+      )
       .catch(() => {});
   }, [refresh]);
 
@@ -70,9 +106,14 @@ export default function GroupRooms() {
       cache: "no-store",
     })
       .then(response =>
-        (response.json() as Promise<{ room: { messages: RoomTranscriptMessage[] } }>).then(
-          data => setTranscript(data.room?.messages ?? []),
-        ),
+        (
+          response.json() as Promise<{
+            room: { members: RoomMemberInfo[]; messages: RoomTranscriptMessage[] };
+          }>
+        ).then(data => {
+          setMembers(data.room?.members ?? []);
+          setTranscript(data.room?.messages ?? []);
+        }),
       )
       .catch(() => {});
   }, [activeId]);
@@ -81,55 +122,87 @@ export default function GroupRooms() {
     bottomRef.current?.scrollIntoView({ block: "end" });
   }, [transcript]);
 
-  const toggleMember = (pid: string) => {
-    setSelected(prev =>
-      prev.includes(pid)
-        ? prev.filter(id => id !== pid)
-        : prev.length >= 6
-          ? prev
-          : [...prev, pid],
-    );
-  };
-
   const create = async () => {
-    if (!newName.trim() || selected.length < 2 || creating) return;
+    if (!newName.trim() || creating) return;
     setCreating(true);
     try {
       const data = (await apiFetch(apiUrl("/api/v1/partners/groups"), {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ name: newName.trim(), members: selected }),
+        body: JSON.stringify({ name: newName.trim() }),
       })) as unknown as { room: { id: string } };
       setNewName("");
-      setSelected([]);
       await refresh();
       setActiveId(data.room.id);
+      setShowAdd(true);
     } finally {
       setCreating(false);
     }
   };
 
-  const activeRoom = rooms.find(room => room.id === activeId) ?? null;
-
-  const onDraftChange = (value: string) => {
-    setDraft(value);
-    // Open the picker when "@" was just typed at start or after whitespace.
-    const charAt = value[value.length - 1];
-    setMentionOpen(charAt === "@");
+  const addMember = async () => {
+    if (!activeId || !addConnection.trim()) return;
+    try {
+      await apiFetch(
+        apiUrl(`/api/v1/partners/groups/${encodeURIComponent(activeId)}/members`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            backend: addBackend,
+            connection: addConnection.trim(),
+            display_name: addDisplay.trim(),
+            persona: addPersona.trim(),
+          }),
+        },
+      );
+      setAddConnection("");
+      setAddDisplay("");
+      setAddPersona("");
+      setShowAdd(false);
+      // Reload the open room.
+      const data = (await apiFetch(
+        apiUrl(`/api/v1/partners/groups/${encodeURIComponent(activeId)}`),
+        { cache: "no-store" },
+      )) as unknown as { room: { members: RoomMemberInfo[] } };
+      setMembers(data.room?.members ?? []);
+      void refresh();
+    } catch {
+      /* surfaced by global handler */
+    }
   };
 
-  const insertMention = (name: string) => {
-    setDraft(prev =>
-      prev.endsWith("@") ? `${prev}${name} ` : `${prev}@${name} `,
+  const updateMember = async (connection: string, persona: string) => {
+    if (!activeId) return;
+    await apiFetch(
+      apiUrl(`/api/v1/partners/groups/${encodeURIComponent(activeId)}/member`),
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ connection, persona }),
+      },
+    ).catch(() => {});
+    setMembers(prev =>
+      prev.map(m => (m.connection === connection ? { ...m, persona } : m)),
     );
-    setMentionOpen(false);
+  };
+
+  const removeMember = async (connection: string) => {
+    if (!activeId) return;
+    await apiFetch(
+      apiUrl(
+        `/api/v1/partners/groups/${encodeURIComponent(activeId)}/members/${encodeURIComponent(connection)}`,
+      ),
+      { method: "DELETE" },
+    ).catch(() => {});
+    setMembers(prev => prev.filter(m => m.connection !== connection));
+    void refresh();
   };
 
   const say = async () => {
     const text = draft.trim();
     if (!text || !activeId || speaking) return;
     setSpeaking(true);
-    // Optimistically show the user's own line.
     setTranscript(prev => [
       ...prev,
       { sender: "user", sender_name: "user", content: text },
@@ -153,9 +226,21 @@ export default function GroupRooms() {
     }
   };
 
+  const activeRoom = rooms.find(room => room.id === activeId) ?? null;
+
+  const onDraftChange = (value: string) => {
+    setDraft(value);
+    setMentionOpen(value[value.length - 1] === "@");
+  };
+
+  const insertMention = (name: string) => {
+    setDraft(prev => (prev.endsWith("@") ? `${prev}${name} ` : `${prev}@${name} `));
+    setMentionOpen(false);
+  };
+
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-4">
-      {/* Create room */}
+      {/* Create room (empty at birth) */}
       <div className="rounded-2xl border border-[var(--border)] bg-[var(--card)]/60 p-4">
         <div className="mb-2 flex items-center gap-2 text-[13px] font-semibold text-[var(--foreground)]">
           <Users size={15} className="text-[var(--primary)]" />
@@ -167,37 +252,21 @@ export default function GroupRooms() {
             onChange={event => setNewName(event.target.value)}
             placeholder={t("Group name")}
             maxLength={80}
-            className="w-48 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[var(--primary)]/50"
+            className="w-56 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[var(--primary)]/50"
           />
-          <div className="flex flex-wrap items-center gap-1">
-            {partners.slice(0, 12).map(partner => (
-              <button
-                key={partner.partner_id}
-                type="button"
-                onClick={() => toggleMember(partner.partner_id)}
-                className={`rounded-full border px-2.5 py-1 text-[11.5px] transition-colors ${
-                  selected.includes(partner.partner_id)
-                    ? "border-[var(--primary)]/60 bg-[var(--primary)]/10 text-[var(--foreground)]"
-                    : "border-[var(--border)] text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
-                }`}
-              >
-                {partner.name || partner.partner_id}
-              </button>
-            ))}
-          </div>
           <button
             type="button"
             onClick={() => void create()}
-            disabled={!newName.trim() || selected.length < 2 || creating}
-            className="ml-auto inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12.5px] font-medium text-[var(--primary-foreground)] disabled:opacity-40"
+            disabled={!newName.trim() || creating}
+            className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12.5px] font-medium text-[var(--primary-foreground)] disabled:opacity-40"
           >
             {creating ? <Loader2 size={13} className="animate-spin" /> : null}
-            {t("Create room")}
+            {t("Create empty room")}
           </button>
+          <span className="text-[11px] text-[var(--muted-foreground)]">
+            {t("Then seat CLI-backed members inside — each keeps its own anchored session.")}
+          </span>
         </div>
-        <p className="mt-1.5 text-[11px] text-[var(--muted-foreground)]">
-          {t("Pick 2 to 6 partners; they take turns answering in the room.")}
-        </p>
       </div>
 
       {/* Rooms */}
@@ -228,42 +297,144 @@ export default function GroupRooms() {
               <p className="mt-0.5 line-clamp-1 text-[11.5px] text-[var(--muted-foreground)]">
                 {room.last_message || t("No messages yet")}
               </p>
-              {activeId === room.id && (
-                <div className="mt-1.5 flex flex-wrap gap-1">
-                  {room.members.map(pid => (
-                    <span
-                      key={pid}
-                      className="rounded-full bg-[var(--muted)] px-2 py-0.5 text-[10.5px] text-[var(--muted-foreground)]"
-                    >
-                      {room.member_names[pid] || pid}
-                    </span>
-                  ))}
-                </div>
-              )}
             </div>
           ))}
         </div>
       )}
 
-      {/* Active room chat */}
-      {activeId && (
-        <div className="flex min-h-[320px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)]/60">
+      {/* Active room */}
+      {activeId && activeRoom && (
+        <div className="flex min-h-[360px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)]/60">
           <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-2">
             <span className="text-[13px] font-semibold text-[var(--foreground)]">
-              {rooms.find(room => room.id === activeId)?.name ?? activeId}
+              {activeRoom.name}
             </span>
-            <button
-              type="button"
-              onClick={() => {
-                setActiveId(null);
-                setTranscript([]);
-              }}
-              className="rounded-md p-1 text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
-            >
-              <X size={14} />
-            </button>
+            <div className="flex items-center gap-1.5">
+              <button
+                type="button"
+                onClick={() => setShowAdd(prev => !prev)}
+                className="rounded-md border border-[var(--border)] px-2 py-0.5 text-[11px] text-[var(--foreground)]"
+              >
+                + {t("Add member")}
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setActiveId(null);
+                  setMembers([]);
+                  setTranscript([]);
+                }}
+                className="rounded-md p-1 text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)]"
+              >
+                <X size={14} />
+              </button>
+            </div>
           </div>
-          <div className="max-h-[46vh] min-h-0 flex-1 overflow-y-auto px-4 py-3">
+
+          {/* Members strip with room-local rename + persona */}
+          <div className="flex flex-wrap items-center gap-2 border-b border-[var(--border)] px-4 py-2">
+            {members.length === 0 && (
+              <span className="text-[11.5px] text-[var(--muted-foreground)]">
+                {t("Empty room — add a member to start talking.")}
+              </span>
+            )}
+            {members.map(member => (
+              <div
+                key={member.connection}
+                className="flex items-center gap-1.5 rounded-full bg-[var(--muted)]/50 py-1 pl-2.5 pr-1.5"
+              >
+                <span className="text-[11.5px] font-medium text-[var(--foreground)]">
+                  {member.display_name || member.connection}
+                </span>
+                <span className="rounded-full bg-[var(--background)] px-1.5 text-[10px] text-[var(--muted-foreground)]">
+                  {BACKEND_OPTIONS.find(b => b.value === member.backend)?.label ??
+                    member.backend}
+                </span>
+                <input
+                  defaultValue={member.persona}
+                  placeholder={t("identity word")}
+                  onBlur={event => {
+                    if (event.target.value !== member.persona)
+                      void updateMember(member.connection, event.target.value);
+                  }}
+                  className="w-24 rounded-full border border-transparent bg-transparent px-1.5 text-[10.5px] text-[var(--muted-foreground)] outline-none focus:border-[var(--primary)]/40 focus:text-[var(--foreground)]"
+                />
+                <button
+                  type="button"
+                  onClick={() => void removeMember(member.connection)}
+                  className="rounded-full p-0.5 text-[var(--muted-foreground)] hover:text-[var(--destructive)]"
+                >
+                  <Trash2 size={11} />
+                </button>
+              </div>
+            ))}
+          </div>
+
+          {/* Add-member form */}
+          {showAdd && (
+            <div className="flex flex-wrap items-end gap-2 border-b border-[var(--border)] bg-[var(--muted)]/25 px-4 py-3">
+              <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                {t("Backend")}
+                <select
+                  value={addBackend}
+                  onChange={event => setAddBackend(event.target.value)}
+                  className="rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] outline-none"
+                >
+                  {BACKEND_OPTIONS.map(option => (
+                    <option key={option.value} value={option.value}>
+                      {option.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                {t("Connection")}
+                <input
+                  value={addConnection}
+                  onChange={event => setAddConnection(event.target.value)}
+                  placeholder={
+                    connections[0]?.name ?? t("connected agent name")
+                  }
+                  list="grp-conn-list"
+                  className="w-36 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] outline-none"
+                />
+                <datalist id="grp-conn-list">
+                  {connections.map(connection => (
+                    <option key={connection.name} value={connection.name} />
+                  ))}
+                </datalist>
+              </label>
+              <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                {t("Display name")}
+                <input
+                  value={addDisplay}
+                  onChange={event => setAddDisplay(event.target.value)}
+                  placeholder={t("e.g. Researcher")}
+                  className="w-28 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] outline-none"
+                />
+              </label>
+              <label className="flex flex-col gap-1 text-[10.5px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                {t("Identity word")}
+                <input
+                  value={addPersona}
+                  onChange={event => setAddPersona(event.target.value)}
+                  placeholder={t("e.g. rigorous, concise")}
+                  className="w-32 rounded-lg border border-[var(--border)] bg-[var(--background)] px-2 py-1.5 text-[12px] outline-none"
+                />
+              </label>
+              <button
+                type="button"
+                onClick={() => void addMember()}
+                disabled={!addConnection.trim()}
+                className="rounded-lg bg-[var(--primary)] px-3 py-1.5 text-[12px] font-medium text-[var(--primary-foreground)] disabled:opacity-40"
+              >
+                {t("Seat member")}
+              </button>
+            </div>
+          )}
+
+          {/* Transcript */}
+          <div className="max-h-[42vh] min-h-0 flex-1 overflow-y-auto px-4 py-3">
             {transcript.map((message, index) => (
               <div
                 key={`${message.sender}-${index}`}
@@ -286,41 +457,52 @@ export default function GroupRooms() {
             {speaking && (
               <div className="flex items-center gap-1.5 text-[11.5px] text-[var(--muted-foreground)]">
                 <Loader2 size={12} className="animate-spin" />
-                {t("The partners are thinking…")}
+                {t("The members are thinking…")}
               </div>
             )}
             <div ref={bottomRef} />
           </div>
-          {mentionOpen && activeRoom && (
-            <div className="flex flex-wrap gap-1 border-b border-[var(--border)] px-3 pb-2 pt-2">
-              {activeRoom.members.map(pid => (
-                <button
-                  key={pid}
-                  type="button"
-                  onClick={() =>
-                    insertMention(activeRoom.member_names[pid] || pid)
-                  }
-                  className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11.5px] text-[var(--muted-foreground)] transition-colors hover:border-[var(--primary)]/50 hover:text-[var(--foreground)]"
-                >
-                  @{activeRoom.member_names[pid] || pid}
-                </button>
-              ))}
-            </div>
-          )}
-          <div className="flex items-center gap-2 border-t border-[var(--border)] p-2">
+
+          {/* Composer */}
+          {mentionOpen &&
+            members.map(member => ({
+              name: member.display_name || member.connection,
+              id: member.connection,
+            })).length > 0 && (
+              <div className="flex flex-wrap gap-1 border-t border-[var(--border)] px-3 pb-2 pt-2">
+                {members.map(member => (
+                  <button
+                    key={member.connection}
+                    type="button"
+                    onClick={() =>
+                      insertMention(member.display_name || member.connection)
+                    }
+                    className="rounded-full border border-[var(--border)] px-2.5 py-1 text-[11.5px] text-[var(--muted-foreground)] transition-colors hover:border-[var(--primary)]/50 hover:text-[var(--foreground)]"
+                  >
+                    @{member.display_name || member.connection}
+                  </button>
+                ))}
+              </div>
+            )}
+          <div className="flex items-center gap-2 p-2">
             <input
               value={draft}
               onChange={event => onDraftChange(event.target.value)}
               onKeyDown={event => {
                 if (event.key === "Enter") void say();
               }}
-              placeholder={t("Say something — use @ to address one partner")}
-              className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-[12.5px] outline-none focus:border-[var(--primary)]/50"
+              placeholder={
+                members.length === 0
+                  ? t("Add a member first")
+                  : t("Say something — use @ to address one partner")
+              }
+              disabled={members.length === 0}
+              className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-[12.5px] outline-none focus:border-[var(--primary)]/50 disabled:opacity-50"
             />
             <button
               type="button"
               onClick={() => void say()}
-              disabled={speaking || !draft.trim()}
+              disabled={speaking || !draft.trim() || members.length === 0}
               className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-[var(--primary)] text-[var(--primary-foreground)] disabled:opacity-40"
             >
               <Send size={15} />

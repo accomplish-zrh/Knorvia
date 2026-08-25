@@ -34,10 +34,40 @@ class RoomMessage:
 
 
 @dataclass
+class RoomMember:
+    """One seat in the room. ``backend`` is a subagent kind (claude_code,
+    codex, grok_build, ..., partner); ``connection`` is the KB connection
+    name it consults through. Display name and persona are room-local:
+    renaming here never touches the shared connection."""
+
+    backend: str
+    connection: str
+    display_name: str = ""
+    persona: str = ""  # identity word(s) injected into the member's prompt
+
+    def to_dict(self) -> dict:
+        return {
+            "backend": self.backend,
+            "connection": self.connection,
+            "display_name": self.display_name,
+            "persona": self.persona,
+        }
+
+
+def _member_from_dict(data: dict) -> RoomMember:
+    return RoomMember(
+        backend=str(data.get("backend", "")),
+        connection=str(data.get("connection", "")),
+        display_name=str(data.get("display_name", "")),
+        persona=str(data.get("persona", "")),
+    )
+
+
+@dataclass
 class Room:
     id: str
     name: str
-    members: list[str] = field(default_factory=list)
+    members: list["RoomMember"] = field(default_factory=list)
     messages: list[RoomMessage] = field(default_factory=list)
     created_at: float = 0.0
 
@@ -65,11 +95,16 @@ class GroupRoomStore:
                         for m in data.get("messages", [])
                         if isinstance(m, dict)
                     ]
+                    members = [
+                        _member_from_dict(m)
+                        for m in data.get("members", [])
+                        if isinstance(m, dict)
+                    ]
                     rooms.append(
                         Room(
                             id=data["id"],
                             name=data.get("name", ""),
-                            members=list(data.get("members", [])),
+                            members=members,
                             messages=msgs,
                             created_at=float(data.get("created_at", 0)),
                         )
@@ -100,15 +135,12 @@ class GroupRoomStore:
         return False
 
 
-def new_room(name: str, members: list[str]) -> Room:
+def new_room(name: str) -> Room:
+    """Rooms are born EMPTY — the user adds CLI-backed members afterwards."""
     import time
 
-    unique = [m for i, m in enumerate(members) if m and m not in members[:i]]
-    if not (2 <= len(unique) <= MAX_MEMBERS):
-        raise ValueError(f"A group needs 2-{MAX_MEMBERS} distinct members.")
     return Room(
         id=f"grp_{uuid.uuid4().hex[:10]}",
         name=name.strip() or "Group",
-        members=unique,
         created_at=time.time(),
     )

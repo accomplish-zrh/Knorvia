@@ -14,8 +14,13 @@ import logging
 import time
 from typing import Any
 
-from knorvia.partners.bus.events import InboundMessage
-from knorvia.services.partners.group_rooms import GroupRoomStore, Room, RoomMessage, new_room
+from knorvia.services.partners.group_rooms import (
+    GroupRoomStore,
+    Room,
+    RoomMember,
+    RoomMessage,
+    new_room,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -40,8 +45,8 @@ class GroupChatEngine:
 
     # ── CRUD passthrough ──────────────────────────────────────────
 
-    def create_room(self, name: str, members: list[str]) -> Room:
-        room = new_room(name, members)
+    def create_room(self, name: str) -> Room:
+        room = new_room(name)
         self._store.save(room)
         return room
 
@@ -53,14 +58,70 @@ class GroupChatEngine:
         self._store.save(room)
         return room
 
-    def set_members(self, room_id: str, members: list[str]) -> Room | None:
-        unique = [m for i, m in enumerate(members) if m and m not in members[:i]]
-        if not (2 <= len(unique) <= 6):
-            raise ValueError("A group needs 2-6 distinct members.")
+    def add_member(
+        self,
+        room_id: str,
+        *,
+        backend: str,
+        connection: str,
+        display_name: str = "",
+        persona: str = "",
+    ) -> Room | None:
+        """Seat one CLI-backed agent in the room (max 6 seats)."""
+        from knorvia.services.subagent import get_backend, list_backend_kinds
+
+        if backend not in list_backend_kinds():
+            raise ValueError(f"Unknown agent backend {backend!r}.")
+        if get_backend(backend) is None:
+            raise ValueError(f"Unknown agent backend {backend!r}.")
         room = self._store.get(room_id)
         if not room:
             return None
-        room.members = unique
+        if len(room.members) >= 6:
+            raise ValueError("A room holds at most 6 members.")
+        if any(m.connection == connection for m in room.members):
+            raise ValueError(f"{connection!r} is already in this room.")
+        room.members.append(
+            RoomMember(
+                backend=backend,
+                connection=connection,
+                display_name=display_name.strip(),
+                persona=persona.strip(),
+            )
+        )
+        self._store.save(room)
+        return room
+
+    def remove_member(self, room_id: str, connection: str) -> Room | None:
+        room = self._store.get(room_id)
+        if not room:
+            return None
+        before = len(room.members)
+        room.members = [m for m in room.members if m.connection != connection]
+        if len(room.members) == before:
+            return None
+        self._store.save(room)
+        return room
+
+    def update_member(
+        self,
+        room_id: str,
+        connection: str,
+        *,
+        display_name: str | None = None,
+        persona: str | None = None,
+    ) -> Room | None:
+        """Room-local rename / identity word — the connection is untouched."""
+        room = self._store.get(room_id)
+        if not room:
+            return None
+        member = next((m for m in room.members if m.connection == connection), None)
+        if not member:
+            return None
+        if display_name is not None:
+            member.display_name = display_name.strip()
+        if persona is not None:
+            member.persona = persona.strip()
         self._store.save(room)
         return room
 
@@ -71,25 +132,14 @@ class GroupChatEngine:
         return self._store.get(room_id)
 
     def list_rooms(self) -> list[dict[str, Any]]:
-        from knorvia.services.partners import get_partner_manager
-
-        manager = get_partner_manager()
         rooms = []
         for room in self._store.list_rooms():
-            names = {}
-            for pid in room.members:
-                inst = manager.get_partner(pid)
-                cfg_name = ""
-                if inst and getattr(inst, "config", None):
-                    cfg_name = getattr(inst.config, "name", "")
-                names[pid] = cfg_name or pid
             last = room.messages[-1] if room.messages else None
             rooms.append(
                 {
                     "id": room.id,
                     "name": room.name,
-                    "members": room.members,
-                    "member_names": names,
+                    "members": [m.to_dict() for m in room.members],
                     "message_count": len(room.messages),
                     "last_message": (last.content[:120] if last else ""),
                     "last_timestamp": (last.timestamp if last else room.created_at),
@@ -101,26 +151,27 @@ class GroupChatEngine:
 
     def _resolve_mentions(
         self, room: "Room", content: str
-    ) -> list[str] | None:
-        """Member ids explicitly @addressed in *content*, or None for all."""
+    ) -> list["RoomMember"] | None:
+        """Members explicitly @addressed in *content*, or None for all.
+
+        Matches @display_name and @connection (case-insensitive). Unknown
+        @names are ignored — a typo falls back to the full round instead of
+        swallowing the message.
+        """
         import re
 
         tokens = {t.lower() for t in re.findall(r"@([\w\-\u4e00-\u9fff]+)", content)}
         if not tokens:
             return None
 
-        from knorvia.services.partners import get_partner_manager
-
-        manager = get_partner_manager()
-        named: list[str] = []
-        for pid in room.members:
-            instance = manager.get_partner(pid)
-            display = ""
-            if instance and getattr(instance, "config", None):
-                display = getattr(instance.config, "name", "") or ""
-            haystacks = {pid.lower(), str(display).strip().lower()}
+        named: list[RoomMember] = []
+        for member in room.members:
+            haystacks = {
+                member.connection.lower(),
+                member.display_name.strip().lower(),
+            }
             if tokens & haystacks:
-                named.append(pid)
+                named.append(member)
         return named or None
 
     async def send_user_message(
@@ -143,12 +194,13 @@ class GroupChatEngine:
         *,
         max_speakers: int | None = None,
     ) -> dict[str, Any]:
-        from knorvia.services.partners import get_partner_manager
-
-        manager = get_partner_manager()
         room = self._store.get(room_id)
         if not room:
             raise LookupError(f"Room {room_id!r} not found")
+        if not room.members:
+            raise ValueError(
+                "This room has no members yet — add a CLI-backed member first."
+            )
 
         now = time.time()
         room.messages.append(RoomMessage("user", "user", content, now))
@@ -156,23 +208,23 @@ class GroupChatEngine:
         if mentioned is not None:
             speakers = mentioned
         else:
-            speakers = [pid for pid in room.members]
+            speakers = list(room.members)
         if max_speakers is not None:
             speakers = speakers[: max(1, max_speakers)]
 
-        replies: list[dict[str, str]] = []
-        for pid in speakers:
-            instance = manager.get_partner(pid)
-            if not instance or not instance.running or not instance.runner:
-                replies.append({"partner": pid, "status": "skipped", "reply": ""})
-                continue
-            name = (
-                getattr(getattr(instance, "config", None), "name", "") or pid
-            )
+        replies: list[dict[str, Any]] = []
+        for member in speakers:
+            name = member.display_name or member.connection
             transcript = self._render_transcript(room)
-            addressed = mentioned is not None and pid in mentioned
+            addressed = mentioned is not None and member in mentioned
+            persona_line = (
+                f"Your identity in this room: {member.persona}. "
+                if member.persona
+                else ""
+            )
             prompt = (
-                f"You are in a group chat with other partners and the user. "
+                f"You are one of several agents in a group chat with the user. "
+                f"{persona_line}"
                 f"Transcript so far:\n\n{transcript}\n\n"
                 + (
                     "You were @addressed by name. Respond to the point raised. "
@@ -182,30 +234,23 @@ class GroupChatEngine:
                 + "Answer the latest message directly and concisely; do not "
                 "repeat what others said."
             )
-            msg = InboundMessage(
-                channel="group",
-                sender_id="room",
-                chat_id=room.id,
-                content=prompt,
-                metadata={"_group_room": room.id},
-                session_key_override=f"group:{room.id}",
-            )
             try:
                 reply = await asyncio.wait_for(
-                    instance.runner.process_message(msg),
+                    self._consult_member(room, member, prompt),
                     timeout=MEMBER_TURN_TIMEOUT_SECONDS,
                 )
             except asyncio.TimeoutError:
-                logger.warning("group turn timed out for %s in %s", pid, room.id)
-                replies.append({"partner": pid, "status": "timeout", "reply": ""})
+                logger.warning("group turn timed out for %s in %s", member.connection, room.id)
+                replies.append({"member": name, "status": "timeout", "reply": ""})
                 continue
             except Exception as exc:  # noqa: BLE001 - one bad member must not kill the room
-                logger.exception("group turn failed for %s in %s", pid, room.id)
-                replies.append({"partner": pid, "status": "error", "reply": str(exc)})
+                logger.exception("group turn failed for %s in %s", member.connection, room.id)
+                replies.append({"member": name, "status": "error", "reply": str(exc)})
                 continue
             reply = (reply or "").strip()
-            room.messages.append(RoomMessage(pid, name, reply, time.time()))
-            replies.append({"partner": pid, "status": "ok", "reply": reply})
+            if reply:
+                room.messages.append(RoomMessage(member.connection, name, reply, time.time()))
+            replies.append({"member": name, "status": "ok", "reply": reply})
 
         if len(room.messages) > GROUP_TRANSCRIPT_MAX:
             room.messages = room.messages[-GROUP_TRANSCRIPT_MAX:]
@@ -219,7 +264,42 @@ class GroupChatEngine:
             ],
         }
 
-    def _render_transcript(self, room: Room) -> str:
+    async def _consult_member(
+        self, room: "Room", member: "RoomMember", prompt: str
+    ) -> str:
+        """One member's turn through its real subagent backend.
+
+        Session anchoring: the cross-turn registry key is
+        ``room:<room_id>::<connection>`` — reopening this room resumes
+        exactly that CLI session; different rooms never share history.
+        """
+        from knorvia.services.subagent import get_backend, load_subagent_settings
+
+        backend = get_backend(member.backend)
+        if backend is None:
+            raise ValueError(f"Unknown agent backend {member.backend!r}.")
+        config = load_subagent_settings().backend(member.backend)
+
+        from knorvia.services.subagent.sessions import get_session, remember_session, session_key
+
+        anchor_key = session_key(f"room:{room.id}", member.connection)
+        resume_id = get_session(anchor_key)
+
+        def _on_event(_event) -> None:  # noqa: ANN001 - events unused in rooms
+            return None
+
+        result = await backend.consult(
+            prompt,
+            on_event=_on_event,
+            cwd=None,
+            session_id=resume_id,
+            config=config,
+        )
+        if result.session_id:
+            remember_session(anchor_key, result.session_id, kind=member.backend)
+        return (result.final_text or "").strip()
+
+    def _render_transcript(self, room: "Room") -> str:
         lines = []
         for m in room.messages[-20:]:
             who = "user" if m.sender == "user" else f"{m.sender_name} ({m.sender})"
