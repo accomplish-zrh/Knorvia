@@ -19,6 +19,7 @@ export type PreviewKind =
   | "docx"
   | "xlsx"
   | "pptx"
+  | "univer"
   | "office-text"
   | "fallback";
 
@@ -94,6 +95,7 @@ export function previewKindFor(source: FilePreviewSource): PreviewKind {
   if (ext === ".svg" || mime === "image/svg+xml") return "svg";
   if (isImage(source, ext)) return "image";
   if (MARKDOWN_EXTS.has(ext) || mime === "text/markdown") return "markdown";
+  if (ext === ".univer") return "univer";
   if (
     DOCX_EXTS.has(ext) ||
     mime ===

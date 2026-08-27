@@ -24,6 +24,15 @@ from typing import Any
 
 from knorvia.core.tool_protocol import BaseTool, ToolDefinition, ToolResult
 from knorvia.services.office_draft import DraftError, OfficeDraftStore
+from knorvia.services.univer_container import (
+    UNIT_TYPES,
+    ContainerError,
+    add_unit,
+    export_unit,
+    list_units,
+    open_univer,
+    pack_univer,
+)
 from knorvia.tools.prompting import load_prompt_hints
 
 WRITE_ACTIONS = (
@@ -37,10 +46,14 @@ WRITE_ACTIONS = (
     "export_doc",
     "export_slide",
     "screenshot_hint",
+    "container_new",
+    "container_add",
+    "container_export_unit",
 )
 LIFECYCLE_ACTIONS = ("ready", "merge", "discard", "status")
 DRAFT_ACTIONS = ("create",) + LIFECYCLE_ACTIONS
 ACTIONS = WRITE_ACTIONS + LIFECYCLE_ACTIONS
+CONTAINER_ACTIONS = ("container_new", "container_add", "container_export_unit")
 
 _SHEET_FORBIDDEN = re.compile(r"[:\\/?*\[\]]")
 _HEADING = re.compile(r"^(#{1,3})\s+(.*\S)\s*$")
@@ -64,8 +77,10 @@ _TOOL_DESCRIPTION = (
     "Markdown subset (#/##/### headings, - lists, |a|b| tables, paragraphs) "
     "to .docx. `export_slide` builds a 16:9 deck from an outline (level-1 "
     "heading = new slide title; bullets = body). `screenshot_hint` returns a "
-    "text grid (and a PNG preview when possible). Independent draft actions: "
-    "ready | merge | discard | status (also via `draft_action`)."
+    "text grid (and a PNG preview when possible). Multi-unit `.univer` ZIP "
+    "containers: `container_new` → `container_add` (unit_type=sheet|doc|slide, "
+    "optional source_file / refs) → `container_export_unit`. Independent "
+    "draft actions: ready | merge | discard | status (also via `draft_action`)."
 )
 
 
@@ -741,13 +756,186 @@ def _prepare_draft(
     return store, draft_id, workspace
 
 
+def _resolve_source_file(
+    write_ws: Path,
+    workspace: Path,
+    source_name: str,
+) -> Path:
+    """Locate ``source_file`` in the draft write dir first, then the workspace."""
+    raw = str(source_name or "").strip()
+    if not raw:
+        raise ValueError("`source_file` is required when provided")
+    for root in (write_ws, workspace):
+        try:
+            candidate = _resolve_file(root, raw)
+        except ValueError:
+            continue
+        if candidate.is_file():
+            return candidate
+    raise ValueError(f"source_file not found: {raw}")
+
+
+def _parse_refs(raw: Any) -> list[dict[str, Any]]:
+    payload = _maybe_json(raw)
+    if payload in (None, "", [], {}):
+        return []
+    if isinstance(payload, dict):
+        payload = [payload]
+    if not isinstance(payload, list):
+        raise ValueError(
+            '`refs` must be a list like [{"to":"sheet","range":"A1:B5"}]'
+        )
+    refs: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            raise ValueError("each refs entry must be an object")
+        refs.append(item)
+    return refs
+
+
+def _action_container_new(
+    path: Path,
+    kwargs: dict[str, Any],
+    workspace: Path,
+    cwd_fallback: bool,
+    *,
+    write_ws: Path | None = None,
+    official_ws: Path | None = None,
+) -> ToolResult:
+    path = _ensure_suffix(path, ".univer")
+    units_raw = _maybe_json(kwargs.get("units") or kwargs.get("cells"))
+    entries: list[dict[str, Any]] = []
+    if isinstance(units_raw, list):
+        for item in units_raw:
+            if not isinstance(item, dict):
+                raise ValueError("each units entry must be an object")
+            entries.append(dict(item))
+    refs = _parse_refs(kwargs.get("refs"))
+    # Optional seed: pack an existing native file as the first unit.
+    source_name = str(kwargs.get("source_file") or "").strip()
+    if source_name:
+        source_path = _resolve_source_file(
+            write_ws or workspace,
+            official_ws or workspace,
+            source_name,
+        )
+        suffix = source_path.suffix.lower()
+        type_map = {".xlsx": "sheet", ".xlsm": "sheet", ".docx": "doc", ".pptx": "slide"}
+        unit_type = type_map.get(suffix)
+        if unit_type is None:
+            raise ValueError(
+                "source_file for container_new must be .xlsx / .docx / .pptx"
+            )
+        unit_id = str(kwargs.get("unit_id") or "").strip()
+        if not unit_id:
+            stem = Path(source_name).stem
+            unit_id = stem if re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,31}", stem) else unit_type
+        entries.append(
+            {
+                "id": unit_id,
+                "type": unit_type,
+                "name": str(kwargs.get("unit_name") or kwargs.get("sheet") or unit_id),
+                "source": source_path,
+            }
+        )
+    manifest = pack_univer(entries, path, refs=refs or None)
+    rel = _rel(path, workspace)
+    extra = f" (absolute {path})" if cwd_fallback else ""
+    count = len(manifest.get("units") or [])
+    return _ok(
+        f"Created .univer container {rel} with {count} unit(s){extra}.",
+        rel,
+        units=manifest.get("units") or [],
+        refs=manifest.get("refs") or [],
+    )
+
+
+def _action_container_add(
+    path: Path,
+    kwargs: dict[str, Any],
+    workspace: Path,
+    write_ws: Path,
+    official_ws: Path,
+) -> ToolResult:
+    path = _ensure_suffix(path, ".univer")
+    if not path.is_file():
+        raise ValueError(
+            f"Container {path.name!r} does not exist. Call action=container_new first."
+        )
+    unit_type = str(kwargs.get("unit_type") or "").strip().lower()
+    if unit_type not in UNIT_TYPES:
+        raise ValueError(
+            f"`unit_type` is required for container_add ({', '.join(UNIT_TYPES)})"
+        )
+    unit_name = str(
+        kwargs.get("unit_name") or kwargs.get("name") or kwargs.get("sheet") or ""
+    ).strip() or None
+    unit_id = str(kwargs.get("unit_id") or "").strip() or None
+    source_bytes: bytes | None = None
+    source_name = str(kwargs.get("source_file") or "").strip()
+    if source_name:
+        source_path = _resolve_source_file(write_ws, official_ws, source_name)
+        source_bytes = source_path.read_bytes()
+    refs = _parse_refs(kwargs.get("refs"))
+    unit = add_unit(
+        path,
+        unit_type,
+        unit_name,
+        source_bytes,
+        unit_id=unit_id,
+        refs=refs or None,
+    )
+    rel = _rel(path, workspace)
+    ref_note = ""
+    if refs:
+        ref_note = f", recorded {len(refs)} ref(s)"
+    return _ok(
+        f"Added {unit['type']} unit {unit['id']!r} to {rel}{ref_note}.",
+        rel,
+        unit=unit,
+        units=list_units(path),
+        refs=open_univer(path).get("refs") or [],
+    )
+
+
+def _action_container_export_unit(
+    path: Path,
+    kwargs: dict[str, Any],
+    workspace: Path,
+    write_ws: Path,
+) -> ToolResult:
+    path = _ensure_suffix(path, ".univer")
+    if not path.is_file():
+        raise ValueError(f"Container {path.name!r} does not exist.")
+    unit_id = str(kwargs.get("unit_id") or "").strip()
+    if not unit_id:
+        raise ValueError("`unit_id` is required for container_export_unit")
+    out_name = str(kwargs.get("export_file") or kwargs.get("output") or "").strip()
+    if not out_name:
+        out_name = unit_id
+    out_path = _resolve_file(write_ws, out_name)
+    exported = export_unit(path, unit_id, out_path)
+    rel = _rel(exported, write_ws)
+    return _ok(
+        f"Exported unit {unit_id!r} from {path.name} to {rel}.",
+        rel,
+        unit_id=unit_id,
+        container=_rel(path, workspace),
+    )
+
+
 def _run_write_action(
     action: str,
     path: Path,
     kwargs: dict[str, Any],
     workspace: Path,
     cwd_fallback: bool,
+    *,
+    write_ws: Path | None = None,
+    official_ws: Path | None = None,
 ) -> ToolResult:
+    active_ws = write_ws or workspace
+    root_ws = official_ws or workspace
     if action == "create":
         return _action_create(path, kwargs, workspace, cwd_fallback)
     if action == "add_sheet":
@@ -768,6 +956,19 @@ def _run_write_action(
         return _action_export_slide(path, kwargs, workspace, cwd_fallback)
     if action == "screenshot_hint":
         return _action_screenshot_hint(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "container_new":
+        return _action_container_new(
+            path,
+            kwargs,
+            workspace,
+            cwd_fallback,
+            write_ws=active_ws,
+            official_ws=root_ws,
+        )
+    if action == "container_add":
+        return _action_container_add(path, kwargs, workspace, active_ws, root_ws)
+    if action == "container_export_unit":
+        return _action_container_export_unit(path, kwargs, workspace, active_ws)
     return _fail(f"Unhandled action {action!r}.")
 
 
@@ -830,7 +1031,15 @@ def execute_office_document(kwargs: dict[str, Any]) -> ToolResult:
             if not file_name:
                 return _fail("`file` is required (relative to this turn's workspace).")
             path = _resolve_file(write_ws, file_name)
-            result = _run_write_action(action, path, kwargs, write_ws, cwd_fallback)
+            result = _run_write_action(
+                action,
+                path,
+                kwargs,
+                write_ws,
+                cwd_fallback,
+                write_ws=write_ws,
+                official_ws=workspace,
+            )
             if (
                 result.success
                 and store is not None
@@ -843,6 +1052,8 @@ def execute_office_document(kwargs: dict[str, Any]) -> ToolResult:
                 preview = str((result.metadata or {}).get("preview_file") or "")
                 if preview:
                     store.note_file(draft_id, preview)
+                if action in CONTAINER_ACTIONS and path.suffix.lower() == ".univer":
+                    store.note_file(draft_id, _rel(path, write_ws))
         if lifecycle and lifecycle != "create":
             if store is None or not draft_id:
                 return _fail("`draft_id` is required for this draft action.")
@@ -866,7 +1077,7 @@ def execute_office_document(kwargs: dict[str, Any]) -> ToolResult:
         if result is None:
             return _fail(f"Unhandled action {action!r}.")
         return _attach_draft_meta(result, store, draft_id)
-    except ValueError as exc:
+    except (ValueError, ContainerError) as exc:
         return _fail(str(exc))
     except Exception as exc:
         return _fail(f"office_document failed: {exc}")
@@ -893,6 +1104,7 @@ class OfficeDocumentTool(BaseTool):
                         "description": (
                             "create | add_sheet | write_cells | formula | style | "
                             "chart | read | export_doc | export_slide | screenshot_hint "
+                            "| container_new | container_add | container_export_unit "
                             "| ready | merge | discard | status"
                         ),
                     },
@@ -956,6 +1168,47 @@ class OfficeDocumentTool(BaseTool):
                     "read_range": {
                         "type": "string",
                         "description": 'A1-style range such as "A1:D10".',
+                    },
+                    "unit_type": {
+                        "type": "string",
+                        "enum": list(UNIT_TYPES),
+                        "description": (
+                            "container_add: sheet | doc | slide unit to append "
+                            "to a .univer ZIP container."
+                        ),
+                    },
+                    "unit_id": {
+                        "type": "string",
+                        "description": (
+                            "Unit id inside a .univer container "
+                            "(container_add / container_export_unit)."
+                        ),
+                    },
+                    "unit_name": {
+                        "type": "string",
+                        "description": "Display name for a container unit.",
+                    },
+                    "source_file": {
+                        "type": "string",
+                        "description": (
+                            "Existing .xlsx/.docx/.pptx in the turn workspace to "
+                            "pack into a .univer unit."
+                        ),
+                    },
+                    "refs": {
+                        "type": "array",
+                        "items": {"type": "object", "additionalProperties": True},
+                        "description": (
+                            'Cross-unit data refs, e.g. [{"to":"sheet","range":"A1:B5"}]. '
+                            "Recorded on manifest.refs; Slide units get a text placeholder."
+                        ),
+                    },
+                    "export_file": {
+                        "type": "string",
+                        "description": (
+                            "Destination file name for container_export_unit "
+                            "(native xlsx/docx/pptx)."
+                        ),
                     },
                 },
             },

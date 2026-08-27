@@ -183,3 +183,40 @@ def test_absolute_parent_and_symlink_escapes_are_rejected(tmp_path: Path) -> Non
     link.parent.mkdir(parents=True, exist_ok=True)
     link.symlink_to(external)
     assert service.resolve_public_output_path(link.absolute()) is None
+
+
+def test_univer_container_manifest_and_unit_proxy(output_app) -> None:
+    from knorvia.services.univer_container import pack_univer
+
+    relative_path = "workspace/chat/chat/session-1/exec/pack.univer"
+    alice = TokenPayload(username="alice", role="user", user_id="u_alice")
+    client, _admin_root, users_root = output_app({"alice-token": alice})
+    target = (
+        PathService(workspace_root=users_root / "u_alice").get_public_outputs_root()
+        / relative_path
+    )
+    pack_univer(
+        [
+            {"id": "sheet", "type": "sheet", "name": "Data"},
+            {"id": "doc", "type": "doc", "name": "Notes"},
+        ],
+        target,
+    )
+
+    with client:
+        client.cookies.set("dt_token", "alice-token")
+        manifest = client.get(f"/api/outputs/{relative_path}/container")
+        unit = client.get(f"/api/outputs/{relative_path}/container?unit=sheet")
+        missing = client.get(f"/api/outputs/{relative_path}/container?unit=nope")
+        not_container = client.get(
+            "/api/outputs/workspace/chat/chat/session-1/exec/report.xlsx/container"
+        )
+
+    assert manifest.status_code == 200
+    body = manifest.json()
+    assert [row["id"] for row in body["units"]] == ["sheet", "doc"]
+    assert unit.status_code == 200
+    assert unit.content[:2] == b"PK"
+    assert "spreadsheetml" in unit.headers["content-type"]
+    assert missing.status_code == 404
+    assert not_container.status_code in {400, 404}

@@ -28,6 +28,10 @@ const PptxPreview = dynamic(
   () => import("@/components/chat/preview/previewers/PptxPreview"),
   { ssr: false },
 );
+const UniverPreview = dynamic(
+  () => import("@/components/chat/preview/previewers/UniverPreview"),
+  { ssr: false },
+);
 
 function statusKey(status: OfficeDraftStatus): string {
   if (status === "ready") return "Waiting for confirmation";
@@ -43,6 +47,9 @@ function DraftPreview({ file }: { file: OfficeDraftFile }) {
   if (kind === "docx") return <DocxPreview url={file.url} />;
   if (kind === "pptx") {
     return <PptxPreview url={file.url} filename={file.name} />;
+  }
+  if (kind === "univer") {
+    return <UniverPreview key={file.url} url={file.url} filename={file.name} />;
   }
   return (
     <object

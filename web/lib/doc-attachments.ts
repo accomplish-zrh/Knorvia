@@ -394,6 +394,12 @@ export function docIconFor(filename: string): DocIconSpec {
       };
     case ".pptx":
       return { Icon: Presentation, tint: "text-orange-500/80", label: "PPTX" };
+    case ".univer":
+      return {
+        Icon: FileSpreadsheet,
+        tint: "text-amber-500/80",
+        label: "UNIVER",
+      };
     case ".svg":
       return { Icon: FileImage, tint: "text-teal-500/80", label: "SVG" };
   }
