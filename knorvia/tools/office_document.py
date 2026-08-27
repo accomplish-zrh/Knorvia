@@ -167,10 +167,18 @@ def _save_workbook(workbook: Any, path: Path) -> None:
     workbook.save(path)
 
 
-def _pick_sheet(workbook: Any, sheet: str | None) -> Any:
+def _pick_sheet(workbook: Any, sheet: str | None, *, create_missing: bool = False) -> Any:
+    """Resolve the target worksheet.
+
+    ``create_missing`` (used by write-path actions) auto-creates a named
+    sheet when absent — the agent should not have to issue a separate
+    ``add_sheet`` call before the first ``write_cells``.
+    """
     if sheet:
         name = _sheet_name(sheet, default=sheet)
         if name not in workbook.sheetnames:
+            if create_missing:
+                return workbook.create_sheet(title=name)
             raise ValueError(
                 f"Sheet {name!r} not found. Existing: {', '.join(workbook.sheetnames)}"
             )
@@ -258,7 +266,7 @@ def _action_write_cells(path: Path, kwargs: dict[str, Any], workspace: Path) -> 
     if kwargs.get("cells") in (None, "", [], {}):
         raise ValueError("`cells` is required for write_cells")
     workbook = _open_workbook(path)
-    ws = _pick_sheet(workbook, kwargs.get("sheet"))
+    ws = _pick_sheet(workbook, kwargs.get("sheet"), create_missing=True)
     written, formulas = _apply_cells(ws, kwargs.get("cells"))
     _save_workbook(workbook, path)
     rel = _rel(path, workspace)
@@ -283,7 +291,7 @@ def _action_formula(path: Path, kwargs: dict[str, Any], workspace: Path) -> Tool
             text = "=" + text
         normalised[key] = text
     workbook = _open_workbook(path)
-    ws = _pick_sheet(workbook, kwargs.get("sheet"))
+    ws = _pick_sheet(workbook, kwargs.get("sheet"), create_missing=True)
     written, formulas = _write_mapping(ws, normalised)
     _save_workbook(workbook, path)
     rel = _rel(path, workspace)
@@ -301,7 +309,7 @@ def _action_style(path: Path, kwargs: dict[str, Any], workspace: Path) -> ToolRe
     if not isinstance(specs, list) or not specs:
         raise ValueError("`styles` must be a non-empty list of style objects")
     workbook = _open_workbook(path)
-    ws = _pick_sheet(workbook, kwargs.get("sheet"))
+    ws = _pick_sheet(workbook, kwargs.get("sheet"), create_missing=True)
     applied = 0
     for spec in specs:
         if not isinstance(spec, dict):
@@ -364,7 +372,7 @@ def _action_chart(path: Path, kwargs: dict[str, Any], workspace: Path) -> ToolRe
         raise ValueError("chart.data_range is required (e.g. A1:B5)")
     min_col, min_row, max_col, max_row = range_boundaries(data_range)
     workbook = _open_workbook(path)
-    ws = _pick_sheet(workbook, kwargs.get("sheet"))
+    ws = _pick_sheet(workbook, kwargs.get("sheet"), create_missing=True)
     chart = mapping[chart_type]()
     title = str(spec.get("title") or "").strip()
     if title:
@@ -510,6 +518,18 @@ def _action_export_doc(path: Path, kwargs: dict[str, Any], workspace: Path, cwd_
 
 
 def _iter_slides(content: str) -> list[tuple[str, list[str]]]:
+    """Parse an outline into (title, bullets) slides.
+
+    Markdown headings (# ...) start a new slide — the documented format.
+    Fallback for plain outlines with NO headings at all: every non-bullet
+    top-level line starts a slide and collects following "- " lines as its
+    bullets. Mixed input keeps heading semantics untouched.
+    """
+    lines = content.replace("\r\n", "\n").split("\n")
+    has_headings = any(_HEADING.match(line.strip()) for line in lines)
+    if not has_headings:
+        return _iter_plain_outline(lines)
+
     slides: list[tuple[str, list[str]]] = []
     title: str | None = None
     bullets: list[str] = []
@@ -522,31 +542,50 @@ def _iter_slides(content: str) -> list[tuple[str, list[str]]]:
         title = None
         bullets = []
 
-    for raw in content.replace("\r\n", "\n").split("\n"):
+    for raw in lines:
         stripped = raw.strip()
         if not stripped:
             continue
         heading = _HEADING.match(stripped)
-        if heading and len(heading.group(1)) == 1:
+        if heading:
             flush()
             title = heading.group(2).strip()
             bullets = []
             continue
-        if heading:
-            # ## / ### become bullets on the current (or new) slide.
-            if title is None:
-                title = heading.group(2).strip()
-            else:
-                bullets.append(heading.group(2).strip())
-            continue
-        ul = _UL_ITEM.match(stripped)
-        text = ul.group(1).strip() if ul else stripped
         if title is None:
-            title = text
-        else:
-            bullets.append(text)
+            title = stripped.lstrip("# ").strip()
+            continue
+        bullets.append(stripped)
     flush()
     return slides
+
+
+def _iter_plain_outline(lines: list[str]) -> list[tuple[str, list[str]]]:
+    """No-markdown fallback: top-level line = slide title; '- ' lines = bullets."""
+    slides: list[tuple[str, list[str]]] = []
+    title: str | None = None
+    bullets: list[str] = []
+
+    def flush() -> None:
+        nonlocal title, bullets
+        if title is None:
+            return
+        slides.append((title, bullets))
+        title = None
+        bullets = []
+
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("- ") or stripped.startswith("•"):
+            if title is not None:
+                bullets.append(stripped.lstrip("-• ").strip())
+            continue
+        flush()
+        title = stripped
+    flush()
+    return slides or [("Slide", [])]
 
 
 def _action_export_slide(path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool) -> ToolResult:
