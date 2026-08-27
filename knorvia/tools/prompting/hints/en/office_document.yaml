@@ -1,0 +1,13 @@
+short_description: "Create and edit structured Excel, Word, and PowerPoint files without writing spreadsheet code."
+when_to_use: "When the user wants a workbook, Word document, or slide deck. Prefer this over writing openpyxl/python-docx/python-pptx inside code_execution."
+input_format: |
+  {"action": "create", "file": "report.xlsx", "sheet": "Sheet"}
+  {"action": "write_cells", "file": "report.xlsx", "cells": {"A1": "Title", "B2": 123}}
+  {"action": "formula", "file": "report.xlsx", "formula_cells": {"D2": "=SUM(B2:C2)"}}
+  {"action": "style", "file": "report.xlsx", "styles": [{"target": "A1:D1", "bold": true, "bg": "#B0501E", "color": "#FFFFFF"}]}
+  {"action": "chart", "file": "report.xlsx", "chart": {"type": "bar", "data_range": "A1:B5", "title": "..."}}
+  {"action": "read", "file": "report.xlsx", "read_range": "A1:D10"}
+  {"action": "export_doc", "file": "brief.docx", "content": "# Title\\n- item\\n|a|b|"}
+  {"action": "export_slide", "file": "deck.pptx", "content": "# Slide 1\\n- bullet"}
+guideline: "Always create the workbook first. After writes, call read to self-check. Keep `file` relative to this turn's workspace."
+phase: "expansion"

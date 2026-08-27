@@ -17,6 +17,7 @@ from knorvia.knowledge.manifest import KB_FILES_DEFAULT_LIMIT, KB_FILES_MAX_LIMI
 from knorvia.tools.exec_tool import ExecTool
 from knorvia.tools.library_tool import LibraryTool
 from knorvia.tools.media_gen_tool import ImagegenTool, VideogenTool
+from knorvia.tools.office_document import OfficeDocumentTool
 from knorvia.tools.partner_memory import (
     PARTNER_BUILTIN_TOOL_NAMES,
     PartnerMemorizeTool,
@@ -1591,6 +1592,9 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     ImagegenTool,
     VideogenTool,
     LibraryTool,
+    # Structured xlsx/docx/pptx authoring — always-on so the model does not have
+    # to fall back to writing openpyxl code inside code_execution.
+    OfficeDocumentTool,
     # Mastery Path + Solve + Obsidian tools — globally registered so schemas/API
     # stay stable; the chat loop capabilities decide when to auto-mount them for
     # a turn. Obsidian is a knowledge capability: when its vault is selected it
@@ -1673,6 +1677,7 @@ CONFIGURABLE_BUILTIN_TOOL_NAMES: tuple[str, ...] = (
     "cron",
     "ask_user",
     "library",
+    "office_document",
 )
 
 TOOL_ALIASES: dict[str, tuple[str, dict[str, Any]]] = {
@@ -1703,6 +1708,7 @@ __all__ = [
     "VideogenTool",
     "LibraryTool",
     "ListNotebookTool",
+    "OfficeDocumentTool",
     "PaperSearchToolWrapper",
     "PartnerMemorizeTool",
     "PartnerReadTool",

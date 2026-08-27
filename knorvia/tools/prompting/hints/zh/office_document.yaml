@@ -1,0 +1,13 @@
+short_description: "结构化创建和编辑 Excel、Word、PowerPoint，无需手写电子表格代码。"
+when_to_use: "用户要工作簿、Word 文档或幻灯片时使用。优先于在 code_execution 里写 openpyxl/python-docx/python-pptx。"
+input_format: |
+  {"action": "create", "file": "report.xlsx", "sheet": "Sheet"}
+  {"action": "write_cells", "file": "report.xlsx", "cells": {"A1": "标题", "B2": 123}}
+  {"action": "formula", "file": "report.xlsx", "formula_cells": {"D2": "=SUM(B2:C2)"}}
+  {"action": "style", "file": "report.xlsx", "styles": [{"target": "A1:D1", "bold": true, "bg": "#B0501E", "color": "#FFFFFF"}]}
+  {"action": "chart", "file": "report.xlsx", "chart": {"type": "bar", "data_range": "A1:B5", "title": "..."}}
+  {"action": "read", "file": "report.xlsx", "read_range": "A1:D10"}
+  {"action": "export_doc", "file": "brief.docx", "content": "# 标题\\n- 条目\\n|a|b|"}
+  {"action": "export_slide", "file": "deck.pptx", "content": "# 第1页\\n- 要点"}
+guideline: "先 create 工作簿。写入后用 read 自检。`file` 必须相对本轮工作区。"
+phase: "expansion"

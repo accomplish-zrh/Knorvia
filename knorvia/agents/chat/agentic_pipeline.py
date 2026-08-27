@@ -1061,6 +1061,16 @@ class AgenticChatPipeline:
                 kwargs["_sandbox_mounts"] = (
                     Mount(host_path=str(exec_dir), sandbox_path=str(exec_dir), read_only=False),
                 )
+        elif tool_name == "office_document":
+            # Same public exec/ turn directory as ``exec`` so /api/outputs serves
+            # the xlsx/docx/pptx the tool writes. ``_workspace_dir`` is the name
+            # the tool itself reads; ``_sandbox_workdir`` matches the exec/code
+            # injection contract.
+            kwargs["_sandbox_user_id"] = self._current_user_id()
+            if exec_dir is not None:
+                exec_dir.mkdir(parents=True, exist_ok=True)
+                kwargs["_sandbox_workdir"] = str(exec_dir)
+                kwargs["_workspace_dir"] = str(exec_dir)
         elif tool_name.startswith(CLI_APP_TOOL_PREFIX):
             # A CLI app runs like exec, and for the same reason gets its workdir
             # from here rather than choosing one: one directory per turn shared by

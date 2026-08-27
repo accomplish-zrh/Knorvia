@@ -74,6 +74,10 @@ _TOOL_DESCRIPTIONS: dict[str, dict[str, str]] = {
         "en": "List, read, and write the personal library tree (markdown, Word, Excel, canvas, files).",
         "zh": "列出、读取和写入个人资料库（Markdown、Word、Excel、画布和文件）。",
     },
+    "office_document": {
+        "en": "Create and edit structured Excel, Word, and PowerPoint files.",
+        "zh": "结构化创建和编辑 Excel、Word 和 PowerPoint 文件。",
+    },
     "cron": {
         "en": "Schedule recurring agent tasks on this machine.",
         "zh": "在本机安排定时 Agent 任务。",
