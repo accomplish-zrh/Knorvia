@@ -20,13 +20,8 @@ import {
 } from "@/lib/trace-tools";
 import type { StreamEvent } from "@/lib/unified-ws";
 import { ChatTaskCards } from "@/components/chat/home/ChatTaskCards";
-import {
-  collectBookIds,
-  collectStudioJobRefs,
-  collectVideoStudioJobRefs,
-  collectVideoStudioProjectRefs,
-  hasResearchEvents,
-} from "@/lib/chat-task-cards";
+import { OfficeDraftCards } from "@/components/chat/home/OfficeDraftCard";
+import { hasChatTaskCards } from "@/lib/chat-task-cards";
 
 type TraceMetadata = {
   call_id?: string;
@@ -2564,15 +2559,7 @@ export function AssistantActivity({
   headerClassName?: string;
 }) {
   const hasTrace = useMemo(() => hasRenderableCallTrace(events), [events]);
-  const hasTaskCards = useMemo(
-    () =>
-      collectStudioJobRefs(events).length > 0 ||
-      collectVideoStudioJobRefs(events).length > 0 ||
-      collectVideoStudioProjectRefs(events).length > 0 ||
-      hasResearchEvents(events) ||
-      collectBookIds(events).length > 0,
-    [events],
-  );
+  const hasTaskCards = useMemo(() => hasChatTaskCards(events), [events]);
   const hasFinalContent = Boolean(content && content.trim().length > 0);
   const finalPhase = useMemo(
     () => isFinalAnswerPhase(events, Boolean(isStreaming), hasFinalContent),
@@ -2602,6 +2589,7 @@ export function AssistantActivity({
         className={headerClassName}
       />
       <ChatTaskCards events={events} isStreaming={isStreaming} />
+      <OfficeDraftCards events={events} />
       {hasTrace ? (
         <div
           className={`grid transition-[grid-template-rows,opacity] duration-300 ease-out ${

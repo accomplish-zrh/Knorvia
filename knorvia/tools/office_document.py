@@ -23,9 +23,10 @@ import re
 from typing import Any
 
 from knorvia.core.tool_protocol import BaseTool, ToolDefinition, ToolResult
+from knorvia.services.office_draft import DraftError, OfficeDraftStore
 from knorvia.tools.prompting import load_prompt_hints
 
-ACTIONS = (
+WRITE_ACTIONS = (
     "create",
     "add_sheet",
     "write_cells",
@@ -37,6 +38,9 @@ ACTIONS = (
     "export_slide",
     "screenshot_hint",
 )
+LIFECYCLE_ACTIONS = ("ready", "merge", "discard", "status")
+DRAFT_ACTIONS = ("create",) + LIFECYCLE_ACTIONS
+ACTIONS = WRITE_ACTIONS + LIFECYCLE_ACTIONS
 
 _SHEET_FORBIDDEN = re.compile(r"[:\\/?*\[\]]")
 _HEADING = re.compile(r"^(#{1,3})\s+(.*\S)\s*$")
@@ -46,18 +50,22 @@ _A1 = re.compile(r"^[A-Za-z]+\d+$")
 
 _TOOL_DESCRIPTION = (
     "Create and edit structured Office files (xlsx / docx / pptx) without "
-    "writing spreadsheet code. Typical flow: create → add_sheet/write_cells → "
-    "formula → style → chart → read (self-check) → optional export_doc / "
-    "export_slide. `create` starts a workbook (`file` required). `write_cells` "
-    "accepts {\"A1\": \"Title\", \"B2\": 123} or a 2D array. `formula` writes "
-    "formula strings such as {\"D2\": \"=SUM(B2:C2)\"}. `style` takes "
-    "[{target:\"A1:D1\", bold:true, bg:\"#B0501E\", color:\"#FFFFFF\", "
-    "font_size:12}]. `chart` is {type:\"bar|line|pie\", data_range:\"A1:B5\", "
-    "title:\"...\"}. `read` returns CSV of a range so you can verify writes. "
-    "`export_doc` renders a Markdown subset (#/##/### headings, - lists, "
-    "|a|b| tables, paragraphs) to .docx. `export_slide` builds a 16:9 deck "
-    "from an outline (level-1 heading = new slide title; bullets = body). "
-    "`screenshot_hint` returns a text grid (and a PNG preview when possible)."
+    "writing spreadsheet code. Writes default to an isolated draft "
+    "(`as_draft=true`); the user previews a review card and confirms before "
+    "files land in the turn workspace. Typical flow: create → add_sheet/"
+    "write_cells → formula → style → chart → read (self-check) → optional "
+    "export_doc / export_slide → draft_action=ready. `create` starts a "
+    "workbook (`file` required). `write_cells` accepts {\"A1\": \"Title\", "
+    "\"B2\": 123} or a 2D array. `formula` writes formula strings such as "
+    "{\"D2\": \"=SUM(B2:C2)\"}. `style` takes [{target:\"A1:D1\", bold:true, "
+    "bg:\"#B0501E\", color:\"#FFFFFF\", font_size:12}]. `chart` is "
+    "{type:\"bar|line|pie\", data_range:\"A1:B5\", title:\"...\"}. `read` "
+    "returns CSV of a range so you can verify writes. `export_doc` renders a "
+    "Markdown subset (#/##/### headings, - lists, |a|b| tables, paragraphs) "
+    "to .docx. `export_slide` builds a 16:9 deck from an outline (level-1 "
+    "heading = new slide title; bullets = body). `screenshot_hint` returns a "
+    "text grid (and a PNG preview when possible). Independent draft actions: "
+    "ready | merge | discard | status (also via `draft_action`)."
 )
 
 
@@ -687,43 +695,181 @@ def _action_screenshot_hint(path: Path, kwargs: dict[str, Any], workspace: Path)
     )
 
 
+def _task_dir_of(kwargs: dict[str, Any]) -> Path | None:
+    raw = str(kwargs.get("_task_dir") or "").strip()
+    if not raw:
+        return None
+    return Path(raw).expanduser().resolve()
+
+
+def _prepare_draft(
+    kwargs: dict[str, Any],
+    workspace: Path,
+    *,
+    writing: bool,
+    lifecycle: str,
+) -> tuple[OfficeDraftStore | None, str, Path]:
+    """Resolve the draft store and the directory write actions should use.
+
+    ``as_draft`` defaults to true, but degrades to a direct workspace write
+    when the pipeline did not inject a turn ``_task_dir`` (unit tests / CWD
+    fallback). Terminal drafts refuse further writes.
+    """
+    as_draft = _as_bool(kwargs.get("as_draft"), default=True)
+    task_dir = _task_dir_of(kwargs)
+    draft_id = str(kwargs.get("draft_id") or kwargs.get("_office_draft_id") or "").strip()
+    needs_store = bool(lifecycle) or (writing and as_draft)
+    if not needs_store:
+        return None, "", workspace
+    if task_dir is None:
+        if writing:
+            return None, "", workspace
+        raise ValueError("office drafts need a turn workspace (`_task_dir`).")
+    store = OfficeDraftStore(task_dir, workspace_dir=workspace)
+    if lifecycle == "create" and not draft_id:
+        draft_id = store.create()
+    if writing and as_draft:
+        if not draft_id:
+            draft_id = store.create()
+        else:
+            store.assert_writable(draft_id)
+        return store, draft_id, store.draft_dir(draft_id)
+    if lifecycle in LIFECYCLE_ACTIONS:
+        if not draft_id:
+            raise ValueError("`draft_id` is required for this draft action.")
+        return store, draft_id, workspace
+    return store, draft_id, workspace
+
+
+def _run_write_action(
+    action: str,
+    path: Path,
+    kwargs: dict[str, Any],
+    workspace: Path,
+    cwd_fallback: bool,
+) -> ToolResult:
+    if action == "create":
+        return _action_create(path, kwargs, workspace, cwd_fallback)
+    if action == "add_sheet":
+        return _action_add_sheet(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "write_cells":
+        return _action_write_cells(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "formula":
+        return _action_formula(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "style":
+        return _action_style(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "chart":
+        return _action_chart(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "read":
+        return _action_read(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    if action == "export_doc":
+        return _action_export_doc(path, kwargs, workspace, cwd_fallback)
+    if action == "export_slide":
+        return _action_export_slide(path, kwargs, workspace, cwd_fallback)
+    if action == "screenshot_hint":
+        return _action_screenshot_hint(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+    return _fail(f"Unhandled action {action!r}.")
+
+
+def _run_lifecycle(store: OfficeDraftStore, draft_id: str, action: str) -> dict[str, Any]:
+    if action == "create":
+        return store.status(draft_id)
+    if action == "ready":
+        return store.mark_ready(draft_id)
+    if action == "merge":
+        return store.merge(draft_id)
+    if action == "discard":
+        return store.discard(draft_id)
+    if action == "status":
+        meta = store.status(draft_id)
+        meta["diff"] = store.diff(draft_id)
+        return meta
+    raise ValueError(f"Unhandled draft action {action!r}.")
+
+
+def _attach_draft_meta(
+    result: ToolResult,
+    store: OfficeDraftStore | None,
+    draft_id: str,
+) -> ToolResult:
+    if store is None or not draft_id:
+        return result
+    try:
+        payload = store.card_payload(draft_id)
+    except DraftError:
+        return result
+    merged = {**(result.metadata or {}), **payload}
+    return ToolResult(content=result.content, success=result.success, metadata=merged)
+
+
 def execute_office_document(kwargs: dict[str, Any]) -> ToolResult:
     """Run one ``office_document`` action. Public entry used by the tool class."""
     action = str(kwargs.get("action") or "").strip().lower()
-    if action not in ACTIONS:
+    draft_action = str(kwargs.get("draft_action") or "").strip().lower()
+    if draft_action and draft_action not in DRAFT_ACTIONS:
+        valid = ", ".join(DRAFT_ACTIONS)
+        return _fail(f"Invalid draft_action {draft_action!r}. Valid: {valid}.")
+    if action and action not in ACTIONS:
         valid = ", ".join(ACTIONS)
         return _fail(f"Invalid action {action!r}. Valid actions: {valid}.")
+    if not action and not draft_action:
+        valid = ", ".join(ACTIONS)
+        return _fail(f"Invalid action {action!r}. Valid actions: {valid}.")
+    lifecycle = draft_action if draft_action in DRAFT_ACTIONS else (
+        action if action in LIFECYCLE_ACTIONS else ""
+    )
+    writing = action in WRITE_ACTIONS
     workspace, cwd_fallback = _workspace(kwargs)
-    file_name = str(kwargs.get("file") or "").strip()
-    if not file_name:
-        return _fail("`file` is required (relative to this turn's workspace).")
     try:
-        path = _resolve_file(workspace, file_name)
-        if action == "create":
-            return _action_create(path, kwargs, workspace, cwd_fallback)
-        if action == "add_sheet":
-            return _action_add_sheet(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
-        if action == "write_cells":
-            return _action_write_cells(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
-        if action == "formula":
-            return _action_formula(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
-        if action == "style":
-            return _action_style(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
-        if action == "chart":
-            return _action_chart(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
-        if action == "read":
-            return _action_read(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
-        if action == "export_doc":
-            return _action_export_doc(path, kwargs, workspace, cwd_fallback)
-        if action == "export_slide":
-            return _action_export_slide(path, kwargs, workspace, cwd_fallback)
-        if action == "screenshot_hint":
-            return _action_screenshot_hint(_ensure_suffix(path, ".xlsx"), kwargs, workspace)
+        store, draft_id, write_ws = _prepare_draft(
+            kwargs, workspace, writing=writing, lifecycle=lifecycle
+        )
+        result: ToolResult | None = None
+        if writing:
+            file_name = str(kwargs.get("file") or "").strip()
+            if not file_name:
+                return _fail("`file` is required (relative to this turn's workspace).")
+            path = _resolve_file(write_ws, file_name)
+            result = _run_write_action(action, path, kwargs, write_ws, cwd_fallback)
+            if (
+                result.success
+                and store is not None
+                and draft_id
+                and _as_bool(kwargs.get("as_draft"), default=True)
+            ):
+                output = str((result.metadata or {}).get("output_file") or "")
+                if output:
+                    store.note_file(draft_id, output)
+                preview = str((result.metadata or {}).get("preview_file") or "")
+                if preview:
+                    store.note_file(draft_id, preview)
+        if lifecycle and lifecycle != "create":
+            if store is None or not draft_id:
+                return _fail("`draft_id` is required for this draft action.")
+            meta = _run_lifecycle(store, draft_id, lifecycle)
+            summary = (
+                f"Office draft {draft_id} is {meta.get('status')}."
+                if result is None
+                else f"{result.content} Draft {draft_id} is now {meta.get('status')}."
+            )
+            success = True if result is None else result.success
+            extra = dict(result.metadata or {}) if result is not None else {}
+            result = ToolResult(content=summary, success=success, metadata=extra)
+        elif lifecycle == "create" and result is None:
+            if store is None or not draft_id:
+                return _fail("Could not create an office draft.")
+            result = ToolResult(
+                content=f"Created office draft {draft_id}.",
+                success=True,
+                metadata={},
+            )
+        if result is None:
+            return _fail(f"Unhandled action {action!r}.")
+        return _attach_draft_meta(result, store, draft_id)
     except ValueError as exc:
         return _fail(str(exc))
     except Exception as exc:
         return _fail(f"office_document failed: {exc}")
-    return _fail(f"Unhandled action {action!r}.")
 
 
 class OfficeDocumentTool(BaseTool):
@@ -746,12 +892,35 @@ class OfficeDocumentTool(BaseTool):
                         "enum": list(ACTIONS),
                         "description": (
                             "create | add_sheet | write_cells | formula | style | "
-                            "chart | read | export_doc | export_slide | screenshot_hint"
+                            "chart | read | export_doc | export_slide | screenshot_hint "
+                            "| ready | merge | discard | status"
+                        ),
+                    },
+                    "as_draft": {
+                        "type": "boolean",
+                        "description": (
+                            "Write into an isolated draft the user must confirm "
+                            "(default true). Set false only to write the official file."
+                        ),
+                    },
+                    "draft_action": {
+                        "type": "string",
+                        "enum": list(DRAFT_ACTIONS),
+                        "description": (
+                            "Independent draft lifecycle: create | ready | merge | "
+                            "discard | status. ready/merge/discard/status also work as `action`."
+                        ),
+                    },
+                    "draft_id": {
+                        "type": "string",
+                        "description": (
+                            "Existing 8-char draft id. Reused automatically within a turn "
+                            "when omitted."
                         ),
                     },
                     "file": {
                         "type": "string",
-                        "description": "Output file name relative to this turn's workspace. Required.",
+                        "description": "Output file name relative to this turn's workspace. Required for write actions.",
                     },
                     "sheet": {
                         "type": "string",

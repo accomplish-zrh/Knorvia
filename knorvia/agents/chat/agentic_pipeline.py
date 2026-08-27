@@ -887,7 +887,7 @@ class AgenticChatPipeline:
                 requested=len(tool_calls),
                 limit=MAX_PARALLEL_TOOL_CALLS,
             )
-        return await dispatch_tool_calls(
+        outcome = await dispatch_tool_calls(
             tool_calls=tool_calls,
             context=context,
             stream=stream,
@@ -912,6 +912,49 @@ class AgenticChatPipeline:
                 default=f"An unknown error occurred while executing {tn}.",
             ),
             trace_id_prefix="chat-loop",
+        )
+        await self._publish_office_draft_metadata(context, outcome, stream)
+        return outcome
+
+    @staticmethod
+    async def _publish_office_draft_metadata(
+        context: UnifiedContext,
+        outcome: DispatchOutcome,
+        stream: StreamBus,
+    ) -> None:
+        """Copy office-draft card metadata onto the turn and the event stream.
+
+        Tool results already carry ``metadata.tool_metadata``; this extra copy
+        on ``context.metadata`` is how later ``office_document`` calls in the
+        same turn reuse the draft id (same pattern as video confirmation).
+        """
+        payload: dict[str, Any] | None = None
+        for extra in outcome.tool_metadata_by_id.values():
+            if not isinstance(extra, dict):
+                continue
+            nested = extra.get("office_draft")
+            if isinstance(nested, dict) and nested.get("draft_id"):
+                payload = {
+                    "draft_id": str(nested.get("draft_id") or ""),
+                    "files": list(nested.get("files") or []),
+                    "status": str(nested.get("status") or extra.get("draft_status") or "draft"),
+                }
+                break
+            if extra.get("draft_id"):
+                payload = {
+                    "draft_id": str(extra.get("draft_id") or ""),
+                    "files": list(extra.get("files") or []),
+                    "status": str(extra.get("draft_status") or extra.get("status") or "draft"),
+                }
+                break
+        if not payload or not payload["draft_id"]:
+            return
+        context.metadata["office_draft"] = payload
+        await stream.progress(
+            "",
+            source="chat",
+            stage="responding",
+            metadata={"office_draft": payload, "trace_kind": "office_draft"},
         )
 
     async def _await_user_reply_and_resolve(
@@ -1065,12 +1108,17 @@ class AgenticChatPipeline:
             # Same public exec/ turn directory as ``exec`` so /api/outputs serves
             # the xlsx/docx/pptx the tool writes. ``_workspace_dir`` is the name
             # the tool itself reads; ``_sandbox_workdir`` matches the exec/code
-            # injection contract.
+            # injection contract. Isolated drafts live under ``task_dir/office_drafts``.
             kwargs["_sandbox_user_id"] = self._current_user_id()
             if exec_dir is not None:
                 exec_dir.mkdir(parents=True, exist_ok=True)
                 kwargs["_sandbox_workdir"] = str(exec_dir)
                 kwargs["_workspace_dir"] = str(exec_dir)
+            if task_dir is not None:
+                kwargs["_task_dir"] = str(task_dir)
+            draft = (context.metadata or {}).get("office_draft")
+            if isinstance(draft, dict) and draft.get("draft_id"):
+                kwargs["_office_draft_id"] = str(draft["draft_id"])
         elif tool_name.startswith(CLI_APP_TOOL_PREFIX):
             # A CLI app runs like exec, and for the same reason gets its workdir
             # from here rather than choosing one: one directory per turn shared by

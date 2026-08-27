@@ -4,6 +4,7 @@
  * already use on their own pages.
  */
 
+import { collectOfficeDrafts } from "@/lib/office-draft";
 import type { StreamEvent } from "@/lib/unified-ws";
 
 export type StudioJobRef = {
@@ -166,6 +167,18 @@ export function hasResearchEvents(events: StreamEvent[]): boolean {
     const meta = metaOf(event);
     return Boolean(meta.research_status_key || meta.research_stage_card);
   });
+}
+
+/** True when AssistantActivity should keep rendering for task / draft cards. */
+export function hasChatTaskCards(events: StreamEvent[]): boolean {
+  return (
+    collectStudioJobRefs(events).length > 0 ||
+    collectVideoStudioJobRefs(events).length > 0 ||
+    collectVideoStudioProjectRefs(events).length > 0 ||
+    hasResearchEvents(events) ||
+    collectBookIds(events).length > 0 ||
+    collectOfficeDrafts(events).length > 0
+  );
 }
 
 export function latestResearchLabelKey(events: StreamEvent[]): string {

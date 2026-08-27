@@ -349,6 +349,7 @@ from knorvia.api.routers import (
     mcp_settings,
     memory,
     notebook,
+    office_drafts,
     outputs,
     partners,
     personas,
@@ -394,6 +395,12 @@ app.include_router(
 )
 
 app.include_router(chat.router, prefix="/api/v1", tags=["chat"], dependencies=_auth)
+app.include_router(
+    office_drafts.router,
+    prefix="/api/v1",
+    tags=["office-drafts"],
+    dependencies=_auth,
+)
 app.include_router(
     question.router, prefix="/api/v1/question", tags=["question"], dependencies=_auth
 )

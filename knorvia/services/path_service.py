@@ -198,6 +198,14 @@ class PathService:
         if len(parts) >= 5 and parts[:3] == ("workspace", "chat", "chat") and parts[4] == "exec":
             return candidate
 
+        # Isolated office drafts (office_document as_draft writes) until merge.
+        if (
+            len(parts) >= 6
+            and parts[:3] == ("workspace", "chat", "chat")
+            and parts[4] == "office_drafts"
+        ):
+            return candidate
+
         # Files a CLI app produced. One directory per turn shared by every app,
         # not one per app, so a model can render with one and post-process with
         # another. Listed explicitly rather than folded into the ``exec`` branch:
