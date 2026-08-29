@@ -20,6 +20,7 @@ from knorvia.services.cron.service import (
     MAX_SESSION_ID_LENGTH,
     MAX_TIMEZONE_LENGTH,
 )
+from knorvia.services.cron.templates import list_templates
 from knorvia.tools.cron_tool import _build_schedule
 
 router = APIRouter()
@@ -62,6 +63,15 @@ def _job_payload(job: Any) -> dict[str, Any]:
             "last_run_at_ms": job.state.last_run_at_ms,
             "last_status": job.state.last_status,
             "last_error": job.state.last_error,
+            "run_history": [
+                {
+                    "run_at_ms": record.run_at_ms,
+                    "status": record.status,
+                    "duration_ms": record.duration_ms,
+                    "error": record.error,
+                }
+                for record in job.state.run_history
+            ],
         },
     }
 
@@ -88,6 +98,12 @@ class CronPatchRequest(BaseModel):
     tz: str | None = Field(default=None, max_length=MAX_TIMEZONE_LENGTH)
 
 
+@router.get("/templates")
+async def list_cron_templates(language: str = "en") -> dict[str, Any]:
+    """Built-in automation catalog the web UI offers on the Templates tab."""
+    return {"templates": list_templates(language=language)}
+
+
 @router.get("/jobs")
 async def list_cron_jobs() -> dict[str, Any]:
     service = get_cron_service()
@@ -110,6 +126,30 @@ async def create_cron_job(payload: CronCreateRequest) -> dict[str, Any]:
     except (ValueError, TypeError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     return _job_payload(job)
+
+
+@router.get("/jobs/runs")
+async def list_cron_runs(limit: int = 200) -> dict[str, Any]:
+    """Recent runs across the caller's tasks, newest first.
+
+    Backed by the service's run journal, so entries survive task deletion
+    (per-job ``run_history`` in ``/jobs`` does not).
+    """
+    service = get_cron_service()
+    runs = service.list_runs(_owner().key, limit=limit)
+    return {
+        "runs": [
+            {
+                "job_id": run.job_id,
+                "job_name": run.job_name,
+                "run_at_ms": run.run_at_ms,
+                "status": run.status,
+                "duration_ms": run.duration_ms,
+                "error": run.error,
+            }
+            for run in runs
+        ]
+    }
 
 
 @router.patch("/jobs/{job_id}")

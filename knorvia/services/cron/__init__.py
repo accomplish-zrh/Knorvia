@@ -3,6 +3,7 @@
 from knorvia.services.cron.service import (
     CronJob,
     CronOwner,
+    CronRunLogEntry,
     CronSchedule,
     CronService,
     compute_next_run,
@@ -13,6 +14,7 @@ from knorvia.services.cron.service import (
 __all__ = [
     "CronJob",
     "CronOwner",
+    "CronRunLogEntry",
     "CronSchedule",
     "CronService",
     "compute_next_run",

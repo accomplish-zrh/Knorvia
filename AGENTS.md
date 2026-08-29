@@ -107,6 +107,8 @@ knorvia start                   # backend + frontend together
 | `knorvia/runtime/registry/`              | Tool + Capability registries         |
 | `knorvia/runtime/bootstrap/builtin_capabilities.py` | Built-in capability class paths |
 | `knorvia/services/config/runtime_settings.py` | JSON settings + process-env overrides |
+| `knorvia/services/cron/service.py`      | Scheduled-task store + scheduler     |
+| `knorvia/services/cron/templates.py`    | Built-in automation template catalog |
 | `knorvia/core/stream.py`, `stream_bus.py` | StreamEvent protocol + async fan-out |
 | `knorvia/core/tool_protocol.py`          | `BaseTool` + `ToolDefinition`         |
 | `knorvia/core/capability_protocol.py`    | `BaseCapability` + `CapabilityManifest` |

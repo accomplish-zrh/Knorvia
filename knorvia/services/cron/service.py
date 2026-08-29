@@ -34,6 +34,10 @@ logger = logging.getLogger(__name__)
 # cheap, and it picks up externally-edited stores within a minute.
 _MAX_SLEEP_SECONDS = 60.0
 _MAX_RUN_HISTORY = 10
+# Append-only cross-job run journal (<store stem>.runs.jsonl). Per-job
+# ``run_history`` dies with the job (deleted tasks, finished one-shots);
+# the journal keeps recent runs visible in the execution-history view.
+MAX_RUN_LOG_ENTRIES = 500
 MAX_JOBS_PER_OWNER = 20
 MAX_TOTAL_JOBS = 500
 MAX_NAME_LENGTH = 120
@@ -92,6 +96,15 @@ class CronRunRecord:
     status: str  # "ok" | "error" | "skipped"
     duration_ms: int = 0
     error: str | None = None
+
+
+@dataclass
+class CronRunLogEntry(CronRunRecord):
+    """One completed run, journalled independent of the job's lifetime."""
+
+    job_id: str = ""
+    job_name: str = ""
+    owner_key: str = ""
 
 
 @dataclass
@@ -222,6 +235,8 @@ class CronService:
         self._active_job_ids: set[str] = set()
         self._run_slots = asyncio.Semaphore(MAX_CONCURRENT_RUNS)
         self._claims_dir = self.store_path.with_name(f"{self.store_path.stem}.claims")
+        self._run_log_path = self.store_path.with_name(f"{self.store_path.stem}.runs.jsonl")
+        self._run_log_lines: int | None = None  # seeded on first append
 
     # ── persistence ───────────────────────────────────────────────
 
@@ -405,6 +420,83 @@ class CronService:
             self._wake.set()
         return len(doomed)
 
+    # ── run journal ───────────────────────────────────────────────
+    # Best-effort and never fatal: bookkeeping on the job itself is the
+    # source of truth, the journal only feeds the history view.
+
+    def _append_run_log(self, entry: CronRunLogEntry) -> None:
+        try:
+            self._run_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._run_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(asdict(entry), ensure_ascii=False) + "\n")
+        except OSError:
+            logger.warning("Could not append cron run log", exc_info=True)
+            return
+        # Line count tracked in memory (seeded once from disk, reset on trim):
+        # recounting the whole file after every append was O(journal) I/O.
+        if self._run_log_lines is None:
+            try:
+                with self._run_log_path.open(encoding="utf-8") as handle:
+                    self._run_log_lines = sum(1 for _ in handle)
+            except OSError:
+                self._run_log_lines = 0
+        else:
+            self._run_log_lines += 1
+        if self._run_log_lines > MAX_RUN_LOG_ENTRIES:
+            self._trim_run_log()
+            self._run_log_lines = MAX_RUN_LOG_ENTRIES
+
+    def _trim_run_log(self) -> None:
+        try:
+            lines = self._run_log_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return
+        keep = [line for line in lines[-MAX_RUN_LOG_ENTRIES:] if line.strip()]
+        tmp = self._run_log_path.with_suffix(".tmp")
+        try:
+            tmp.write_text("\n".join(keep) + "\n", encoding="utf-8")
+            tmp.replace(self._run_log_path)
+        except OSError:
+            logger.warning("Could not trim cron run log", exc_info=True)
+
+    def list_runs(
+        self, owner_key: str | None = None, *, limit: int = MAX_RUN_LOG_ENTRIES
+    ) -> list[CronRunLogEntry]:
+        """Recent runs across all jobs, newest first (owner-filterable).
+
+        Reads are tolerant of a torn final line — a crash mid-append must
+        not take the history view down.
+        """
+        capped = max(1, min(int(limit), MAX_RUN_LOG_ENTRIES))
+        try:
+            lines = self._run_log_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        entries: list[CronRunLogEntry] = []
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                raw = json.loads(line)
+                entries.append(
+                    CronRunLogEntry(
+                        job_id=str(raw.get("job_id") or ""),
+                        job_name=str(raw.get("job_name") or ""),
+                        owner_key=str(raw.get("owner_key") or ""),
+                        run_at_ms=int(raw.get("run_at_ms") or 0),
+                        status=str(raw.get("status") or "error"),
+                        duration_ms=int(raw.get("duration_ms") or 0),
+                        error=raw.get("error"),
+                    )
+                )
+            except (ValueError, TypeError, AttributeError):
+                continue
+        if owner_key is not None:
+            entries = [entry for entry in entries if entry.owner_key == owner_key]
+        entries.sort(key=lambda entry: entry.run_at_ms, reverse=True)
+        return entries[:capped]
+
     # ── scheduler ─────────────────────────────────────────────────
 
     async def start(self) -> None:
@@ -541,6 +633,18 @@ class CronService:
         )
         job.state.run_history = job.state.run_history[-_MAX_RUN_HISTORY:]
 
+        self._append_run_log(
+            CronRunLogEntry(
+                job_id=job.id,
+                job_name=job.name,
+                owner_key=job.owner.key,
+                run_at_ms=started,
+                status=status,
+                duration_ms=_now_ms() - started,
+                error=error,
+            )
+        )
+
         if job.delete_after_run or job.schedule.kind == "at":
             self._jobs.pop(job.id, None)
         else:
@@ -631,12 +735,15 @@ def get_cron_service() -> CronService:
 __all__ = [
     "CronJob",
     "CronOwner",
+    "CronRunLogEntry",
+    "CronRunRecord",
     "CronSchedule",
     "CronService",
     "JOB_TIMEOUT_SECONDS",
     "MAX_JOBS_PER_OWNER",
     "MAX_NAME_LENGTH",
     "MAX_MESSAGE_LENGTH",
+    "MAX_RUN_LOG_ENTRIES",
     "MAX_SESSION_ID_LENGTH",
     "MAX_TOTAL_JOBS",
     "compute_next_run",

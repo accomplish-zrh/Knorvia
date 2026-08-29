@@ -198,10 +198,10 @@ const CHAT_CHILDREN: SettingsLeaf[] = [
   {
     key: "schedule",
     href: "/settings/schedule",
-    label: { zh: "定时任务", en: "Scheduled tasks" },
+    label: { zh: "自动化", en: "Automations" },
     blurb: {
-      zh: "查看下次运行、立刻执行，并把结果绑到某次对话。",
-      en: "See the next run, run now, and bind the reply to a conversation.",
+      zh: "从模板创建定时自动化，查看执行历史与下次运行。",
+      en: "Create scheduled automations from templates; track runs and next fires.",
     },
     icon: CalendarClock,
     tile: "bg-cyan-500/10 text-cyan-600 dark:text-cyan-400",
@@ -336,8 +336,8 @@ export const SETTINGS_CATEGORIES: SettingsCategory[] = [
     key: "chat",
     label: { zh: "聊天", en: "Chat" },
     blurb: {
-      zh: "工具、能力、附件与定时任务",
-      en: "Tools, capabilities, attachments, and scheduled tasks",
+      zh: "工具、能力、附件与自动化",
+      en: "Tools, capabilities, attachments, and automations",
     },
     icon: MessagesSquare,
     href: "/settings/chat",
@@ -396,7 +396,7 @@ const STORAGE_PATHS: Record<string, string> = {
   "/settings/document-parsing": "data/user/settings/document_parsing.json",
   "/settings/tools": "data/user/settings/interface.json",
   "/settings/attachments": "data/user/settings/system.json",
-  "/settings/schedule": "workspace/cron/jobs.json",
+  "/settings/schedule": "workspace/cron/jobs.json · jobs.runs.jsonl",
   "/settings/capabilities": "data/user/settings/main.yaml · agents.yaml",
   "/settings/memory": "data/user/settings/main.yaml",
   "/settings/agents/claude-code": "data/user/settings/subagent.json",

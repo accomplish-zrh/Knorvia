@@ -337,3 +337,88 @@ class TestMutations:
         )
         with pytest.raises(ValueError):
             service.update_job(job.id, message="   ")
+
+
+class TestRunJournal:
+    @pytest.mark.asyncio
+    async def test_run_is_journalled_and_survives_one_shot_removal(self, tmp_path):
+        async def on_job(job):
+            return "ok", None
+
+        service = CronService(store_path=tmp_path / "jobs.json", on_job=on_job)
+        job = service.add_job(
+            name="once",
+            message="x",
+            schedule=CronSchedule(kind="at", at_ms=_now_ms() + 60_000),
+            owner=_chat_owner(),
+        )
+        service.run_now(job.id)
+        await service._tick()
+        assert service.get_job(job.id) is None  # one-shot cleaned up…
+
+        runs = service.list_runs(owner_key=_chat_owner().key)
+        assert len(runs) == 1  # …but its run stays visible in the journal
+        entry = runs[0]
+        assert (entry.job_id, entry.job_name, entry.status) == (job.id, "once", "ok")
+        assert entry.error is None and entry.duration_ms >= 0
+
+    @pytest.mark.asyncio
+    async def test_journal_scopes_by_owner_newest_first(self, tmp_path):
+        async def on_job(_job):
+            return "ok", None
+
+        service = CronService(store_path=tmp_path / "jobs.json", on_job=on_job)
+        for user in ("u1", "u1", "u2"):
+            job = service.add_job(
+                name=f"job-{user}",
+                message="x",
+                schedule=CronSchedule(kind="every", every_seconds=3600),
+                owner=_chat_owner(user),
+            )
+            service.run_now(job.id)
+            await service._tick()
+
+        mine = service.list_runs(owner_key="chat:u1")
+        assert [entry.job_name for entry in mine] == ["job-u1", "job-u1"]
+        assert all(entry.owner_key == "chat:u1" for entry in mine)
+        assert mine[0].run_at_ms >= mine[1].run_at_ms
+
+        everything = service.list_runs()
+        assert {entry.owner_key for entry in everything} == {"chat:u1", "chat:u2"}
+
+    @pytest.mark.asyncio
+    async def test_journal_trims_to_cap(self, tmp_path, monkeypatch):
+        import knorvia.services.cron.service as service_module
+
+        monkeypatch.setattr(service_module, "MAX_RUN_LOG_ENTRIES", 5)
+
+        async def on_job(_job):
+            return "ok", None
+
+        service = CronService(store_path=tmp_path / "jobs.json", on_job=on_job)
+        job = service.add_job(
+            name="loop",
+            message="x",
+            schedule=CronSchedule(kind="every", every_seconds=3600),
+            owner=_chat_owner(),
+        )
+        for _ in range(8):
+            service.run_now(job.id)
+            await service._tick()
+
+        runs = service.list_runs(limit=100)
+        assert len(runs) <= 5
+        lines = (tmp_path / "jobs.runs.jsonl").read_text(encoding="utf-8").splitlines()
+        assert len(lines) <= 5
+
+    def test_torn_tail_line_is_ignored(self, tmp_path):
+        log = tmp_path / "jobs.runs.jsonl"
+        log.write_text(
+            '{"job_id":"a","job_name":"A","owner_key":"chat:u1","run_at_ms":2,'
+            '"status":"ok","duration_ms":1,"error":null}\n'
+            '{"job_id":"b","job_na',  # crash mid-append
+            encoding="utf-8",
+        )
+        service = CronService(store_path=tmp_path / "jobs.json")
+        runs = service.list_runs()
+        assert [entry.job_id for entry in runs] == ["a"]
