@@ -338,9 +338,14 @@ export function SidebarShell({
   /* ---- Collapsed state ---- */
   if (collapsed) {
     return (
-      <aside className="group/sb relative flex h-dvh w-[60px] shrink-0 flex-col items-center bg-[var(--secondary)] py-3 transition-all duration-200">
+      <aside data-app-sidebar="" className="group/sb relative flex h-dvh w-[60px] shrink-0 flex-col items-center bg-[var(--secondary)] pb-3 pt-0 transition-all duration-200">
+        <div data-desktop-drag="" aria-hidden className="h-3 w-full shrink-0" />
         {/* Header: logo + collapse toggle (toggle replaces logo on hover) */}
-        <div className="relative mb-2 flex h-9 w-9 items-center justify-center">
+        <div
+          data-desktop-drag=""
+          data-sidebar-header="collapsed"
+          className="relative mb-2 flex h-9 w-9 items-center justify-center"
+        >
           <Link
             href="/"
             aria-label={t("Knorvia")}
@@ -483,9 +488,13 @@ export function SidebarShell({
 
   /* ---- Expanded state ---- */
   return (
-    <aside className="flex w-[220px] h-dvh shrink-0 flex-col bg-[var(--secondary)] transition-all duration-200">
-      {/* Header: logo + collapse toggle */}
-      <div className="flex h-14 items-center justify-between px-4">
+    <aside data-app-sidebar="" className="flex w-[220px] h-dvh shrink-0 flex-col bg-[var(--secondary)] transition-all duration-200">
+      {/* Header: logo + collapse toggle; desktop drag region on the left. */}
+      <div
+        data-desktop-drag=""
+        data-sidebar-header="expanded"
+        className="flex h-14 items-center justify-between px-4"
+      >
         <Link href="/" className="group flex items-center gap-1.5">
           <Image
             src="/logo.png"

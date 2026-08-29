@@ -22,14 +22,23 @@ test("appearance settings page: adds the code blocks section after the theme sec
   const source = readAppearancePage();
 
   const themeIndex = source.indexOf('title={t("Theme")}');
+  const frostIndex = source.indexOf('title={t("Window frost")}');
   const codeBlocksIndex = source.indexOf('title={t("Code blocks")}');
 
   assert.notEqual(themeIndex, -1, "Theme section should exist");
+  assert.notEqual(frostIndex, -1, "Window frost section should exist");
   assert.notEqual(codeBlocksIndex, -1, "Code blocks section should exist");
   assert.ok(
-    codeBlocksIndex > themeIndex,
-    "Code blocks section should come after Theme",
+    frostIndex > themeIndex,
+    "Window frost should come after Theme",
   );
+  assert.ok(
+    codeBlocksIndex > frostIndex,
+    "Code blocks section should come after Window frost",
+  );
+  assert.match(source, /frost_clarity/);
+  assert.match(source, /frost_plates/);
+  assert.match(source, /type="range"/);
 });
 
 test("appearance settings page: wires syntax theme select and toggle controls to settings context", () => {
@@ -84,4 +93,26 @@ test("appearance settings page: preview includes a line long enough to demonstra
     previewSource.split("\n").some((line) => line.length >= 120),
     "The preview needs a 120+ character line so Wrap long lines has a visible effect",
   );
+});
+
+test("appearance settings page: wallpaper is independent of window frost", () => {
+  const source = readAppearancePage();
+
+  const themeIndex = source.indexOf('title={t("Theme")}');
+  const wallpaperIndex = source.indexOf('title={t("Wallpaper")}');
+  const frostIndex = source.indexOf('title={t("Window frost")}');
+  const codeBlocksIndex = source.indexOf('title={t("Code blocks")}');
+
+  assert.notEqual(wallpaperIndex, -1, "Wallpaper section should exist");
+  assert.ok(wallpaperIndex > themeIndex, "Wallpaper should come after Theme");
+  assert.ok(frostIndex !== wallpaperIndex);
+  assert.ok(codeBlocksIndex > wallpaperIndex);
+  assert.match(source, /chooseBuiltinWallpaper/);
+  assert.match(source, /importCustomWallpaper/);
+  assert.match(source, /clearWallpaper/);
+  assert.match(source, /wallpaper_enabled/);
+  assert.match(source, /wallpaper_source/);
+  assert.match(source, /wallpaper_fit/);
+  assert.match(source, /wallpaper_dim/);
+  assert.match(source, /BUILTIN_WALLPAPERS/);
 });

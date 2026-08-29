@@ -280,6 +280,7 @@ export default function PickerShell({
             aria-modal="true"
             aria-labelledby={labelledBy}
             aria-label={labelledBy ? undefined : ariaLabel}
+            className="overflow-hidden rounded-2xl"
             onKeyDown={handleKeyDown}
             // Stop propagation so a click *inside* the dialog never reaches the
             // backdrop's mousedown handler above. Width/layout decisions stay

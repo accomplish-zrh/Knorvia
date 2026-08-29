@@ -52,12 +52,12 @@ const PALETTES: Record<Theme, Palette> = {
     border: "#3a3634",
   },
   glass: {
-    bg: "#0e0d1a",
-    fg: "#ffffff",
-    card: "rgba(255,255,255,0.06)",
-    primary: "#a855f7",
-    muted: "rgba(255,255,255,0.06)",
-    border: "rgba(255,255,255,0.12)",
+    bg: "#eaf2f8",
+    fg: "#10151c",
+    card: "#f7fafc",
+    primary: "#b0501e",
+    muted: "#e3edf5",
+    border: "#c5d4e2",
     glass: true,
   },
 };
@@ -76,8 +76,8 @@ function MiniPreview({ palette }: { palette: Palette }) {
         <>
           <defs>
             <radialGradient id="glass-shine" cx="20%" cy="0%" r="80%">
-              <stop offset="0%" stopColor="rgba(168,85,247,0.38)" />
-              <stop offset="100%" stopColor="rgba(168,85,247,0)" />
+              <stop offset="0%" stopColor="rgba(255,255,255,0.55)" />
+              <stop offset="100%" stopColor="rgba(186,216,245,0)" />
             </radialGradient>
           </defs>
           <rect

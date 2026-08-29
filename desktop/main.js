@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, protocol, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, protocol, nativeTheme, shell } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
@@ -10,6 +10,17 @@ const {
   DesktopAssetStreamBroker,
   isDesktopDirectFilePath,
 } = require("./protocol-stream");
+const {
+  TITLEBAR_HEIGHT,
+  WINDOW_CORNER_RADIUS,
+  browserWindowChrome,
+  sanitizeOverlay,
+  windowMaterialForFrost,
+  applyWindowMaterial,
+  fromMainWindow,
+} = require("./window-chrome");
+const { applyWindowCornerRegion } = require("./win32-corners");
+const wallpaper = require("./wallpaper");
 
 let mainWindow;
 let engine;
@@ -29,6 +40,11 @@ const DESKTOP_VERSION = require("./package.json").version;
 protocol.registerSchemesAsPrivileged([
   { scheme: "knorvia", privileges: { standard: true, secure: true, supportFetchAPI: true, corsEnabled: true } },
 ]);
+
+// Win32 stays non-layered so maximize/restore work. 16px corners are
+// applied with SetWindowRgn (win32-corners.js).
+
+let liveBackdrop = false;
 
 function runtimeRoot() {
   return app.isPackaged
@@ -101,88 +117,175 @@ function ensureDesktopDefaults(root) {
   }
 }
 
-function loadingPage() {
+function readInterfaceSettings() {
+  try {
+    const file = path.join(workspaceRoot(), "data", "user", "settings", "interface.json");
+    return JSON.parse(fs.readFileSync(file, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function storedUiTheme() {
+  const parsed = readInterfaceSettings();
+  return parsed && typeof parsed.theme === "string" ? parsed.theme : null;
+}
+
+function storedUiFrost() {
+  const parsed = readInterfaceSettings();
+  if (!parsed) return false;
+  if (typeof parsed.window_frost === "boolean") return parsed.window_frost;
+  return parsed.theme === "glass";
+}
+
+function loadingPage(glass) {
   const logo = fs.readFileSync(path.join(__dirname, "build", "logo.png")).toString("base64");
-  // Palette mirrors globals.css: cream light / warm dark, terracotta accent.
-  // Choreography mirrors BootSplash v2 (web/components/common/BootSplash.tsx):
-  // settle-in logo -> conic ring wipe -> orbit motes with glow -> wordmark
-  // letter-spacing tighten -> gradient shimmer bar. Pure CSS, no deps.
+  // Palette mirrors globals.css cream / warm dark. Choreography mirrors
+  // BootSplash v3 (web/components/common/BootSplash.tsx): aura bloom, logo
+  // focus, one hairline arc, tracking wordmark, centre-grown rule. No
+  // breathe, motes, or dual spinners. Frost keeps the canvas transparent
+  // so DWM acrylic / macOS vibrancy show through. Restored windows clip
+  // to 16px here too.
   const html = `<!doctype html><meta charset="utf-8"><title>Knorvia</title>
   <style>
-    :root { --bg:#faf7ef; --fg:#1c1816; --muted:#71717a; --track:#f1ede2; --accent:#b0501e; }
+    :root { --bg:#fdfcf9; --fg:#1c1816; --muted:#6d645a; --accent:#b0501e; }
     @media (prefers-color-scheme: dark) {
-      :root { --bg:#191411; --fg:#f3ede4; --muted:#a8a29e; --track:#2b241f; --accent:#d4734b; }
+      :root { --bg:#1a1918; --fg:#e8e4de; --muted:#9b9590; --accent:#d4734b; }
     }
     * { box-sizing:border-box; }
-    body { margin:0; background:var(--bg); color:var(--fg); font:15px system-ui,-apple-system,"Segoe UI",sans-serif;
-           display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; overflow:hidden; }
+    html, body { border-radius:${WINDOW_CORNER_RADIUS}px; overflow:hidden; clip-path:inset(0 round ${WINDOW_CORNER_RADIUS}px); }
+    body { margin:0; background:${glass ? "transparent" : "var(--bg)"}; color:var(--fg); font:15px system-ui,-apple-system,"Segoe UI",sans-serif;
+           display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; overflow:hidden; user-select:none; }
+    .chrome { position:fixed; top:0; left:0; right:0; height:${TITLEBAR_HEIGHT}px; -webkit-app-region:drag; z-index:10; }
+    .chrome .caption { position:absolute; top:0; right:0; height:100%; display:none; -webkit-app-region:no-drag; }
+    .chrome .caption button { width:46px; height:100%; border:0; background:transparent; color:var(--fg); font-size:12px; }
+    .chrome .caption button:hover { background:rgba(127,127,127,.18); }
+    .chrome .caption button.close:hover { background:#e81123; color:#fff; }
     .emblem { position:relative; width:128px; height:128px; display:grid; place-items:center; }
-    .emblem img { width:76px; height:76px; object-fit:contain; position:relative; z-index:2;
-                  filter:drop-shadow(0 16px 22px rgba(36,50,74,.14));
-                  animation:settle .65s cubic-bezier(.16,1,.3,1) both, breathe 2.2s .65s ease-in-out infinite; }
-    .ring { position:absolute; border-radius:9999px; pointer-events:none;
-            animation:ringIn .8s cubic-bezier(.16,1,.3,1) both; }
-    .ring.outer { inset:0;
-      background:conic-gradient(from 180deg, var(--accent) 0deg, color-mix(in srgb, var(--accent) 26%, transparent) 110deg, transparent 200deg, transparent 360deg);
-      -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px));
-              mask:radial-gradient(farthest-side, transparent calc(100% - 1.5px), #000 calc(100% - 1.5px)); }
-    .ring.inner { inset:14px; animation-delay:.12s;
-      background:conic-gradient(from 0deg, color-mix(in srgb, var(--accent) 55%, transparent) 0deg, transparent 140deg, transparent 360deg);
-      -webkit-mask:radial-gradient(farthest-side, transparent calc(100% - 1px), #000 calc(100% - 1px));
-              mask:radial-gradient(farthest-side, transparent calc(100% - 1px), #000 calc(100% - 1px)); }
-    .orbit { position:absolute; inset:0; animation:spin 1.9s linear infinite; }
-    .orbit.rev { inset:14px; animation-duration:2.9s; animation-direction:reverse; }
-    .mote { position:absolute; top:-2.5px; left:calc(50% - 2.5px); width:5px; height:5px; border-radius:9999px;
-            background:var(--accent); box-shadow:0 0 10px 1px color-mix(in srgb, var(--accent) 55%, transparent);
-            animation:moteIn .5s .35s both; }
-    .orbit.rev .mote { width:4px; height:4px; top:auto; bottom:-2px; opacity:.6; box-shadow:none; }
-    h1 { font-size:25px; font-weight:600; margin:28px 0 6px; font-family:Georgia,'Times New Roman',serif;
-         animation:riseTrack .75s .18s cubic-bezier(.16,1,.3,1) both; }
-    .muted { color:var(--muted); font-size:13px; line-height:1;
-             animation:riseTrack .75s .3s cubic-bezier(.16,1,.3,1) both; }
-    .bar { margin-top:28px; width:176px; height:3px; border-radius:9999px; background:var(--track);
-           overflow:hidden; opacity:0; animation:fadeIn .4s .5s ease-out both; }
-    .bar i { display:block; height:100%; width:100%; border-radius:inherit;
-             background:linear-gradient(90deg, transparent 0%, color-mix(in srgb, var(--accent) 70%, transparent) 30%, var(--accent) 50%, color-mix(in srgb, var(--accent) 70%, transparent) 70%, transparent 100%);
-             background-size:220% 100%; animation:shimmer 1.25s linear infinite; }
-    @keyframes settle { from{opacity:0;transform:scale(.86)} to{opacity:1;transform:scale(1)} }
-    @keyframes breathe { 0%,100%{transform:scale(1)} 50%{transform:scale(.955)} }
-    @keyframes ringIn { from{opacity:0;transform:rotate(-120deg) scale(.92)} to{opacity:1;transform:rotate(0) scale(1)} }
-    @keyframes spin { to { transform:rotate(360deg) } }
-    @keyframes moteIn { from{opacity:0} to{opacity:1} }
-    @keyframes riseTrack { from{opacity:0;transform:translateY(10px);letter-spacing:.14em}
-                           to{opacity:1;transform:none;letter-spacing:-.02em} }
-    @keyframes shimmer { from{background-position:130% 0} to{background-position:-90% 0} }
-    @keyframes fadeIn { from{opacity:0} to{opacity:1} }
+    .aura { position:absolute; left:50%; top:50%; width:380px; height:250px; margin-left:-190px; margin-top:-125px;
+      border-radius:50%; pointer-events:none; filter:blur(14px);
+      background: radial-gradient(circle at 36% 40%, rgba(80,150,230,.22), transparent 46%),
+                  radial-gradient(circle at 66% 60%, rgba(236,154,82,.18), transparent 48%),
+                  radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 58%);
+      animation:auraIn 1.35s cubic-bezier(.16,1,.3,1) both; }
+    @media (prefers-color-scheme: dark) {
+      .aura { filter:blur(16px);
+              background: radial-gradient(circle at 36% 40%, rgba(80,150,230,.42), transparent 46%),
+                          radial-gradient(circle at 66% 60%, rgba(236,154,82,.36), transparent 48%),
+                          radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%); }
+    }
+    .halo { position:absolute; inset:0; width:128px; height:128px; color:var(--accent); pointer-events:none;
+            animation:drift 36s linear infinite; }
+    .halo circle { fill:none; stroke:currentColor; stroke-width:1; stroke-linecap:round; stroke-dasharray:168 386;
+                   opacity:.7; animation:draw 1.15s .22s cubic-bezier(.22,1,.36,1) both; }
+    .emblem img { width:78px; height:78px; object-fit:contain; position:relative; z-index:2;
+                  animation:arrive .95s .08s cubic-bezier(.16,1,.3,1) both; }
+    h1 { font-size:21px; font-weight:600; margin:32px 0 0; letter-spacing:.06em;
+         font-family:Georgia,'Times New Roman',serif;
+         animation:word .9s .34s cubic-bezier(.16,1,.3,1) both; }
+    .muted { color:var(--muted); font-size:12px; line-height:1; margin:10px 0 0;
+             animation:statusIn .7s .5s cubic-bezier(.16,1,.3,1) both; }
+    .rule { margin-top:28px; width:52px; height:1px; overflow:hidden; }
+    .rule i { display:block; height:100%; width:100%; transform-origin:center;
+              background:color-mix(in srgb, var(--accent) 55%, transparent);
+              animation:ruleIn .85s .64s cubic-bezier(.22,1,.36,1) both; }
+    @keyframes auraIn { from{opacity:0;transform:scale(.78)} to{opacity:1;transform:scale(1)} }
+    @keyframes arrive { from{opacity:0;transform:translateY(12px) scale(.96);filter:blur(7px)}
+                        to{opacity:1;transform:none;filter:blur(0)} }
+    @keyframes draw { from{stroke-dashoffset:168;opacity:0} to{stroke-dashoffset:0;opacity:.7} }
+    @keyframes drift { to { transform:rotate(360deg) } }
+    @keyframes word { from{opacity:0;transform:translateY(6px);letter-spacing:.2em}
+                      to{opacity:1;transform:none;letter-spacing:.06em} }
+    @keyframes statusIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
+    @keyframes ruleIn { from{transform:scaleX(0);opacity:0} to{transform:scaleX(1);opacity:1} }
     @media (prefers-reduced-motion: reduce) {
-      .emblem img,.ring,.orbit,.bar i,h1,.muted,.bar { animation:none !important; }
-      .ring,.bar,.mote,h1,.muted { opacity:1 !important; }
+      .aura,.emblem img,.halo,.halo circle,h1,.muted,.rule i { animation:none !important; }
+      .emblem img,.halo circle,h1,.muted,.rule i { opacity:1 !important; transform:none !important; filter:none !important; }
+      .aura { opacity:1 !important; transform:none !important; }
+      .halo circle { stroke-dashoffset:0 !important; }
     }
   </style>
+  <div class="chrome"><div class="caption" id="caption"></div></div>
   <div class="emblem">
-    <span class="ring outer"></span><span class="ring inner"></span>
-    <span class="orbit"><i class="mote"></i></span>
-    <span class="orbit rev"><i class="mote"></i></span>
+    <span class="aura"></span>
+    <svg class="halo" viewBox="0 0 128 128" fill="none"><g transform="rotate(-108 64 64)"><circle cx="64" cy="64" r="61.5"/></g></svg>
     <img src="data:image/png;base64,${logo}" alt="">
   </div>
   <h1>Knorvia</h1>
   <div class="muted">正在启动桌面 AI 引擎…</div>
-  <div class="bar"><i></i></div>`;
+  <div class="rule"><i></i></div>
+  <script>
+    (function () {
+      var chrome = window.knorviaDesktop && window.knorviaDesktop.chrome;
+      if (!chrome || chrome.captionOverlay || chrome.trafficLights) return;
+      var el = document.getElementById("caption");
+      el.style.display = "flex";
+      el.innerHTML = '<button id="min" aria-label="Minimize">&#x2013;</button><button id="max" aria-label="Maximize">&#x25A1;</button><button id="cls" class="close" aria-label="Close">&#x2715;</button>';
+      document.getElementById("min").onclick = function () { chrome.windowMinimize(); };
+      document.getElementById("max").onclick = function () { chrome.windowMaximize(); };
+      document.getElementById("cls").onclick = function () { chrome.windowClose(); };
+    })();
+  </script>`;
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
+function isFilledScreen() {
+  if (!mainWindow || mainWindow.isDestroyed()) return false;
+  return mainWindow.isMaximized() || mainWindow.isFullScreen();
+}
+
+function emitWindowState() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("knorvia:window-state", {
+    maximized: isFilledScreen(),
+  });
+}
+
+function refreshWindowShape() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  applyWindowCornerRegion(mainWindow, WINDOW_CORNER_RADIUS, {
+    square: isFilledScreen(),
+  });
+  emitWindowState();
+}
+
 function createWindow() {
+  const theme = storedUiTheme();
+  const frost = storedUiFrost();
+  const chrome = browserWindowChrome(process.platform, {
+    dark: nativeTheme.shouldUseDarkColors,
+    theme,
+    frost,
+  });
   mainWindow = new BrowserWindow({
     width: 1440, height: 920, minWidth: 1050, minHeight: 700, show: false,
-    autoHideMenuBar: true, backgroundColor: "#f7f8fc",
+    autoHideMenuBar: true,
     icon: path.join(__dirname, "build", "icon.ico"),
+    ...chrome,
     webPreferences: {
       preload: path.join(__dirname, "preload.js"), contextIsolation: true,
       nodeIntegration: false, sandbox: true,
     },
   });
-  mainWindow.loadURL(loadingPage());
-  mainWindow.once("ready-to-show", () => mainWindow.show());
+  liveBackdrop = frost;
+  if (frost) applyWindowMaterial(mainWindow, process.platform, windowMaterialForFrost(true, theme || "snow", process.platform));
+  mainWindow.loadURL(loadingPage(frost));
+  mainWindow.once("ready-to-show", () => {
+    if (liveBackdrop) applyWindowMaterial(mainWindow, process.platform, windowMaterialForFrost(true, storedUiTheme() || "snow", process.platform));
+    mainWindow.show();
+    refreshWindowShape();
+  });
+  const refreshBackdrop = () => {
+    refreshWindowShape();
+    if (!liveBackdrop || !mainWindow || mainWindow.isDestroyed()) return;
+    applyWindowMaterial(mainWindow, process.platform, windowMaterialForFrost(true, storedUiTheme() || "snow", process.platform));
+  };
+  mainWindow.on("maximize", refreshBackdrop);
+  mainWindow.on("unmaximize", refreshBackdrop);
+  mainWindow.on("restore", refreshBackdrop);
+  mainWindow.on("resized", refreshBackdrop);
+  mainWindow.on("enter-full-screen", refreshBackdrop);
+  mainWindow.on("leave-full-screen", refreshBackdrop);
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
     openAllowedExternal(url); return { action: "deny" };
   });
@@ -340,6 +443,60 @@ function sendBridge(message) {
 
 function installIpcHandlers() {
   const trusted = (event) => event.senderFrame.url.startsWith("knorvia://app/");
+  ipcMain.on("knorvia:titlebar-overlay", (event, payload) => {
+    if (!fromMainWindow(event, mainWindow) || process.platform !== "win32") return;
+    const overlay = sanitizeOverlay(payload);
+    if (!overlay || !mainWindow || mainWindow.isDestroyed()) return;
+    try { mainWindow.setTitleBarOverlay(overlay); } catch (error) {
+      capture(`Title bar overlay update failed: ${error.message}\n`);
+    }
+  });
+  ipcMain.on("knorvia:window-material", (event, payload) => {
+    if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) return;
+    liveBackdrop = payload?.material === "acrylic" || payload?.vibrancy === "under-window";
+    try { applyWindowMaterial(mainWindow, process.platform, payload); } catch (error) {
+      capture(`Window material update failed: ${error.message}\n`);
+    }
+  });
+  ipcMain.on("knorvia:window-minimize", (event) => {
+    if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.minimize();
+  });
+  ipcMain.on("knorvia:window-maximize", (event) => {
+    if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isFullScreen()) {
+      mainWindow.setFullScreen(false);
+      return;
+    }
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+  });
+  ipcMain.on("knorvia:window-close", (event) => {
+    if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.close();
+  });
+  ipcMain.handle("knorvia:window-is-maximized", (event) => {
+    if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) return false;
+    return isFilledScreen();
+  });
+  ipcMain.handle("knorvia:wallpaper-state", (event) => {
+    if (!fromMainWindow(event, mainWindow)) return { id: "none", src: null, builtins: [] };
+    return wallpaper.getState();
+  });
+  ipcMain.handle("knorvia:wallpaper-set", (event, id) => {
+    if (!fromMainWindow(event, mainWindow)) return { id: "none", src: null, builtins: [] };
+    return wallpaper.setBuiltin(id);
+  });
+  ipcMain.handle("knorvia:wallpaper-import", async (event) => {
+    if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) {
+      return { id: "none", src: null, builtins: [] };
+    }
+    return wallpaper.importCustom(mainWindow);
+  });
+  ipcMain.handle("knorvia:wallpaper-clear", (event) => {
+    if (!fromMainWindow(event, mainWindow)) return { id: "none", src: null, builtins: [] };
+    return wallpaper.clear();
+  });
   ipcMain.handle("knorvia:fetch", (event, request) => {
     if (!trusted(event)) return encodedHttpError(403, "请求来源不受信任");
     if (typeof request?.path !== "string" || !request.path.startsWith("/api/"))

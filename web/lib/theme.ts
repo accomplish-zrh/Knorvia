@@ -91,7 +91,7 @@ export function applyThemeToDocument(theme: Theme): void {
   if (theme === "dark") {
     html.classList.add("dark");
   } else if (theme === "glass") {
-    html.classList.add("dark", "theme-glass");
+    html.classList.add("theme-glass");
   } else if (theme === "snow") {
     html.classList.add("theme-snow");
   }

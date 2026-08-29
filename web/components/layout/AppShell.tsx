@@ -128,6 +128,12 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
         </div>
 
         <main className="flex min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]">
+          {/* Desktop caption-button strip; height is 0 in the browser. */}
+          <div
+            data-desktop-main-chrome=""
+            aria-hidden
+            className="desktop-titlebar-space"
+          />
           <div className="flex h-11 shrink-0 items-center gap-1 border-b border-[var(--border)] px-2 md:hidden">
             <button
               type="button"

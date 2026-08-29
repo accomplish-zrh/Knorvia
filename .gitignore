@@ -337,3 +337,7 @@ celerybeat.pid
 *.wav
 *.ogg
 !demo/*.mp4
+
+# User-uploaded desktop wallpapers (never commit custom files)
+**/settings/wallpapers/
+

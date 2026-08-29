@@ -64,7 +64,7 @@ export function ConfirmDialog({
     >
       <div
         onClick={(e) => e.stopPropagation()}
-        className="w-full max-w-sm rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-xl"
+        className="w-full max-w-sm overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-xl"
       >
         <div className="mb-3 flex items-center justify-between">
           <h2 className="text-base font-semibold text-[var(--foreground)]">

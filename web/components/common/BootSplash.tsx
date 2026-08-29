@@ -1,32 +1,36 @@
 "use client";
 
 /**
- * Boot splash — the app-entry loading animation (v2).
+ * Boot splash v3 — keep in lockstep with desktop/main.js `loadingPage()`.
  *
- * Choreography (total ~1.6s, then 450ms fade):
- *   0.00s  logo scales in from 0.86 with a soft settle
- *   0.15s  two orbit rings draw themselves in (conic wipe), motes light up
- *          and start counter-rotating at different speeds
- *   0.30s  wordmark rises with letter-spacing easing from wide to normal
- *   0.42s  status line rises
- *   0.55s  progress bar appears; its sweep is a moving gradient (indeterminate
- *          shimmer, not a scaleX loop) so it reads as "working" not "looping"
- *   exit   whole splash fades + scales up 1.02 — feels like a door opening
+ * Quiet room, one light, one mark, one line. No breathing logo, no dual
+ * spinners, no orbiting motes. Choreography (~1.9s hold, 0.58s curtain):
+ *   0.00s  dual-lobe aura (the mark's own blue / amber) blooms
+ *   0.08s  logo arrives — lift, tiny scale, brief focus
+ *   0.22s  a single hairline arc draws, then drifts like a clock
+ *   0.34s  wordmark: tracking settles, almost no travel
+ *   0.50s  status fades (no tracking — Chinese copy)
+ *   0.64s  signature rule grows from the centre
+ *   exit   curtain lift: fade + rise + soft blur (not a zoom)
  *
- * All motion is CSS-only; reduced-motion collapses to a static logo + text.
+ * CSS-only. Reduced motion: static composition, short fade.
  */
 
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import Image from "next/image";
+import { initI18n } from "@/i18n/init";
+
+const i18n = initI18n();
 
 export default function BootSplash() {
-  const { t } = useTranslation();
+  const { t } = useTranslation("app", { i18n });
   const [phase, setPhase] = useState<"visible" | "fading" | "gone">("visible");
 
   useEffect(() => {
-    const fadeTimer = window.setTimeout(() => setPhase("fading"), 1600);
-    const goneTimer = window.setTimeout(() => setPhase("gone"), 2100);
+    const reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const fadeTimer = window.setTimeout(() => setPhase("fading"), reduced ? 280 : 1900);
+    const goneTimer = window.setTimeout(() => setPhase("gone"), reduced ? 480 : 2480);
     return () => {
       window.clearTimeout(fadeTimer);
       window.clearTimeout(goneTimer);
@@ -42,250 +46,238 @@ export default function BootSplash() {
         phase === "fading" ? "boot-exit pointer-events-none" : ""
       }`}
     >
-      {/* Emblem: rings draw in around the breathing logo */}
+      <div
+        data-desktop-drag=""
+        aria-hidden
+        className="desktop-drag-hit absolute inset-x-0 top-0 h-9"
+      />
+
       <div className="boot-emblem relative flex h-32 w-32 items-center justify-center">
-        <span className="boot-ring boot-ring-outer absolute inset-0 rounded-full" />
-        <span className="boot-ring boot-ring-inner absolute inset-[14px] rounded-full" />
+        <span className="boot-aura" />
+        <svg className="boot-halo" viewBox="0 0 128 128" fill="none">
+          <g transform="rotate(-108 64 64)">
+            <circle cx="64" cy="64" r="61.5" />
+          </g>
+        </svg>
         <Image
           src="/logo.png"
           alt=""
-          width={76}
-          height={76}
+          width={78}
+          height={78}
           priority
-          className="boot-logo relative z-10 h-[76px] w-[76px] object-contain"
+          className="boot-logo relative z-10 h-[78px] w-[78px] object-contain"
         />
-        {/* Motes ride the outer ring via nested rotators (no layout thrash) */}
-        <span className="boot-orbit absolute inset-0">
-          <i className="boot-mote" />
-        </span>
-        <span className="boot-orbit boot-orbit-rev absolute inset-[14px]">
-          <i className="boot-mote boot-mote-dim" />
-        </span>
       </div>
 
-      <h1 className="boot-wordmark mt-7 font-serif text-[22px] font-semibold text-[var(--foreground)]">
+      <h1 className="boot-wordmark font-serif text-[21px] font-semibold text-[var(--foreground)]">
         {t("Knorvia")}
       </h1>
-      <p className="boot-status mt-1.5 text-[12px] leading-none text-[var(--muted-foreground)]">
+      <p className="boot-status text-[12px] leading-none text-[var(--muted-foreground)]">
         {t("正在启动桌面 AI 引擎…")}
       </p>
-
-      {/* Indeterminate shimmer bar */}
-      <div
-        className="boot-bar mt-7 h-[3px] w-44 overflow-hidden rounded-full bg-[var(--muted)]"
-        role="presentation"
-      >
-        <span className="boot-bar-fill block h-full w-full rounded-full" />
+      <div className="boot-rule" role="presentation">
+        <span />
       </div>
 
       <style jsx global>{`
         .boot-root {
+          user-select: none;
           opacity: 1;
+          transform: translateY(0);
+          filter: blur(0);
           transition:
-            opacity 0.45s ease-out,
-            transform 0.45s ease-out;
+            opacity 0.58s cubic-bezier(0.22, 1, 0.36, 1),
+            transform 0.58s cubic-bezier(0.22, 1, 0.36, 1),
+            filter 0.58s cubic-bezier(0.22, 1, 0.36, 1);
         }
         .boot-exit {
           opacity: 0;
-          transform: scale(1.02);
+          transform: translateY(-10px);
+          filter: blur(8px);
         }
 
-        /* Logo: settle-in, then a slow breathe */
+        .boot-aura {
+          position: absolute;
+          left: 50%;
+          top: 50%;
+          width: 380px;
+          height: 250px;
+          margin-left: -190px;
+          margin-top: -125px;
+          border-radius: 50%;
+          pointer-events: none;
+          filter: blur(14px);
+          background:
+            radial-gradient(circle at 36% 40%, rgba(80, 150, 230, 0.22), transparent 46%),
+            radial-gradient(circle at 66% 60%, rgba(236, 154, 82, 0.18), transparent 48%),
+            radial-gradient(
+              circle at 50% 50%,
+              color-mix(in srgb, var(--primary) 12%, transparent),
+              transparent 58%
+            );
+          animation: boot-aura-in 1.35s cubic-bezier(0.16, 1, 0.3, 1) both;
+        }
+        html.dark .boot-aura {
+          filter: blur(16px);
+          background:
+            radial-gradient(circle at 36% 40%, rgba(80, 150, 230, 0.42), transparent 46%),
+            radial-gradient(circle at 66% 60%, rgba(236, 154, 82, 0.36), transparent 48%),
+            radial-gradient(
+              circle at 50% 50%,
+              color-mix(in srgb, var(--primary) 22%, transparent),
+              transparent 60%
+            );
+        }
+        @keyframes boot-aura-in {
+          from {
+            opacity: 0;
+            transform: scale(0.78);
+          }
+          to {
+            opacity: 1;
+            transform: scale(1);
+          }
+        }
+
         .boot-logo {
-          animation:
-            boot-settle 0.65s cubic-bezier(0.16, 1, 0.3, 1) both,
-            boot-breathe 2.2s 0.65s ease-in-out infinite;
+          animation: boot-arrive 0.95s 0.08s cubic-bezier(0.16, 1, 0.3, 1) both;
         }
-        @keyframes boot-settle {
+        @keyframes boot-arrive {
           from {
             opacity: 0;
-            transform: scale(0.86);
+            transform: translateY(12px) scale(0.96);
+            filter: blur(7px);
           }
           to {
             opacity: 1;
-            transform: scale(1);
-          }
-        }
-        @keyframes boot-breathe {
-          0%,
-          100% {
-            transform: scale(1);
-          }
-          50% {
-            transform: scale(0.955);
+            transform: translateY(0) scale(1);
+            filter: blur(0);
           }
         }
 
-        /* Rings draw themselves with a conic-gradient wipe */
-        .boot-ring {
-          border-radius: 9999px;
-          animation: boot-ring-in 0.8s cubic-bezier(0.16, 1, 0.3, 1) both;
+        .boot-halo {
+          position: absolute;
+          inset: 0;
+          width: 128px;
+          height: 128px;
+          color: var(--primary);
+          pointer-events: none;
+          animation: boot-drift 36s linear infinite;
         }
-        .boot-ring-outer {
-          background: conic-gradient(
-            from 180deg,
-            var(--primary) 0deg,
-            color-mix(in srgb, var(--primary) 26%, transparent) 110deg,
-            transparent 200deg,
-            transparent 360deg
-          );
-          -webkit-mask: radial-gradient(
-            farthest-side,
-            transparent calc(100% - 1.5px),
-            #000 calc(100% - 1.5px)
-          );
-          mask: radial-gradient(
-            farthest-side,
-            transparent calc(100% - 1.5px),
-            #000 calc(100% - 1.5px)
-          );
+        .boot-halo circle {
+          fill: none;
+          stroke: currentColor;
+          stroke-width: 1;
+          stroke-linecap: round;
+          stroke-dasharray: 168 386;
+          opacity: 0.7;
+          animation: boot-draw 1.15s 0.22s cubic-bezier(0.22, 1, 0.36, 1) both;
         }
-        .boot-ring-inner {
-          animation-delay: 0.12s;
-          background: conic-gradient(
-            from 0deg,
-            color-mix(in srgb, var(--primary) 55%, transparent) 0deg,
-            transparent 140deg,
-            transparent 360deg
-          );
-          -webkit-mask: radial-gradient(
-            farthest-side,
-            transparent calc(100% - 1px),
-            #000 calc(100% - 1px)
-          );
-          mask: radial-gradient(
-            farthest-side,
-            transparent calc(100% - 1px),
-            #000 calc(100% - 1px)
-          );
-        }
-        @keyframes boot-ring-in {
+        @keyframes boot-draw {
           from {
+            stroke-dashoffset: 168;
             opacity: 0;
-            transform: rotate(-120deg) scale(0.92);
           }
           to {
-            opacity: 1;
-            transform: rotate(0deg) scale(1);
+            stroke-dashoffset: 0;
+            opacity: 0.7;
           }
         }
-
-        /* Motes orbit on dedicated layers (transform-only) */
-        .boot-orbit {
-          animation: boot-spin 1.9s linear infinite;
-        }
-        .boot-orbit-rev {
-          animation-duration: 2.9s;
-          animation-direction: reverse;
-        }
-        @keyframes boot-spin {
+        @keyframes boot-drift {
           to {
             transform: rotate(360deg);
           }
         }
-        .boot-mote {
-          position: absolute;
-          top: -2.5px;
-          left: calc(50% - 2.5px);
-          display: block;
-          width: 5px;
-          height: 5px;
-          border-radius: 9999px;
-          background: var(--primary);
-          box-shadow: 0 0 10px 1px color-mix(in srgb, var(--primary) 55%, transparent);
-          animation: boot-mote-in 0.5s 0.35s both;
-        }
-        .boot-mote-dim {
-          width: 4px;
-          height: 4px;
-          top: auto;
-          bottom: -2px;
-          opacity: 0.6;
-          box-shadow: none;
-        }
-        @keyframes boot-mote-in {
-          from {
-            opacity: 0;
-          }
-          to {
-            opacity: 1;
-          }
-        }
 
-        /* Wordmark: rise + tracking settles from airy to normal */
         .boot-wordmark {
-          margin-block: 28px 6px;
-          animation: boot-rise-track 0.75s 0.18s cubic-bezier(0.16, 1, 0.3, 1) both;
+          margin: 32px 0 0;
+          letter-spacing: 0.06em;
+          animation: boot-word 0.9s 0.34s cubic-bezier(0.16, 1, 0.3, 1) both;
         }
-        @keyframes boot-rise-track {
+        @keyframes boot-word {
           from {
             opacity: 0;
-            transform: translateY(10px);
-            letter-spacing: 0.14em;
+            transform: translateY(6px);
+            letter-spacing: 0.2em;
           }
           to {
             opacity: 1;
             transform: translateY(0);
-            letter-spacing: -0.02em;
+            letter-spacing: 0.06em;
           }
-        }
-        .boot-status {
-          animation: boot-rise-track 0.75s 0.3s cubic-bezier(0.16, 1, 0.3, 1) both;
         }
 
-        /* Progress: gradient shimmer travels through the track */
-        .boot-bar {
-          opacity: 0;
-          animation: boot-fade-in 0.4s 0.5s ease-out both;
+        .boot-status {
+          margin: 10px 0 0;
+          animation: boot-status-in 0.7s 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
         }
-        .boot-bar-fill {
-          background: linear-gradient(
-            90deg,
-            transparent 0%,
-            color-mix(in srgb, var(--primary) 70%, transparent) 30%,
-            var(--primary) 50%,
-            color-mix(in srgb, var(--primary) 70%, transparent) 70%,
-            transparent 100%
-          );
-          background-size: 220% 100%;
-          animation: boot-shimmer 1.25s linear infinite;
-        }
-        @keyframes boot-shimmer {
+        @keyframes boot-status-in {
           from {
-            background-position: 130% 0;
+            opacity: 0;
+            transform: translateY(4px);
           }
           to {
-            background-position: -90% 0;
+            opacity: 1;
+            transform: translateY(0);
           }
         }
-        @keyframes boot-fade-in {
+
+        .boot-rule {
+          margin-top: 28px;
+          width: 52px;
+          height: 1px;
+          overflow: hidden;
+        }
+        .boot-rule span {
+          display: block;
+          height: 100%;
+          width: 100%;
+          transform-origin: center;
+          background: color-mix(in srgb, var(--primary) 55%, transparent);
+          animation: boot-rule-in 0.85s 0.64s cubic-bezier(0.22, 1, 0.36, 1) both;
+        }
+        @keyframes boot-rule-in {
           from {
+            transform: scaleX(0);
             opacity: 0;
           }
           to {
+            transform: scaleX(1);
             opacity: 1;
           }
         }
 
         @media (prefers-reduced-motion: reduce) {
+          .boot-aura,
           .boot-logo,
-          .boot-ring,
-          .boot-orbit,
-          .boot-bar-fill,
+          .boot-halo,
+          .boot-halo circle,
           .boot-wordmark,
           .boot-status,
-          .boot-bar {
+          .boot-rule span {
             animation: none;
           }
-          .boot-ring,
-          .boot-bar,
-          .boot-mote,
+          .boot-logo,
+          .boot-halo circle,
+          .boot-wordmark,
           .boot-status,
-          .boot-wordmark {
+          .boot-rule span {
             opacity: 1;
+            transform: none;
+            filter: none;
+            letter-spacing: 0.06em;
+            stroke-dashoffset: 0;
+          }
+          .boot-aura {
+            opacity: 1;
+            transform: none;
           }
           .boot-root {
             transition: opacity 0.2s ease-out;
+          }
+          .boot-exit {
+            transform: none;
+            filter: none;
           }
         }
       `}</style>

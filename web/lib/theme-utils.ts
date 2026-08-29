@@ -35,7 +35,7 @@ export function setDarkTheme(): void {
  */
 export function getThemeClass(theme: Theme): string {
   if (theme === "dark") return "dark";
-  if (theme === "glass") return "dark theme-glass";
+  if (theme === "glass") return "theme-glass";
   if (theme === "snow") return "theme-snow";
   return "";
 }

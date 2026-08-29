@@ -27,6 +27,8 @@ import { apiFetch, apiUrl } from '@/lib/api'
 import { invalidateLLMOptionsCache } from '@/lib/llm-options'
 import { setModelReasoningEffort } from '@/lib/reasoning-effort'
 import { setTheme as applyThemePreference } from '@/lib/theme'
+import { syncLoadedWindowFrost } from '@/lib/window-frost'
+import { syncLoadedWallpaper } from '@/lib/wallpaper'
 
 // ─── Domain types ─────────────────────────────────────────────────────────
 
@@ -157,6 +159,13 @@ export type UiSettings = {
   code_block_theme: string
   code_block_show_line_numbers: boolean
   code_block_wrap_long_lines: boolean
+  window_frost: boolean
+  frost_clarity: number
+  frost_plates: number
+  wallpaper_enabled: boolean
+  wallpaper_source: string
+  wallpaper_fit: 'cover' | 'contain'
+  wallpaper_dim: number
 }
 
 type CodeBlockUiSettings = Pick<
@@ -654,6 +663,8 @@ export function SettingsProvider({ children }: { children: ReactNode }) {
       // the code-block settings event; AppShellContext (the single source) picks
       // them up, so no separate copy needs seeding here.
       syncLoadedCodeBlockSettingsToAppShell(payload.ui)
+      syncLoadedWindowFrost(payload.ui)
+      syncLoadedWallpaper(payload.ui)
       if (payload.providers) setProviders(payload.providers)
       settingsLoaded = true
     } catch (err) {

@@ -17,6 +17,13 @@ import {
   type Theme,
 } from "@/lib/theme";
 import {
+  applyWindowFrostToDocument,
+  readStoredWindowFrost,
+  saveWindowFrost,
+  subscribeToWindowFrost,
+  type WindowFrostState,
+} from "@/lib/window-frost";
+import {
   ACTIVE_SESSION_EVENT,
   ACTIVE_SESSION_STORAGE_KEY,
   CODE_BLOCK_SHOW_LINE_NUMBERS_STORAGE_KEY,
@@ -64,6 +71,8 @@ interface AppShellContextValue {
   setCodeBlockShowLineNumbers: (show: boolean) => void;
   codeBlockWrapLongLines: boolean;
   setCodeBlockWrapLongLines: (wrap: boolean) => void;
+  windowFrost: WindowFrostState;
+  setWindowFrost: (next: Partial<WindowFrostState>) => WindowFrostState;
 }
 
 const AppShellContext = createContext<AppShellContextValue | null>(null);
@@ -87,6 +96,9 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
     useState<boolean>(() => readStoredCodeBlockShowLineNumbers());
   const [codeBlockWrapLongLines, setCodeBlockWrapLongLinesState] =
     useState<boolean>(() => readStoredCodeBlockWrapLongLines());
+  const [windowFrost, setWindowFrostState] = useState<WindowFrostState>(() =>
+    readStoredWindowFrost(),
+  );
 
   useEffect(() => {
     // Hydrate client-only preferences after SSR-safe first render.
@@ -96,6 +108,9 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
     setCodeBlockThemeState(readStoredCodeBlockTheme());
     setCodeBlockShowLineNumbersState(readStoredCodeBlockShowLineNumbers());
     setCodeBlockWrapLongLinesState(readStoredCodeBlockWrapLongLines());
+    const frost = readStoredWindowFrost();
+    setWindowFrostState(frost);
+    applyWindowFrostToDocument(frost);
   }, []);
 
   useEffect(() => {
@@ -220,6 +235,7 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
     window.addEventListener(ACTIVE_SESSION_EVENT, onActiveSession);
     window.addEventListener(SIDEBAR_COLLAPSED_EVENT, onSidebarCollapsed);
     window.addEventListener(CODE_BLOCK_SETTINGS_EVENT, onCodeBlockSettings);
+    const stopFrost = subscribeToWindowFrost(setWindowFrostState);
 
     return () => {
       window.removeEventListener("storage", onStorage);
@@ -230,6 +246,7 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
         CODE_BLOCK_SETTINGS_EVENT,
         onCodeBlockSettings,
       );
+      stopFrost();
     };
   }, []);
 
@@ -269,6 +286,12 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
     setCodeBlockWrapLongLinesState(wrap);
   }, []);
 
+  const setWindowFrost = useCallback((next: Partial<WindowFrostState>) => {
+    const applied = saveWindowFrost({ ...readStoredWindowFrost(), ...next });
+    setWindowFrostState(applied);
+    return applied;
+  }, []);
+
   const value = useMemo<AppShellContextValue>(
     () => ({
       theme,
@@ -285,6 +308,8 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
       setCodeBlockShowLineNumbers,
       codeBlockWrapLongLines,
       setCodeBlockWrapLongLines,
+      windowFrost,
+      setWindowFrost,
     }),
     [
       activeSessionId,
@@ -299,8 +324,10 @@ export function AppShellProvider({ children }: { children: React.ReactNode }) {
       setLanguage,
       setSidebarCollapsed,
       setTheme,
+      setWindowFrost,
       sidebarCollapsed,
       theme,
+      windowFrost,
     ],
   );
 

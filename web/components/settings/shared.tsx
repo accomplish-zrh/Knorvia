@@ -159,7 +159,7 @@ export function SettingSection({
           </p>
         )}
       </header>
-      <div className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)]/40 px-5">
+      <div className="rounded-xl border border-[var(--border)]/60 bg-[var(--card)]/40 px-5 text-[var(--foreground)]">
         {children}
       </div>
     </section>
