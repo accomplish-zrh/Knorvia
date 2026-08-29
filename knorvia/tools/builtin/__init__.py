@@ -18,6 +18,7 @@ from knorvia.tools.exec_tool import ExecTool
 from knorvia.tools.library_tool import LibraryTool
 from knorvia.tools.media_gen_tool import ImagegenTool, VideogenTool
 from knorvia.tools.office_document import OfficeDocumentTool
+from knorvia.tools.partner_management import CreatePartnerTool, UpdatePartnerTool
 from knorvia.tools.partner_memory import (
     PARTNER_BUILTIN_TOOL_NAMES,
     PartnerMemorizeTool,
@@ -1621,6 +1622,11 @@ BUILTIN_TOOL_TYPES: tuple[type[BaseTool], ...] = (
     # Bot-to-bot DM (Hermes bot-mode parity): a partner can message another
     # partner; delivery lands in the target's own session via its runner.
     PartnerMessageTool,
+    # Partner roster management (grok CreateAgent / UpdateAgent parity): a
+    # partner can create a new teammate and refine an existing one's profile.
+    # No delete tool — an agent can never destroy a teammate.
+    CreatePartnerTool,
+    UpdatePartnerTool,
 )
 
 # No tools are parked right now. When a tool's implementation is being

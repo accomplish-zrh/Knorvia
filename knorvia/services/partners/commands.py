@@ -70,11 +70,29 @@ class PartnerCommandHandler:
         config: Any,
         store: PartnerSessionStore,
         save_config: Callable[[str, Any], None] | None = None,
+        cancel_turn: Callable[[str], bool] | None = None,
     ) -> None:
         self.partner_id = partner_id
         self.config = config
         self.store = store
         self.save_config = save_config
+        # Cancels the in-flight turn for a session key (see
+        # PartnerRunner.cancel_turn); None keeps the legacy placeholder text.
+        self.cancel_turn = cancel_turn
+
+    @staticmethod
+    def is_stop_command(text: str) -> bool:
+        """Whether *text* is a bare ``/stop`` (no args) — handled pre-lock.
+
+        The runner checks this BEFORE acquiring the session lock: a stop that
+        waited behind the turn it wants to cancel would always arrive late.
+        """
+        stripped = str(text or "").strip()
+        if not looks_like_partner_command(stripped):
+            return False
+        first = stripped.split(None, 1)
+        head = first[0].split("@", 1)[0].lower() if first else ""
+        return head == "/stop"
 
     def dispatch(self, msg: InboundMessage) -> PartnerCommandResult | None:
         raw = msg.content.strip()
@@ -96,6 +114,8 @@ class PartnerCommandHandler:
         if command == "/branch":
             return self._branch(msg)
         if command == "/stop":
+            if self.cancel_turn is not None and self.cancel_turn(msg.session_key):
+                return PartnerCommandResult("Stopped the reply that was being generated.")
             return PartnerCommandResult("There's nothing being generated to stop.")
         if command == "/sessions":
             return self._sessions()
@@ -170,6 +190,9 @@ class PartnerCommandHandler:
             or getattr(self.config, "model", None)
             or "default"
         )
+        from knorvia.services.partners.routing import routing_label
+
+        routing = routing_label(getattr(self.config, "routing", None))
         tools = self._current_tools()
         messages = self.store.messages(msg.session_key, limit=10_000)
         lines = [
@@ -177,6 +200,7 @@ class PartnerCommandHandler:
             f"- Partner: {getattr(self.config, 'name', self.partner_id)} (`{self.partner_id}`)",
             f"- Channel: {msg.channel}",
             f"- Session: `{msg.session_key}`",
+            f"- Router: `{routing}`",
             f"- Model: `{model}`",
             f"- Messages in current conversation: {len(messages)}",
             f"- Tools: {', '.join(f'`{name}`' for name in tools) if tools else '(none)'}",

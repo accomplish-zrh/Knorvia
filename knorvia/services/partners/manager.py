@@ -166,12 +166,24 @@ def _mcp_tools_setting(data: dict[str, Any]) -> list[str] | None:
     return None if MCP_TOOLS_UNRESTRICTED in names else names
 
 
+def _partner_routing_setting(data: dict[str, Any]) -> dict[str, str]:
+    """Load + sanitise the routing block so an unknown kind degrades to llm."""
+    from knorvia.services.partners.routing import sanitize_routing
+
+    return sanitize_routing(data.get("routing"))
+
+
 @dataclass
 class PartnerConfig:
     """Configuration for a single partner."""
 
     name: str
     description: str = ""
+    # grok-bot profile parity: a short title (job-style subtitle) and the
+    # abstract avatarShape seed used by UIs to render an identicon when no
+    # photo (``avatar``) is set. ``color`` carries the avatarColor seed.
+    title: str = ""
+    avatar_shape: str = ""
     channels: dict[str, Any] = field(default_factory=dict)
     llm_selection: dict[str, str] | None = None
     # Fallback model: when a turn fails outright on the primary selection
@@ -185,6 +197,10 @@ class PartnerConfig:
     # kept inline in config so <img> rendering needs no authenticated
     # file endpoint. Takes precedence over emoji/color when set.
     avatar: str = ""
+    # grok-bot settings parity: ``notify_on_agent_updates`` and
+    # ``hidden_from_sidebar`` (see agent_identity.read_settings). Mirrored to
+    # ``settings.json`` beside the partner config for file-based discovery.
+    settings: dict[str, Any] = field(default_factory=dict)
     soul_origin: dict[str, str] = field(default_factory=dict)  # {"type","id"} provenance
     # User-toggleable system tools (same pool as the chat composer /
     # /settings/tools). None = all of them; [] = none; list = whitelist.
@@ -206,6 +222,15 @@ class PartnerConfig:
     # missing grant must not hand a real account the deployment's servers, while
     # a partner's ``None`` is an owner's deliberate "allow everything".
     mcp_tools: list[str] | None = field(default_factory=list)
+    # grok-bot inference-router parity: who answers this partner's turns.
+    # ``{"backend": "llm"}`` (default) runs the product chat pipeline with
+    # ``llm_selection``; ``{"backend": "cli", "kind": "claude_code"|…,
+    # "connection": "<subagent connection KB name>"}`` routes the turn through
+    # a local agent CLI (see services/partners/routing.py). Sanitised through
+    # ``sanitize_routing`` on load so a stale kind falls back visibly.
+    routing: dict[str, str] = field(
+        default_factory=lambda: {"backend": "llm", "kind": "", "connection": ""}
+    )
 
 
 @dataclass
@@ -297,6 +322,9 @@ class PartnerInstance:
             "partner_id": self.partner_id,
             "name": self.config.name,
             "description": self.config.description,
+            "title": self.config.title,
+            "avatar_shape": self.config.avatar_shape,
+            "settings": self.config.settings,
             "channels": channels,
             "llm_selection": self.config.llm_selection,
             "backup_llm_selection": self.config.backup_llm_selection,
@@ -309,6 +337,7 @@ class PartnerInstance:
             "enabled_tools": self.config.enabled_tools,
             "builtin_tools": self.config.builtin_tools,
             "mcp_tools": self.config.mcp_tools,
+            "routing": self.config.routing,
             "running": self.running,
             "started_at": self.started_at.isoformat(),
             "last_reload_error": self.last_reload_error,
@@ -354,6 +383,9 @@ class PartnerManager:
     _MERGEABLE_FIELDS = (
         "name",
         "description",
+        "title",
+        "avatar_shape",
+        "settings",
         "channels",
         "llm_selection",
         "backup_llm_selection",
@@ -366,6 +398,7 @@ class PartnerManager:
         "enabled_tools",
         "builtin_tools",
         "mcp_tools",
+        "routing",
     )
 
     def load_config(self, partner_id: str) -> PartnerConfig | None:
@@ -377,6 +410,9 @@ class PartnerManager:
             return PartnerConfig(
                 name=data.get("name", partner_id),
                 description=data.get("description", ""),
+                title=str(data.get("title", "") or ""),
+                avatar_shape=str(data.get("avatar_shape", "") or ""),
+                settings=dict(data.get("settings", {}) or {}),
                 channels=strip_legacy_global_delivery(data.get("channels", {}) or {}),
                 llm_selection=data.get("llm_selection"),
                 backup_llm_selection=data.get("backup_llm_selection"),
@@ -389,6 +425,7 @@ class PartnerManager:
                 enabled_tools=_optional_str_list(data.get("enabled_tools")),
                 builtin_tools=_optional_str_list(data.get("builtin_tools")),
                 mcp_tools=_mcp_tools_setting(data),
+                routing=_partner_routing_setting(data),
             )
         except Exception:
             logger.exception("Failed to load partner config %s", partner_id)
@@ -411,6 +448,9 @@ class PartnerManager:
         data: dict[str, Any] = {
             "name": config.name,
             "description": config.description,
+            "title": config.title or "",
+            "avatar_shape": config.avatar_shape or "",
+            "settings": config.settings,
             "channels": strip_legacy_global_delivery(config.channels),
             "language": config.language,
             "emoji": config.emoji,
@@ -435,10 +475,42 @@ class PartnerManager:
         data["mcp_tools"] = (
             [MCP_TOOLS_UNRESTRICTED] if config.mcp_tools is None else list(config.mcp_tools)
         )
+        # Always spelled explicitly: the loader sanitises anyway, and the UI
+        # reads the routing block straight off config.yaml.
+        data["routing"] = config.routing or {"backend": "llm", "kind": "", "connection": ""}
 
         tmp_path = path.with_suffix(path.suffix + ".tmp")
         tmp_path.write_text(yaml.dump(data, allow_unicode=True), encoding="utf-8")
         tmp_path.replace(path)
+        self._write_identity_files(partner_dir, config)
+
+    @staticmethod
+    def _write_identity_files(partner_dir: Path, config: PartnerConfig) -> None:
+        """Mirror the grok-bot file-based discovery surface.
+
+        ``profile.json`` / ``settings.json`` sit beside ``config.yaml`` so any
+        partner (reading via Shell) can discover a sibling's fresh identity the
+        same way grok-bot agents read ``<agentId>/profile.json``. config.yaml
+        stays authoritative; these are informational mirrors.
+        """
+        from knorvia.services.partners.agent_identity import write_profile, write_settings
+
+        try:
+            write_profile(
+                partner_dir,
+                {
+                    "name": config.name,
+                    "description": config.description,
+                    "title": config.title,
+                    "avatar_shape": config.avatar_shape,
+                    "avatar_color": config.color,
+                },
+            )
+            write_settings(partner_dir, config.settings)
+        except Exception:  # noqa: BLE001 - mirror is best-effort, never break save
+            logger.warning(
+                "Failed to write partner identity files for %s", partner_dir.name, exc_info=True
+            )
 
     def _load_auto_start(self, partner_id: str, *, default: bool = False) -> bool:
         path = self._partner_dir(partner_id) / "config.yaml"
@@ -487,7 +559,24 @@ class PartnerManager:
 
         bus = MessageBus()
         store = self.session_store(partner_id)
-        runner = PartnerRunner(partner_id, config, bus, store, save_config=self.save_config)
+
+        async def _typing_hook(channel_name: str, chat_id: str, active: bool) -> None:
+            instance = self._partners.get(partner_id)
+            if instance is None or instance.channel_manager is None:
+                return
+            channel = instance.channel_manager.get_channel(channel_name)
+            if channel is None:
+                return
+            await channel.set_typing(chat_id, active)
+
+        runner = PartnerRunner(
+            partner_id,
+            config,
+            bus,
+            store,
+            save_config=self.save_config,
+            set_typing_hook=_typing_hook,
+        )
 
         try:
             channel_manager = self._build_channel_manager(config, bus, partner_id=partner_id)
@@ -722,6 +811,9 @@ class PartnerManager:
                 "partner_id": pid,
                 "name": cfg.name if cfg else pid,
                 "description": cfg.description if cfg else "",
+                "title": cfg.title if cfg else "",
+                "avatar_shape": cfg.avatar_shape if cfg else "",
+                "settings": cfg.settings if cfg else {},
                 "channels": list(cfg.channels.keys()) if cfg else [],
                 "llm_selection": cfg.llm_selection if cfg else None,
                 "backup_llm_selection": cfg.backup_llm_selection if cfg else None,
@@ -828,6 +920,39 @@ class PartnerManager:
             session_key_override=resolved_key,
         )
         return await instance.runner.process_message(msg, on_event=on_event)
+
+    async def broadcast_message(self, content: str) -> list[str]:
+        """Fan the same user directive out to every running partner.
+
+        Each partner receives a hidden broadcast turn framed by
+        ``[broadcast]`` (grok's ADMIN_BROADCAST) so it treats the message as
+        the owner speaking, not another agent. Returns the ids reached.
+        """
+        import uuid as _uuid
+
+        from knorvia.partners.bus.events import InboundMessage
+        from knorvia.services.partners.agent_identity import build_admin_broadcast_wake_prompt
+
+        reached: list[str] = []
+        prompt = build_admin_broadcast_wake_prompt(content)
+        for partner_id, instance in self._partners.items():
+            if not instance.running or not instance.runner:
+                continue
+            session_key = f"broadcast:{partner_id}:{_uuid.uuid4().hex[:8]}"
+            inbound = InboundMessage(
+                channel="broadcast",
+                sender_id="owner",
+                chat_id=session_key,
+                content=prompt,
+                metadata={"_broadcast": True},
+                session_key_override=session_key,
+            )
+            asyncio.create_task(
+                instance.runner.process_message(inbound),
+                name=f"partner:{partner_id}:broadcast",
+            )
+            reached.append(partner_id)
+        return reached
 
     # ── Live web turns (refresh-survivable streaming) ─────────────
 

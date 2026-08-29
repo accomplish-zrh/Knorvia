@@ -102,6 +102,18 @@ class BaseChannel(ABC):
         """
         pass
 
+    async def set_typing(self, chat_id: str, active: bool) -> None:
+        """Show / clear the platform's typing indicator for *chat_id*.
+
+        grok-bot activity parity: the runner brackets every turn with
+        ``set_typing(True)`` / ``set_typing(False)``. The default is a no-op —
+        platforms without a typing API simply do nothing; platforms with one
+        override this (Telegram repeats its short-lived chat action, Discord
+        triggers typing). Implementations must be best-effort: never raise a
+        turn-breaking error out of here.
+        """
+        pass
+
     @property
     def supports_streaming(self) -> bool:
         """True when config enables streaming AND this subclass implements send_delta."""

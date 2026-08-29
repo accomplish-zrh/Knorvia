@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 import threading
 from typing import Any
+import uuid
 
 from knorvia.partners.helpers import safe_filename
 
@@ -23,6 +24,8 @@ logger = logging.getLogger(__name__)
 _HISTORY_MAX_MESSAGES = 40
 _HISTORY_MAX_CHARS = 24_000
 _ARCHIVE_PREFIX = "_archived_"
+_REACTIONS_FILE = "_reactions.json"
+_REACTION_MAX_EMOJI = 24
 
 
 class PartnerSessionStore:
@@ -111,6 +114,7 @@ class PartnerSessionStore:
         index = self._load_index()
         if index.pop(self._stem(session_key), None) is not None:
             self._save_index(index)
+        self._mutate_reactions(lambda reactions: reactions.pop(self._stem(session_key), None))
         return existed
 
     def branch(self, source_key: str, new_key: str) -> dict[str, Any] | None:
@@ -149,6 +153,9 @@ class PartnerSessionStore:
             "role": role,
             "content": content,
             "timestamp": datetime.now().isoformat(),
+            # Stable id so reactions (grok-bot parity) can address one entry
+            # in an append-only file without rewriting it.
+            "message_id": uuid.uuid4().hex[:12],
         }
         if channel:
             record["channel"] = channel
@@ -205,7 +212,115 @@ class PartnerSessionStore:
                 return None
             path.replace(archive_path)
 
+        # Reactions are keyed by the session stem, so they follow the file
+        # rename (grok-bot keeps reactions inline in the transcript; the
+        # sidecar key move is the append-only equivalent).
+        self._mutate_reactions(
+            lambda reactions: reactions.setdefault(archive_path.stem, reactions.pop(safe_key, {}))
+        )
+
         return self._session_summary(archive_path)
+
+    # ── reactions (grok-bot parity) ───────────────────────────────
+    #
+    # Emoji reactions live in a sidecar keyed by (session stem, message_id) so
+    # the append-only JSONL hot path is never rewritten. ``by`` mirrors
+    # grok-bot's single-viewer model ("me"); the shape keeps the door open for
+    # per-channel authors later.
+
+    @property
+    def _reactions_path(self) -> Path:
+        return self._dir / _REACTIONS_FILE
+
+    def _load_reactions(self) -> dict[str, Any]:
+        path = self._reactions_path
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except (OSError, json.JSONDecodeError):
+            return {}
+
+    def _save_reactions(self, reactions: dict[str, Any]) -> None:
+        with self._write_lock:
+            self._reactions_path.write_text(
+                json.dumps(reactions, ensure_ascii=False, indent=2), encoding="utf-8"
+            )
+
+    def _mutate_reactions(self, mutator: Any) -> None:
+        """Apply *mutator* to the sidecar atomically; drop empty branches."""
+        reactions = self._load_reactions()
+        mutator(reactions)
+        reactions = {stem: per_session for stem, per_session in reactions.items() if per_session}
+        self._save_reactions(reactions)
+
+    def toggle_reaction(
+        self, session_key: str, message_id: str, emoji: str, *, by: str = "me"
+    ) -> list[dict[str, str]] | None:
+        """Toggle one emoji on one message; returns the new reactions list.
+
+        ``None`` means the message (or session) does not exist — the caller
+        answers 404 rather than inventing reactions for a ghost message.
+        """
+        emoji = str(emoji or "").strip()
+        if not emoji or len(emoji) > _REACTION_MAX_EMOJI:
+            return None
+        stem = self._stem(session_key)
+        if not any(record.get("message_id") == message_id for record in self._read_records(stem)):
+            return None
+
+        result: list[dict[str, str]] | None = None
+
+        def mutate(reactions: dict[str, Any]) -> None:
+            per_session = reactions.setdefault(stem, {})
+            current = [
+                entry
+                for entry in (per_session.get(message_id) or [])
+                if isinstance(entry, dict) and entry.get("emoji") and entry.get("by")
+            ]
+            exists = any(entry.get("emoji") == emoji and entry.get("by") == by for entry in current)
+            if exists:
+                current = [
+                    entry
+                    for entry in current
+                    if not (entry.get("emoji") == emoji and entry.get("by") == by)
+                ]
+            else:
+                current.append({"emoji": emoji, "by": str(by)})
+            if current:
+                per_session[message_id] = current
+            else:
+                per_session.pop(message_id, None)
+            nonlocal result
+            result = [dict(entry) for entry in current]
+
+        self._mutate_reactions(mutate)
+        return result
+
+    def reactions_for_session(self, session_key: str) -> dict[str, list[dict[str, str]]]:
+        """Reactions for every message of one session: ``{message_id: [...]}``."""
+        return {
+            str(message_id): [dict(entry) for entry in entries]
+            for message_id, entries in (
+                self._load_reactions().get(self._stem(session_key)) or {}
+            ).items()
+        }
+
+    def attach_reactions(
+        self, session_key: str, messages: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Return *messages* with their reactions merged in as ``reactions``."""
+        per_session = self._load_reactions().get(self._stem(session_key)) or {}
+        if not per_session:
+            return messages
+        merged: list[dict[str, Any]] = []
+        for message in messages:
+            reactions = per_session.get(str(message.get("message_id") or ""))
+            if reactions:
+                message = {**message, "reactions": [dict(entry) for entry in reactions]}
+            merged.append(message)
+        return merged
 
     # ── read ──────────────────────────────────────────────────────
 

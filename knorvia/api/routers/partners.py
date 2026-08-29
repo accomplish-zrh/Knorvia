@@ -131,6 +131,8 @@ class CreatePartnerRequest(BaseModel):
     # Omitting ``mcp_tools`` creates the partner with MCP off (the config
     # default); ``null`` is the deliberate opt-in to every configured MCP tool.
     mcp_tools: list[str] | None = []
+    # grok-bot inference-router parity: who answers the partner's turns.
+    routing: dict[str, str] | None = None
     assets: AssetSpec | None = None
     start: bool = True
 
@@ -148,6 +150,7 @@ class UpdatePartnerRequest(BaseModel):
     enabled_tools: list[str] | None = None
     builtin_tools: list[str] | None = None
     mcp_tools: list[str] | None = None
+    routing: dict[str, str] | None = None
 
 
 class SoulUpdateBody(BaseModel):
@@ -382,8 +385,12 @@ async def get_group_room(room_id: str):
             "name": room.name,
             "members": [m.to_dict() for m in room.members],
             "messages": [
-                {"sender": m.sender, "sender_name": m.sender_name,
-                 "content": m.content, "timestamp": m.timestamp}
+                {
+                    "sender": m.sender,
+                    "sender_name": m.sender_name,
+                    "content": m.content,
+                    "timestamp": m.timestamp,
+                }
                 for m in room.messages
             ],
         }
@@ -435,9 +442,7 @@ async def remove_group_member(room_id: str, connection: str):
 
     room = get_group_room_engine().remove_member(room_id, connection)
     if not room:
-        raise HTTPException(
-            status_code=404, detail="Room or member not found"
-        )
+        raise HTTPException(status_code=404, detail="Room or member not found")
     return {"room": {"id": room.id, "members": [m.to_dict() for m in room.members]}}
 
 
@@ -593,6 +598,56 @@ async def tool_options():
     return await build_tool_options(exclude_builtin={"read_memory", "write_memory"})
 
 
+@router.get("/router/backends")
+async def router_backends():
+    """Inference-router backend table (grok-bot Router settings parity).
+
+    One entry per local agent CLI the machine could route partner turns to,
+    with its detection status, plus the connections already registered for it
+    (from the subagent KBs) so the Router UI can offer a cwd picker.
+    """
+    from knorvia.services.partners.routing import router_backend_status
+
+    backends = await router_backend_status()
+    connections: list[dict[str, Any]] = []
+    try:
+        from knorvia.knowledge.kb_types import SUBAGENT_KB_TYPE
+        from knorvia.multi_user.knowledge_access import admin_kb_manager
+
+        manager = admin_kb_manager()
+        for name in manager.list_knowledge_bases():
+            meta = manager.get_metadata(name)
+            if not isinstance(meta, dict) or meta.get("type") != SUBAGENT_KB_TYPE:
+                continue
+            connections.append(
+                {
+                    "name": str(meta.get("name") or name),
+                    "kind": str(meta.get("agent_kind") or ""),
+                    "cwd": str(meta.get("cwd") or ""),
+                }
+            )
+    except Exception:
+        logger.warning("Failed to list subagent connections for router", exc_info=True)
+    return {"backends": backends, "connections": connections}
+
+
+def _validate_routing_payload(routing: dict[str, str] | None) -> dict[str, str]:
+    """API-boundary routing validation: unknown CLI kinds are a 422, not a
+    silent fallback (the silent-degrade path is only for on-disk configs)."""
+    from knorvia.services.partners.routing import sanitize_routing
+
+    if routing is None:
+        return {"backend": "llm", "kind": "", "connection": ""}
+    safe = sanitize_routing(routing)
+    requested_backend = str(routing.get("backend") or "llm").strip().lower()
+    if requested_backend == "cli" and safe["backend"] != "cli":
+        raise HTTPException(
+            status_code=422,
+            detail=f"Unknown router backend kind: {routing.get('kind')!r}",
+        )
+    return safe
+
+
 # ── Create / read / update / lifecycle ─────────────────────────
 
 
@@ -626,6 +681,7 @@ async def create_partner(payload: CreatePartnerRequest):
         enabled_tools=payload.enabled_tools,
         builtin_tools=payload.builtin_tools,
         mcp_tools=payload.mcp_tools,
+        routing=_validate_routing_payload(payload.routing),
     )
     mgr.save_config(partner_id, config, auto_start=bool(payload.start))
     write_soul(partner_id, soul_content)
@@ -680,6 +736,7 @@ def _stopped_partner_dict(
         "enabled_tools": cfg.enabled_tools,
         "builtin_tools": cfg.builtin_tools,
         "mcp_tools": cfg.mcp_tools,
+        "routing": cfg.routing,
         "running": False,
         "started_at": None,
         "last_reload_error": None,
@@ -736,6 +793,8 @@ def _apply_update(cfg: PartnerConfig, payload: UpdatePartnerRequest) -> None:
         cfg.builtin_tools = payload.builtin_tools
     if "mcp_tools" in payload.model_fields_set:
         cfg.mcp_tools = payload.mcp_tools
+    if "routing" in payload.model_fields_set:
+        cfg.routing = _validate_routing_payload(payload.routing)
 
 
 @router.patch("/{partner_id}")
@@ -889,7 +948,54 @@ async def get_partner_history(
     mgr = get_partner_manager()
     if session_id and not session_key:
         session_key = mgr.web_session_key(partner_id, session_id=session_id)
-    return mgr.get_history(partner_id, session_key=session_key, limit=limit)
+    history = mgr.get_history(partner_id, session_key=session_key, limit=limit)
+    if session_key:
+        history = mgr.session_store(partner_id).attach_reactions(session_key, history)
+    return history
+
+
+class ReactionToggleBody(BaseModel):
+    session_key: str = Field(..., min_length=1)
+    message_id: str = Field(..., min_length=1)
+    emoji: str = Field(..., min_length=1, max_length=24)
+
+
+@router.post("/{partner_id}/history/reaction")
+async def toggle_partner_reaction(partner_id: str, payload: ReactionToggleBody):
+    """Toggle one emoji reaction on one history message (grok-bot parity).
+
+    Idempotent per (message, emoji): sending it twice removes it again. The
+    updated reaction list is returned so the UI can reconcile optimistically.
+    """
+    mgr = get_partner_manager()
+    if not mgr.partner_exists(partner_id):
+        raise HTTPException(status_code=404, detail=t("api.partner_not_found"))
+    reactions = mgr.session_store(partner_id).toggle_reaction(
+        payload.session_key, payload.message_id, payload.emoji
+    )
+    if reactions is None:
+        raise HTTPException(status_code=404, detail="Message not found")
+    return {
+        "partner_id": partner_id,
+        "session_key": payload.session_key,
+        "message_id": payload.message_id,
+        "reactions": reactions,
+    }
+
+
+@router.get("/{partner_id}/usage")
+async def get_partner_usage(partner_id: str, days: int = 30):
+    """Local usage ledger for this partner (grok-bot usage-tracking parity).
+
+    Activity records — turns, token totals and estimated cost from the
+    pricing table — folded per day and per backend over the requested window.
+    """
+    mgr = get_partner_manager()
+    if not mgr.partner_exists(partner_id):
+        raise HTTPException(status_code=404, detail=t("api.partner_not_found"))
+    from knorvia.services.partners import usage as usage_ledger
+
+    return usage_ledger.summary(partner_id, days=days)
 
 
 @router.get("/{partner_id}/sessions")

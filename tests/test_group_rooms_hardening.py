@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Hardening tests v2: room lock, turn timeout, transcript cap (CLI model)."""
+
 from __future__ import annotations
 
 import asyncio
@@ -33,13 +34,9 @@ class FakeInstance:
 
 
 def _install_backend(monkeypatch: pytest.MonkeyPatch, backend) -> None:
-    monkeypatch.setattr(
-        "knorvia.services.subagent.get_backend", lambda kind: backend
-    )
+    monkeypatch.setattr("knorvia.services.subagent.get_backend", lambda kind: backend)
     settings = type("S", (), {"backend": lambda self, kind: object()})()
-    monkeypatch.setattr(
-        "knorvia.services.subagent.load_subagent_settings", lambda: settings
-    )
+    monkeypatch.setattr("knorvia.services.subagent.load_subagent_settings", lambda: settings)
     import knorvia.services.subagent.sessions as sess
 
     store: dict[str, str] = {}

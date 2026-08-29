@@ -30,6 +30,10 @@ import AssetPicker, {
 import ToolPicker from "@/components/partners/ToolPicker";
 import FaceEditor, { type FaceValue } from "@/components/partners/FaceEditor";
 import SoulEditor from "@/components/partners/SoulEditor";
+import {
+  PartnerRouterSection,
+  PartnerUsageSection,
+} from "@/components/partners/PartnerRouterSection";
 
 function Section({
   title,
@@ -299,6 +303,8 @@ export default function PartnerConfigure({
 
   return (
     <div className="space-y-4">
+      <PartnerRouterSection partner={partner} onToast={onToast} onUpdated={onUpdated} />
+
       <Section
         title={t("Identity")}
         action={
@@ -535,6 +541,8 @@ export default function PartnerConfigure({
           </ul>
         )}
       </Section>
+
+      <PartnerUsageSection partner={partner} />
     </div>
   );
 }

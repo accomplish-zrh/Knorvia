@@ -23,6 +23,8 @@ import {
   getPartnerHistory,
   getPartnerSessions,
   resumePartnerSession,
+  togglePartnerReaction,
+  type MessageReaction,
 } from "@/lib/partners-api";
 import { freshPartnerSessionKey } from "@/lib/partner-session";
 import type { ExportableMessage } from "@/lib/chat-export";
@@ -53,6 +55,24 @@ interface ChatMsg {
   /** Full turn event stream (live turns only; restored history has none). */
   events?: StreamEvent[];
   error?: boolean;
+  /** Persisted message id — reactions need it (grok-bot reactToMessage parity). */
+  messageId?: string;
+  reactions?: MessageReaction[];
+}
+
+/** The emoji set offered on a message hover (grok-bot's quick reactions). */
+const REACTION_EMOJIS = ["👍", "👀", "🔥", "🚀", "❤️", "😄"];
+
+function toggleReactionLocal(
+  reactions: MessageReaction[] | undefined,
+  emoji: string,
+): MessageReaction[] {
+  const current = reactions ?? [];
+  const exists = current.some((r) => r.emoji === emoji && r.by === "me");
+  const next = exists
+    ? current.filter((r) => !(r.emoji === emoji && r.by === "me"))
+    : [...current, { emoji, by: "me" }];
+  return next;
 }
 
 interface PartnerMessageAttachment {
@@ -124,12 +144,66 @@ function sentAttachmentsForMessage(
   }));
 }
 
+/** Reaction chips + the hover emoji picker (only for persisted messages). */
+function MessageReactions({
+  messageId,
+  reactions,
+  onToggle,
+}: {
+  messageId?: string;
+  reactions?: MessageReaction[];
+  onToggle: (emoji: string) => void;
+}) {
+  const current = reactions ?? [];
+  const grouped = new Map<string, MessageReaction[]>();
+  for (const reaction of current) {
+    grouped.set(reaction.emoji, [...(grouped.get(reaction.emoji) ?? []), reaction]);
+  }
+  const mine = (emoji: string) =>
+    (grouped.get(emoji) ?? []).some((r) => r.by === "me");
+  const canReact = Boolean(messageId);
+
+  return (
+    <div data-message-reactions="" className="mt-1.5 flex items-center gap-1">
+      {canReact && (
+        <div className="flex items-center gap-0.5 rounded-full border border-[var(--border)] bg-[var(--card)]/70 px-1 py-0.5 opacity-0 transition-opacity group-hover/msg:opacity-100">
+          {REACTION_EMOJIS.map((emoji) => (
+            <button
+              key={emoji}
+              type="button"
+              onClick={() => onToggle(emoji)}
+              className="rounded-full px-1 text-[13px] leading-5 transition-transform hover:scale-125"
+              aria-label={emoji}
+            >
+              {emoji}
+            </button>
+          ))}
+        </div>
+      )}
+      {[...grouped.entries()].map(([emoji, entries]) => (
+        <button
+          key={emoji}
+          type="button"
+          onClick={() => onToggle(emoji)}
+          className={`inline-flex items-center gap-0.5 rounded-full border px-1.5 py-0.5 text-[11.5px] transition-colors ${
+            mine(emoji)
+              ? "border-[var(--ring)] bg-[var(--accent)]"
+              : "border-[var(--border)] text-[var(--muted-foreground)]"
+          }`}
+        >
+          <span className="text-[12.5px]">{emoji}</span>
+          {entries.length > 1 && <span>{entries.length}</span>}
+        </button>
+      ))}
+    </div>
+  );
+}
+
 function AttachmentStrip({
   attachments,
 }: {
   attachments?: PartnerMessageAttachment[];
-}) {
-  if (!attachments?.length) return null;
+}) {  if (!attachments?.length) return null;
   return (
     <div className="mt-2 flex flex-wrap gap-1.5">
       {attachments.map((attachment, index) => {
@@ -283,6 +357,12 @@ export default function PartnerChat({
             .map((m) => ({
               role: m.role as "user" | "assistant",
               content: m.content,
+              messageId: (m as Record<string, unknown>).message_id as
+                | string
+                | undefined,
+              reactions: (m as Record<string, unknown>).reactions as
+                | MessageReaction[]
+                | undefined,
               attachments: normalizeHistoryAttachments(
                 (m as Record<string, unknown>).attachments,
               ),
@@ -386,6 +466,34 @@ export default function PartnerChat({
         setStreaming(false);
         live = null;
         publish();
+        // The finished turn is persisted server-side now; pull the tail back
+        // so the fresh assistant message carries its message_id + reactions
+        // (reactions are only addressable on persisted messages).
+        const tailSessionKey = sessionKeyRef.current;
+        void getPartnerHistory(partnerId, {
+          sessionKey: tailSessionKey,
+          limit: 2,
+        })
+          .then((tail) => {
+            setMessages((msgs) => {
+              const patched = [...msgs];
+              let cursor = patched.length - 1;
+              for (let k = tail.length - 1; k >= 0 && cursor >= 0; k--) {
+                const record = tail[k];
+                const target = patched[cursor];
+                if (target && target.role === record.role) {
+                  patched[cursor] = {
+                    ...target,
+                    messageId: record.message_id,
+                    reactions: record.reactions,
+                  };
+                  cursor--;
+                }
+              }
+              return patched;
+            });
+          })
+          .catch(() => {});
       } else if (data.type === "stopped") {
         // Server cancelled the turn (/stop or the stop button). Keep any
         // partial answer the user already saw; drop the live draft.
@@ -452,6 +560,38 @@ export default function PartnerChat({
       );
     }
   }, [sessionKey]);
+
+  // grok-bot reactToMessage parity: optimistic toggle, then reconcile with
+  // the server's authoritative list (removes the reaction server-side on 404).
+  const handleToggleReaction = useCallback(
+    async (messageIndex: number, emoji: string) => {
+      const target = messages[messageIndex];
+      if (!target?.messageId) return;
+      setMessages((msgs) =>
+        msgs.map((msg, i) =>
+          i === messageIndex
+            ? { ...msg, reactions: toggleReactionLocal(msg.reactions, emoji) }
+            : msg,
+        ),
+      );
+      try {
+        const res = await togglePartnerReaction(
+          partnerId,
+          sessionKeyRef.current,
+          target.messageId,
+          emoji,
+        );
+        setMessages((msgs) =>
+          msgs.map((msg, i) =>
+            i === messageIndex ? { ...msg, reactions: res.reactions } : msg,
+          ),
+        );
+      } catch {
+        onToast?.(t("Reaction failed"));
+      }
+    },
+    [messages, partnerId, onToast, t],
+  );
 
   // Escape interrupts a streaming answer. Bound on `window` rather than the
   // chat container because the composer is disabled mid-stream, so focus
@@ -675,7 +815,7 @@ export default function PartnerChat({
                   </div>
                 </div>
               ) : (
-                <div key={i} className="flex items-start gap-2.5">
+                <div key={i} className="group/msg flex items-start gap-2.5">
                   <PartnerAvatar
                     name={partnerName}
                     emoji={emoji}
@@ -701,6 +841,11 @@ export default function PartnerChat({
                     ) : (
                       <AssistantResponse content={msg.content} />
                     )}
+                    <MessageReactions
+                      messageId={msg.messageId}
+                      reactions={msg.reactions}
+                      onToggle={(emoji) => void handleToggleReaction(i, emoji)}
+                    />
                   </div>
                 </div>
               ),
@@ -715,18 +860,38 @@ export default function PartnerChat({
                   size={26}
                 />
                 <div className="min-w-0 flex-1">
-                  <AssistantActivity
-                    events={draft.events}
-                    isStreaming
-                    content={draft.content}
-                    className="mb-1.5"
-                    agentName={partnerName}
-                    showMark={false}
-                    headerClassName="min-h-[26px]"
-                  />
-                  {draft.content ? (
-                    <AssistantResponse content={draft.content} />
-                  ) : null}
+                  {draft.events.length === 0 && !draft.content ? (
+                    // grok-bot composing parity: the perceptible gap between
+                    // sending and the first streamed token gets a typing row.
+                    <div
+                      data-typing-dots=""
+                      className="flex items-center gap-1 py-2.5"
+                      aria-label={t("Composing…")}
+                    >
+                      {[0, 150, 300].map((delay) => (
+                        <span
+                          key={delay}
+                          className="h-1.5 w-1.5 animate-bounce rounded-full bg-[var(--muted-foreground)]"
+                          style={{ animationDelay: `${delay}ms` }}
+                        />
+                      ))}
+                    </div>
+                  ) : (
+                    <>
+                      <AssistantActivity
+                        events={draft.events}
+                        isStreaming
+                        content={draft.content}
+                        className="mb-1.5"
+                        agentName={partnerName}
+                        showMark={false}
+                        headerClassName="min-h-[26px]"
+                      />
+                      {draft.content ? (
+                        <AssistantResponse content={draft.content} />
+                      ) : null}
+                    </>
+                  )}
                 </div>
               </div>
             )}

@@ -9,6 +9,7 @@ the packaged app — launched from that stale Explorer — reports "not
 installed" until reboot. Detect now falls back to checking each backend's
 documented default install locations directly before giving up.
 """
+
 from __future__ import annotations
 
 import os

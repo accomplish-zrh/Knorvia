@@ -7,6 +7,7 @@ the room transcript through their own session store — the room injects
 the conversation as an inbound message whose session key is the room id,
 so transcripts persist per-partner exactly like botdm sessions.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -149,9 +150,7 @@ class GroupChatEngine:
 
     # ── Conversation ─────────────────────────────────────────────
 
-    def _resolve_mentions(
-        self, room: "Room", content: str
-    ) -> list["RoomMember"] | None:
+    def _resolve_mentions(self, room: "Room", content: str) -> list["RoomMember"] | None:
         """Members explicitly @addressed in *content*, or None for all.
 
         Matches @display_name and @connection (case-insensitive). Unknown
@@ -183,9 +182,7 @@ class GroupChatEngine:
     ) -> dict[str, Any]:
         """User speaks into the room; every member answers once in turn."""
         async with _lock_for(room_id):
-            return await self._send_user_message_locked(
-                room_id, content, max_speakers=max_speakers
-            )
+            return await self._send_user_message_locked(room_id, content, max_speakers=max_speakers)
 
     async def _send_user_message_locked(
         self,
@@ -198,9 +195,7 @@ class GroupChatEngine:
         if not room:
             raise LookupError(f"Room {room_id!r} not found")
         if not room.members:
-            raise ValueError(
-                "This room has no members yet — add a CLI-backed member first."
-            )
+            raise ValueError("This room has no members yet — add a CLI-backed member first.")
 
         now = time.time()
         room.messages.append(RoomMessage("user", "user", content, now))
@@ -218,9 +213,7 @@ class GroupChatEngine:
             transcript = self._render_transcript(room)
             addressed = mentioned is not None and member in mentioned
             persona_line = (
-                f"Your identity in this room: {member.persona}. "
-                if member.persona
-                else ""
+                f"Your identity in this room: {member.persona}. " if member.persona else ""
             )
             prompt = (
                 f"You are one of several agents in a group chat with the user. "
@@ -264,9 +257,7 @@ class GroupChatEngine:
             ],
         }
 
-    async def _consult_member(
-        self, room: "Room", member: "RoomMember", prompt: str
-    ) -> str:
+    async def _consult_member(self, room: "Room", member: "RoomMember", prompt: str) -> str:
         """One member's turn through its real subagent backend.
 
         Session anchoring: the cross-turn registry key is

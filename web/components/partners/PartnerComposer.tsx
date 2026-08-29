@@ -405,7 +405,8 @@ export const PartnerComposer = memo(function PartnerComposer({
         rows={1}
         maxLength={32000}
         disabled={disabled || streaming}
-        className="block w-full resize-none bg-transparent px-3.5 pt-3 pb-1 text-[14px] leading-relaxed text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)] disabled:opacity-50"
+        className="block w-full resize-none appearance-none bg-transparent px-3.5 pt-3 pb-1 text-[14px] leading-relaxed text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)] disabled:opacity-50"
+        style={{ backgroundColor: "rgba(0,0,0,0)" }}
       />
 
       {!!attachments.length && (

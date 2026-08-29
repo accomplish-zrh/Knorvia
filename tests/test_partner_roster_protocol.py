@@ -23,9 +23,7 @@ def test_no_teammates_returns_empty() -> None:
         def list_partners(self):
             return [{"id": "alpha", "name": "Alpha", "running": True}]
 
-    with patch(
-        "knorvia.services.partners.manager.get_partner_manager"
-    ) as getter:
+    with patch("knorvia.services.partners.manager.get_partner_manager") as getter:
         getter.return_value = EmptyManager()
         assert _runtime("alpha")._teammates_context() == ""
 
@@ -43,9 +41,7 @@ def test_roster_lists_others_with_state_and_role() -> None:
                 },
             ]
 
-    with patch(
-        "knorvia.services.partners.manager.get_partner_manager"
-    ) as getter:
+    with patch("knorvia.services.partners.manager.get_partner_manager") as getter:
         getter.return_value = Manager()
         ctx = _runtime("alpha")._teammates_context()
 
@@ -61,7 +57,5 @@ def test_manager_failure_degrades_to_empty() -> None:
     def boom():
         raise RuntimeError("manager down")
 
-    with patch(
-        "knorvia.services.partners.manager.get_partner_manager", boom
-    ):
+    with patch("knorvia.services.partners.manager.get_partner_manager", boom):
         assert _runtime("alpha")._teammates_context() == ""

@@ -12,6 +12,8 @@ export interface PartnerInfo {
   llm_selection?: LLMSelection | null;
   backup_llm_selection?: LLMSelection | null;
   model?: string | null;
+  /** grok-bot inference-router parity: who answers this partner's turns. */
+  routing?: PartnerRouting;
   language?: string;
   emoji?: string;
   color?: string;
@@ -25,6 +27,53 @@ export interface PartnerInfo {
   last_reload_error?: string | null;
   provisioning?: ProvisioningReport;
   start_error?: string;
+}
+
+export interface PartnerRouting {
+  backend: "llm" | "cli";
+  kind?: string;
+  connection?: string;
+}
+
+export interface RouterBackendStatus {
+  kind: string;
+  display_name: string;
+  available: boolean;
+  version?: string;
+  detail?: string;
+  suggested_cwd?: string;
+}
+
+export interface RouterBackendConnection {
+  name: string;
+  kind: string;
+  cwd: string;
+}
+
+export interface RouterBackendsResponse {
+  backends: RouterBackendStatus[];
+  connections: RouterBackendConnection[];
+}
+
+export interface UsageBucket {
+  turns: number;
+  total_calls: number;
+  prompt_tokens: number;
+  completion_tokens: number;
+  total_tokens: number;
+  cost_usd: number;
+}
+
+export interface PartnerUsageSummary {
+  days: number;
+  totals: UsageBucket;
+  per_day: (UsageBucket & { day: string })[];
+  per_backend: (UsageBucket & { backend: string })[];
+}
+
+export interface MessageReaction {
+  emoji: string;
+  by: string;
 }
 
 export interface ProvisioningReport {
@@ -106,6 +155,7 @@ export interface CreatePartnerPayload {
   enabled_tools?: string[] | null;
   builtin_tools?: string[] | null;
   mcp_tools?: string[] | null;
+  routing?: PartnerRouting;
   assets?: {
     knowledge_bases?: string[];
     skills?: string[];
@@ -339,10 +389,13 @@ export async function getPartnerHistory(
     role: string;
     content: string;
     timestamp?: string;
+    message_id?: string;
     channel?: string;
     attachments?: Record<string, unknown>[];
     /** Persisted turn trace (assistant rows only) for rehydrating activity. */
     events?: Record<string, unknown>[];
+    /** grok-bot parity: emoji reactions merged from the sidecar. */
+    reactions?: MessageReaction[];
   }[]
 > {
   const params = new URLSearchParams();
@@ -414,6 +467,55 @@ export async function branchPartnerSession(
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ source_key: sourceKey, new_key: newKey }),
       },
+    ),
+  );
+}
+
+/** Detection snapshot for the partner Router UI (grok-bot parity). */
+export async function getRouterBackends(): Promise<RouterBackendsResponse> {
+  return json(
+    await apiFetch(apiUrl("/api/v1/partners/router/backends"), {
+      cache: "no-store",
+    }),
+  );
+}
+
+/** Toggle one emoji on one history message; returns the reconciled list. */
+export async function togglePartnerReaction(
+  partnerId: string,
+  sessionKey: string,
+  messageId: string,
+  emoji: string,
+): Promise<{ reactions: MessageReaction[] }> {
+  return json(
+    await apiFetch(
+      apiUrl(
+        `/api/v1/partners/${encodeURIComponent(partnerId)}/history/reaction`,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          session_key: sessionKey,
+          message_id: messageId,
+          emoji,
+        }),
+      },
+    ),
+  );
+}
+
+/** Local usage records (turns / tokens / estimated cost) for one partner. */
+export async function getPartnerUsage(
+  partnerId: string,
+  days = 30,
+): Promise<PartnerUsageSummary> {
+  return json(
+    await apiFetch(
+      apiUrl(
+        `/api/v1/partners/${encodeURIComponent(partnerId)}/usage?days=${days}`,
+      ),
+      { cache: "no-store" },
     ),
   );
 }

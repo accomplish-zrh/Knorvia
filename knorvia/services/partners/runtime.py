@@ -27,7 +27,8 @@ import json
 import logging
 import mimetypes
 from pathlib import Path
-from typing import Any, Awaitable, Callable
+import re
+from typing import Any, AsyncIterator, Awaitable, Callable
 import uuid
 
 from knorvia.core.context import Attachment, UnifiedContext
@@ -79,14 +80,32 @@ class PartnerRunner:
         bus: MessageBus,
         store: PartnerSessionStore,
         save_config: Callable[[str, Any], None] | None = None,
+        set_typing_hook: Callable[[str, str, bool], Awaitable[None]] | None = None,
     ) -> None:
         self.partner_id = partner_id
         self.config = config
         self.bus = bus
         self.store = store
         self.save_config = save_config
+        # Channel typing indicator (grok-bot activity parity): the manager
+        # injects a hook resolving the channel instance; ``None`` disables it.
+        self.set_typing_hook = set_typing_hook
         self._session_locks: dict[str, asyncio.Lock] = {}
         self._tasks: set[asyncio.Task] = set()
+        # In-flight turn tasks by session key — what /stop cancels.
+        self._active_turns: dict[str, asyncio.Task] = {}
+
+    def cancel_turn(self, session_key: str) -> bool:
+        """Cancel the in-flight turn for *session_key*; False when idle.
+
+        grok-bot parity: the IM ``/stop`` command and the web stop button both
+        land here, on the same in-flight turn map.
+        """
+        task = self._active_turns.get(session_key)
+        if task is None or task.done():
+            return False
+        task.cancel()
+        return True
 
     # ── inbound loop ──────────────────────────────────────────────
 
@@ -110,6 +129,23 @@ class PartnerRunner:
         delivery_meta: dict[str, Any] = {}
         try:
             final = await self.process_message(msg, delivery_meta=delivery_meta)
+        except asyncio.CancelledError:
+            # A /stop (or web stop) cancelled the turn mid-flight: tell the
+            # channel, keep the session lock released, and let the task end
+            # cancelled (no half answer is persisted — process_message handled
+            # that before re-raising).
+            try:
+                await self.bus.publish_outbound(
+                    OutboundMessage(
+                        channel=msg.channel,
+                        chat_id=msg.chat_id,
+                        content="⏹ Reply stopped.",
+                        metadata={"_progress": True},
+                    )
+                )
+            except Exception:  # noqa: BLE001 - bus may already be closing
+                pass
+            raise
         except Exception as exc:
             logger.exception(
                 "Partner %s failed to process message on %s", self.partner_id, msg.channel
@@ -148,19 +184,54 @@ class PartnerRunner:
         when the reply was already delivered live via stream deltas).
         """
         session_key = msg.session_key
+
+        # /stop must act while the running turn holds the session lock —
+        # dispatching it through the lock would make every stop arrive one
+        # turn too late ("nothing being generated" right after generation).
+        if PartnerCommandHandler.is_stop_command(msg.content):
+            if self.cancel_turn(session_key):
+                return "Stopped the reply that was being generated."
+            return "There's nothing being generated to stop."
+
         async with self._lock_for(session_key):
             command = PartnerCommandHandler(
                 partner_id=self.partner_id,
                 config=self.config,
                 store=self.store,
                 save_config=self.save_config,
+                cancel_turn=self.cancel_turn,
             ).dispatch(msg)
             if command is not None:
                 return command.content
 
-            final, turn_events = await self._run_turn(
-                msg, on_event=on_event, delivery_meta=delivery_meta
-            )
+            task = asyncio.current_task()
+            if task is not None:
+                self._active_turns[session_key] = task
+            typing_active = False
+            try:
+                await self._set_typing(msg, True)
+                typing_active = True
+                final, turn_events, usage_row = await self._run_turn(
+                    msg, on_event=on_event, delivery_meta=delivery_meta
+                )
+            except asyncio.CancelledError:
+                # The turn was stopped mid-flight: keep the user message on
+                # record (it was received), but never persist a half answer.
+                self.store.append(
+                    session_key,
+                    "user",
+                    msg.content,
+                    channel=msg.channel,
+                    sender_id=msg.sender_id,
+                    attachments=list((msg.metadata or {}).get("_attachment_records") or []),
+                )
+                raise
+            finally:
+                if typing_active:
+                    await self._set_typing(msg, False)
+                if task is not None:
+                    self._active_turns.pop(session_key, None)
+
             self.store.append(
                 session_key,
                 "user",
@@ -177,6 +248,7 @@ class PartnerRunner:
                     channel=msg.channel,
                     events=turn_events or None,
                 )
+            self._record_usage(usage_row)
             return final
 
     async def _run_turn(
@@ -185,12 +257,38 @@ class PartnerRunner:
         *,
         on_event: EventCallback | None = None,
         delivery_meta: dict[str, Any] | None = None,
-    ) -> tuple[str, list[dict[str, Any]]]:
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
+        """One turn: router first (when configured), then the LLM chain.
+
+        Returns ``(final, events, usage_row)`` — *usage_row* (``None`` when
+        nothing worth recording happened) feeds the partner usage ledger.
+        """
         ensure_partner_workspace(self.partner_id)
         primary = getattr(self.config, "llm_selection", None) or None
         backup = getattr(self.config, "backup_llm_selection", None) or None
 
-        final_text, errors, events = await self._execute_turn(
+        # grok-bot inference-router parity: a partner may route its turns to a
+        # local agent CLI. A failed routing never strands the chat — it falls
+        # back to the LLM path and the error is reported in-band.
+        from knorvia.services.partners.routing import is_cli_routing, sanitize_routing
+
+        routing = sanitize_routing(getattr(self.config, "routing", None))
+        if is_cli_routing(routing):
+            final_text, errors, events, usage_row = await self._execute_routed_turn(
+                msg, routing, on_event=on_event, delivery_meta=delivery_meta
+            )
+            if final_text:
+                return final_text, events, usage_row
+            logger.warning(
+                "Partner %s routed turn via %s failed (%s); falling back to the LLM path",
+                self.partner_id,
+                routing.get("kind"),
+                (errors[-1][:200] if errors else "no output"),
+            )
+            if delivery_meta is not None:
+                delivery_meta.pop("_streamed", None)
+
+        final_text, errors, events, cost_summary = await self._execute_turn(
             msg, selection=primary, on_event=on_event, delivery_meta=delivery_meta
         )
         if not final_text and errors and backup and backup != primary:
@@ -201,13 +299,14 @@ class PartnerRunner:
             )
             if delivery_meta is not None:
                 delivery_meta.pop("_streamed", None)
-            final_text, errors, events = await self._execute_turn(
+            final_text, errors, events, cost_summary = await self._execute_turn(
                 msg, selection=backup, on_event=on_event, delivery_meta=delivery_meta
             )
 
         if not final_text and errors:
             final_text = f"Sorry, the turn failed: {errors[-1]}"
-        return final_text, events
+        usage_row = self._usage_row_for_llm(msg, selection=primary, cost_summary=cost_summary)
+        return final_text, events, usage_row
 
     async def _execute_turn(
         self,
@@ -216,14 +315,16 @@ class PartnerRunner:
         selection: dict[str, str] | None,
         on_event: EventCallback | None = None,
         delivery_meta: dict[str, Any] | None = None,
-    ) -> tuple[str, list[str], list[dict[str, Any]]]:
-        """Run one chat turn with *selection* active; returns (final, errors, events).
+    ) -> tuple[str, list[str], list[dict[str, Any]], dict[str, Any] | None]:
+        """Run one chat turn with *selection* active; returns (final, errors, events, cost).
 
         ``events`` is the turn's trace (every StreamEvent except done/session,
         as ``to_dict()`` — the exact shape the web socket forwards live), so the
         web chat can rehydrate its collapsible "Done" activity after a refresh.
+        ``cost`` is the pipeline's per-turn usage summary (``cost_summary`` from
+        the RESULT event) or ``None``.
 
-        A failed turn is ``("", [error, …], events)`` — the caller decides
+        A failed turn is ``("", [error, …], events, …)`` — the caller decides
         whether a backup model gets a second attempt. Exceptions are folded into
         the error list so the retry policy sees them too.
 
@@ -241,17 +342,6 @@ class PartnerRunner:
             reset_llm_selection,
         )
 
-        final_text = ""
-        terminator_text = ""
-        turn_id = ""
-        round_buffers: dict[str, list[str]] = {}
-        streamed_rounds: dict[str, str] = {}  # call_id → accumulated streamed text
-        ended_rounds: set[str] = set()
-        answer_visible_parts: list[str] = []
-        errors: list[str] = []
-        turn_events: list[dict[str, Any]] = []
-        wants_stream = False
-
         # Turn setup (context assembly + LLM-selection resolution) runs INSIDE
         # the try so a setup failure folds into the error list instead of
         # propagating as an opaque crash. The common one is a missing active
@@ -266,6 +356,10 @@ class PartnerRunner:
         # the model catalog lives in the admin workspace, and the scoped config
         # rides the same async context into the orchestrator task.
         llm_token = None
+        errors: list[str] = []
+        final_text = ""
+        turn_events: list[dict[str, Any]] = []
+        cost_summary: dict[str, Any] | None = None
         try:
             context = self._build_context(msg)
             turn_id = str(context.metadata.get("turn_id") or "")
@@ -289,65 +383,178 @@ class PartnerRunner:
             # needed here (and the partner can never write the owner's memory).
             with user_context(partner_user(self.partner_id, name=self.config.name)):
                 orchestrator = ChatOrchestrator()
-                async for event in orchestrator.handle(context):
-                    if on_event is not None:
-                        await on_event(event)
-                    meta = event.metadata or {}
-
-                    # Capture the trace for rehydration — mirror product chat's
-                    # persisted ``assistant_events`` (everything but done/session).
-                    if event.type not in (StreamEventType.DONE, StreamEventType.SESSION):
-                        turn_events.append(event.to_dict())
-
-                    if event.type == StreamEventType.CONTENT:
-                        call_id = str(meta.get("call_id") or "")
-                        round_buffers.setdefault(call_id, []).append(event.content or "")
-                        if meta.get("call_kind") == "llm_final_response":
-                            terminator_text += event.content or ""
-                        if wants_stream and event.content:
-                            streamed_rounds[call_id] = (
-                                streamed_rounds.get(call_id, "") + event.content
-                            )
-                            await self._publish_stream_delta(msg, turn_id, call_id, event.content)
-
-                    elif event.type == StreamEventType.TOOL_CALL:
-                        if is_im and send_tool_hints and event.content:
-                            hint = _format_tool_hint(event.content, meta.get("args"))
-                            await self._publish_hint(msg, hint, tool_hint=True)
-
-                    elif event.type == StreamEventType.PROGRESS:
-                        if (
-                            meta.get("trace_kind") == "call_status"
-                            and meta.get("call_state") == "complete"
-                            and meta.get("call_role") == "narration"
-                        ):
-                            call_id = str(meta.get("call_id") or "")
-                            raw_text = "".join(round_buffers.pop(call_id, []))
-                            text = raw_text.strip()
-                            if meta.get("answer_visible") is True:
-                                if raw_text:
-                                    answer_visible_parts.append(raw_text)
-                                if call_id in streamed_rounds:
-                                    ended_rounds.add(call_id)
-                                    await self._publish_stream_end(msg, turn_id, call_id)
-                                continue
-                            if call_id in streamed_rounds:
-                                # Already streamed live — freeze the segment.
-                                ended_rounds.add(call_id)
-                                await self._publish_stream_end(msg, turn_id, call_id)
-                            elif is_im and send_progress and text:
-                                await self._publish_hint(msg, text, tool_hint=False)
-
-                    elif event.type == StreamEventType.RESULT and event.source == "chat":
-                        final_text = str(meta.get("response") or "")
-
-                    elif event.type == StreamEventType.ERROR and event.content:
-                        errors.append(event.content)
+                final_text, errors, turn_events, cost_summary = await self._consume_turn_events(
+                    orchestrator.handle(context),
+                    msg=msg,
+                    turn_id=turn_id,
+                    on_event=on_event,
+                    delivery_meta=delivery_meta,
+                    send_progress=send_progress,
+                    send_tool_hints=send_tool_hints,
+                )
         except Exception as exc:
             logger.exception("Partner %s turn crashed", self.partner_id)
             errors.append(f"{type(exc).__name__}: {exc}")
         finally:
             reset_llm_selection(llm_token)
+
+        return final_text, errors, turn_events, cost_summary
+
+    async def _execute_routed_turn(
+        self,
+        msg: InboundMessage,
+        routing: dict[str, str],
+        *,
+        on_event: EventCallback | None = None,
+        delivery_meta: dict[str, Any] | None = None,
+    ) -> tuple[str, list[str], list[dict[str, Any]], dict[str, Any] | None]:
+        """One turn through the routed CLI backend (grok-bot inference router).
+
+        Emits the same StreamEvent shapes as the LLM path so all shared
+        handling applies; returns ``(final, errors, events, usage_row)`` —
+        CLI backends don't report token usage, so the ledger row records the
+        request itself.
+        """
+        from knorvia.services.partners.routing import RoutedTurnMeta, execute_routed_turn
+
+        turn_id = f"partner-{self.partner_id}-{uuid.uuid4().hex[:12]}"
+        send_progress = self._channel_delivery_flag(msg.channel, "send_progress", default=True)
+        send_tool_hints = self._channel_delivery_flag(msg.channel, "send_tool_hints", default=True)
+        user_message, _persona_extra = self._effective_user_message(msg)
+
+        meta = RoutedTurnMeta()
+        events_iter = execute_routed_turn(
+            partner_id=self.partner_id,
+            partner_name=self.config.name,
+            description=str(getattr(self.config, "description", "") or ""),
+            soul=read_soul(self.partner_id),
+            channel=msg.channel,
+            session_key=msg.session_key,
+            user_message=user_message,
+            media=list(msg.media or []),
+            routing=routing,
+            meta=meta,
+        )
+        try:
+            final_text, errors, turn_events, _cost = await self._consume_turn_events(
+                events_iter,
+                msg=msg,
+                turn_id=turn_id,
+                on_event=on_event,
+                delivery_meta=delivery_meta,
+                send_progress=send_progress,
+                send_tool_hints=send_tool_hints,
+            )
+        except Exception as exc:  # noqa: BLE001 - routed setup failures fall back
+            logger.exception("Partner %s routed turn crashed", self.partner_id)
+            return "", [f"{type(exc).__name__}: {exc}"], [], None
+
+        errors = list(errors)
+        for router_error in meta.errors:
+            note = f"Router error: {router_error}"
+            if note not in errors:
+                errors.append(note)
+        # CLI backends don't report token usage; the ledger records the turn
+        # request itself (grok-bot usage parity: activity, not an invoice).
+        usage_row = None
+        if final_text:
+            usage_row = {
+                "channel": msg.channel,
+                "backend": f"cli:{meta.kind}",
+                "model": "",
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+                "total_calls": 1,
+                "cost_usd": 0.0,
+            }
+        return final_text, errors, turn_events, usage_row
+
+    async def _consume_turn_events(
+        self,
+        events: AsyncIterator[StreamEvent],
+        *,
+        msg: InboundMessage,
+        turn_id: str,
+        on_event: EventCallback | None,
+        delivery_meta: dict[str, Any] | None,
+        send_progress: bool,
+        send_tool_hints: bool,
+    ) -> tuple[str, list[str], list[dict[str, Any]], dict[str, Any] | None]:
+        """Shared event consumer for the LLM and routed turn paths.
+
+        Buffers CONTENT per call, streams IM deltas live, freezes narration
+        rounds, extracts the final reply + the pipeline cost summary, and
+        closes any stream segment still open at the end (including after a
+        crash) so channels can flush their edit buffers.
+        """
+        final_text = ""
+        terminator_text = ""
+        round_buffers: dict[str, list[str]] = {}
+        streamed_rounds: dict[str, str] = {}  # call_id → accumulated streamed text
+        ended_rounds: set[str] = set()
+        answer_visible_parts: list[str] = []
+        errors: list[str] = []
+        turn_events: list[dict[str, Any]] = []
+        cost_summary: dict[str, Any] | None = None
+        is_im = msg.channel != "web"
+        wants_stream = is_im and send_progress and bool(msg.metadata.get("_wants_stream"))
+
+        async for event in events:
+            if on_event is not None:
+                await on_event(event)
+            meta = event.metadata or {}
+
+            # Capture the trace for rehydration — mirror product chat's
+            # persisted ``assistant_events`` (everything but done/session).
+            if event.type not in (StreamEventType.DONE, StreamEventType.SESSION):
+                turn_events.append(event.to_dict())
+
+            if event.type == StreamEventType.CONTENT:
+                call_id = str(meta.get("call_id") or "")
+                round_buffers.setdefault(call_id, []).append(event.content or "")
+                if meta.get("call_kind") == "llm_final_response":
+                    terminator_text += event.content or ""
+                if wants_stream and event.content:
+                    streamed_rounds[call_id] = streamed_rounds.get(call_id, "") + event.content
+                    await self._publish_stream_delta(msg, turn_id, call_id, event.content)
+
+            elif event.type == StreamEventType.TOOL_CALL:
+                if is_im and send_tool_hints and event.content:
+                    hint = _format_tool_hint(event.content, meta.get("args"))
+                    await self._publish_hint(msg, hint, tool_hint=True)
+
+            elif event.type == StreamEventType.PROGRESS:
+                if (
+                    meta.get("trace_kind") == "call_status"
+                    and meta.get("call_state") == "complete"
+                    and meta.get("call_role") == "narration"
+                ):
+                    call_id = str(meta.get("call_id") or "")
+                    raw_text = "".join(round_buffers.pop(call_id, []))
+                    text = raw_text.strip()
+                    if meta.get("answer_visible") is True:
+                        if raw_text:
+                            answer_visible_parts.append(raw_text)
+                        if call_id in streamed_rounds:
+                            ended_rounds.add(call_id)
+                            await self._publish_stream_end(msg, turn_id, call_id)
+                        continue
+                    if call_id in streamed_rounds:
+                        # Already streamed live — freeze the segment.
+                        ended_rounds.add(call_id)
+                        await self._publish_stream_end(msg, turn_id, call_id)
+                    elif is_im and send_progress and text:
+                        await self._publish_hint(msg, text, tool_hint=False)
+
+            elif event.type == StreamEventType.RESULT and event.source == "chat":
+                final_text = str(meta.get("response") or "")
+                inner = meta.get("metadata")
+                if isinstance(inner, dict) and isinstance(inner.get("cost_summary"), dict):
+                    cost_summary = dict(inner["cost_summary"])
+
+            elif event.type == StreamEventType.ERROR and event.content:
+                errors.append(event.content)
 
         if not final_text.strip():
             final_text = terminator_text.strip()
@@ -384,7 +591,61 @@ class PartnerRunner:
                 ):
                     delivery_meta["_streamed"] = True
 
-        return final_text, errors, turn_events
+        return final_text, errors, turn_events, cost_summary
+
+    # ── channel activity + usage ledger ───────────────────────────
+
+    async def _set_typing(self, msg: InboundMessage, active: bool) -> None:
+        """Best-effort typing indicator on channels that support it."""
+        if self.set_typing_hook is None:
+            return
+        if not self._channel_delivery_flag(msg.channel, "send_typing", default=True):
+            return
+        if not msg.chat_id:
+            return
+        try:
+            await self.set_typing_hook(msg.channel, str(msg.chat_id), active)
+        except Exception:  # noqa: BLE001 - typing is cosmetic, never fail a turn
+            logger.debug(
+                "Partner %s typing indicator failed on %s",
+                self.partner_id,
+                msg.channel,
+                exc_info=True,
+            )
+
+    def _usage_row_for_llm(
+        self,
+        msg: InboundMessage,
+        *,
+        selection: dict[str, str] | None,
+        cost_summary: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Ledger row for one LLM-path turn (None when nothing recorded)."""
+        if not cost_summary:
+            return None
+        model = ""
+        if isinstance(selection, dict):
+            model = str(selection.get("model_id") or "")
+        return {
+            "channel": msg.channel,
+            "backend": "llm",
+            "model": model,
+            "prompt_tokens": cost_summary.get("prompt_tokens", 0),
+            "completion_tokens": cost_summary.get("completion_tokens", 0),
+            "total_tokens": cost_summary.get("total_tokens", 0),
+            "total_calls": cost_summary.get("total_calls", 0),
+            "cost_usd": cost_summary.get("total_cost_usd", 0.0),
+        }
+
+    def _record_usage(self, row: dict[str, Any] | None) -> None:
+        if not row:
+            return
+        try:
+            from knorvia.services.partners import usage as usage_ledger
+
+            usage_ledger.record(self.partner_id, row)
+        except Exception:  # noqa: BLE001 - accounting never breaks a turn
+            logger.debug("Partner %s usage recording failed", self.partner_id, exc_info=True)
 
     # ── context assembly ──────────────────────────────────────────
 
@@ -444,9 +705,10 @@ class PartnerRunner:
         if isinstance(mcp_tools, list):
             metadata["mcp_tools_filter"] = [str(name) for name in mcp_tools]
 
+        user_message, persona_extra = self._effective_user_message(msg)
         return UnifiedContext(
             session_id=f"partner:{self.partner_id}:{session_key}",
-            user_message=msg.content,
+            user_message=user_message,
             conversation_history=history,
             enabled_tools=self._resolved_enabled_tools(),
             allowed_builtin_tools=self._resolved_builtin_tools(),
@@ -455,48 +717,172 @@ class PartnerRunner:
             attachments=attachments,
             language=self._language(),
             persona_context=(
-                read_soul(self.partner_id).strip() + self._teammates_context()
+                read_soul(self.partner_id).strip() + self._teammates_context() + persona_extra
             ),
             skills_manifest=skills_manifest,
             source_manifest=source_manifest,
             metadata=metadata,
         )
 
+    def _effective_user_message(self, msg: InboundMessage) -> tuple[str, str]:
+        """Resolve the message the agent actually reads + protocol framing.
+
+        * bot-to-bot sends (``botdm``) are framed by the ``[agent]`` wake cue
+          so the receiver never mistakes another partner for the user typing;
+        * a "broadcast" turn is already framed by its ``[broadcast]`` prompt;
+        * a user message that @mentions sibling partners surfaces them in a
+          short directory block so the agent can loop them in on request;
+        * every message is clamped to ``AGENT_MESSAGE_MAX_TEXT_LENGTH``.
+        """
+        from knorvia.services.partners.agent_identity import (
+            build_agent_inbound_wake_prompt,
+            build_mentioned_agents_context,
+            clamp_agent_message,
+        )
+
+        raw = msg.content or ""
+        persona_extra = ""
+
+        if msg.channel == "botdm" and bool((msg.metadata or {}).get("_bot_dm")):
+            meta = msg.metadata or {}
+            from_name = str(meta.get("sender_name") or "") or (
+                str(meta.get("sender_id") or "") or "another partner"
+            )
+            wake = build_agent_inbound_wake_prompt(
+                from_address={"id": str(meta.get("sender_id") or ""), "name": from_name},
+                text=raw,
+                images=meta.get("_bot_dm_images") or None,
+                priority=bool(meta.get("_bot_dm_priority")),
+            )
+            return clamp_agent_message(wake), persona_extra
+
+        if msg.channel == "broadcast" and bool((msg.metadata or {}).get("_broadcast")):
+            return clamp_agent_message(raw), persona_extra
+
+        mentioned = self._mentioned_partner_addresses(raw)
+        mentioned_block = build_mentioned_agents_context(mentioned)
+        if mentioned_block:
+            persona_extra = "\n\n" + mentioned_block
+        return clamp_agent_message(raw), persona_extra
+
+    def _mentioned_partner_addresses(self, content: str) -> list[dict[str, str]]:
+        """Sibling partners the user @mentioned in *content* (by name or id)."""
+        try:
+            from knorvia.services.partners.manager import get_partner_manager
+        except Exception:  # noqa: BLE001 - best-effort
+            return []
+        try:
+            partners = get_partner_manager().list_partners()
+        except Exception:  # noqa: BLE001 - best-effort
+            return []
+        tokens = {
+            t.lower() for t in re.findall(r"@([\w\u4e00-\u9fff][\w\-.\u4e00-\u9fff]*)", content)
+        }
+        if not tokens:
+            return []
+        others = [p for p in partners if str(p.get("id") or "") != self.partner_id and p.get("id")]
+        mentioned: list[dict[str, str]] = []
+        for p in others:
+            haystacks = {
+                str(p.get("id") or "").lower(),
+                str(p.get("name") or "").lower(),
+            }
+            if tokens & haystacks:
+                mentioned.append(
+                    {
+                        "id": str(p["id"]),
+                        "name": str(p.get("name") or p.get("id")),
+                        "description": str(p.get("description") or "").strip()[:120],
+                    }
+                )
+        return mentioned
+
     def _teammates_context(self) -> str:
-        """Roster of the other partners for the bot-mode protocol section.
+        """Roster of the other partners + shared rooms for the agent's
+        collaboration protocol section (grok-bot directory parity).
 
         Empty when this is the only partner — no protocol noise for a
         single-agent install.
         """
         try:
+            from knorvia.services.partners.agent_identity import (
+                render_agent_directory_system_prompt,
+            )
             from knorvia.services.partners.manager import get_partner_manager
 
             partners = get_partner_manager().list_partners()
         except Exception:  # noqa: BLE001 - roster is best-effort context
             return ""
-        others = [
-            p for p in partners
-            if str(p.get("id") or "") != self.partner_id and p.get("id")
-        ]
+        others = [p for p in partners if str(p.get("id") or "") != self.partner_id and p.get("id")]
         if not others:
-            return ""
-        lines = []
-        for p in others:
-            state = "running" if p.get("running") else "stopped"
-            name = str(p.get("name") or p.get("id"))
-            desc = str(p.get("description") or "").strip()
-            line = f"- {name} (id: {p.get('id')}, {state})"
-            if desc:
-                line += f": {desc[:120]}"
-            lines.append(line)
-        return (
-            "\n\n## Teammates (other partners on this machine)\n"
-            "You are not alone. To delegate work or ask a teammate a question, "
-            "call send_partner_message(partner_id=..., message=...). The reply "
-            "arrives as the tool result; messages must be self-contained. "
-            "Do not message a stopped partner without telling the user why.\n"
-            + "\n".join(lines)
+            return self._teammates_context_empty()
+        others_addr = [
+            {
+                "id": str(p["id"]),
+                "name": str(p.get("name") or p.get("id")),
+                "description": str(p.get("description") or "").strip()[:120],
+                "running": bool(p.get("running", False)),
+            }
+            for p in others
+        ]
+        groups = self._groups_for_directory()
+        return render_agent_directory_system_prompt(
+            others=others_addr,
+            groups=groups,
+            agents_root_dir=str(self._partners_root_for_prompt()),
         )
+
+    def _teammates_context_empty(self) -> str:
+        """Single-agent install: no peers means no collaboration protocol.
+
+        (grok's empty case offers to *create* a teammate; Knorvia mirrors the
+        product-chat principle of no protocol noise when nothing exists to
+        coordinate with, so it stays silent — the ``send_partner_message``
+        tool remains available if the user asks for it.)
+        """
+        return ""
+
+    def _partners_root_for_prompt(self) -> str | None:
+        try:
+            from knorvia.partners.config.paths import get_data_dir
+
+            return str(get_data_dir())
+        except Exception:  # noqa: BLE001 - prompt hint is best-effort
+            return None
+
+    def _groups_for_directory(self) -> list[dict[str, Any]]:
+        """Shared rooms this partner is seated in, as group addresses."""
+        from knorvia.services.partners.agent_identity import AGENT_DIRECTORY_PROMPT_LIMIT
+
+        try:
+            from knorvia.services.partners.group_chat import get_group_room_engine
+        except Exception:  # noqa: BLE001 - rooms are best-effort context
+            return []
+        try:
+            rooms = get_group_room_engine().list_rooms()
+        except Exception:  # noqa: BLE001 - best-effort
+            return []
+        groups: list[dict[str, Any]] = []
+        for room in rooms:
+            members = room.get("members") or []
+            seated = any(str(m.get("connection") or "") == self.partner_id for m in members)
+            if not seated:
+                continue
+            groups.append(
+                {
+                    "id": str(room.get("id") or ""),
+                    "name": str(room.get("name") or room.get("id") or "Group"),
+                    "is_group": True,
+                    "members": [
+                        {
+                            "id": str(m.get("connection") or ""),
+                            "name": str(m.get("display_name") or m.get("connection") or ""),
+                        }
+                        for m in members[:AGENT_DIRECTORY_PROMPT_LIMIT]
+                    ],
+                }
+            )
+        return groups
 
     def _resolved_enabled_tools(self) -> list[str]:
         """The partner's user-toggleable tool whitelist.
@@ -571,7 +957,11 @@ class PartnerRunner:
             return default
         value = section.get(name)
         if value is None:
-            camel = "sendProgress" if name == "send_progress" else "sendToolHints"
+            camel = {
+                "send_progress": "sendProgress",
+                "send_tool_hints": "sendToolHints",
+                "send_typing": "sendTyping",
+            }.get(name, name)
             value = section.get(camel)
         return value if isinstance(value, bool) else default
 

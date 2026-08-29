@@ -1014,6 +1014,13 @@ class TelegramChannel(BaseChannel):
         if task and not task.done():
             task.cancel()
 
+    async def set_typing(self, chat_id: str, active: bool) -> None:
+        """Unified typing contract (BaseChannel): bracket partner turns."""
+        if active:
+            self._start_typing(str(chat_id))
+        else:
+            self._stop_typing(str(chat_id))
+
     async def _typing_loop(self, chat_id: str) -> None:
         """Repeatedly send 'typing' action until cancelled."""
         try:

@@ -11,6 +11,7 @@ user message or an explicit stop.
 Rooms are standalone rows in the roster UI; membership changes are plain
 metadata edits that never touch a partner's own config.
 """
+
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
@@ -91,14 +92,10 @@ class GroupRoomStore:
                 try:
                     data = json.loads(path.read_text(encoding="utf-8"))
                     msgs = [
-                        RoomMessage(**m)
-                        for m in data.get("messages", [])
-                        if isinstance(m, dict)
+                        RoomMessage(**m) for m in data.get("messages", []) if isinstance(m, dict)
                     ]
                     members = [
-                        _member_from_dict(m)
-                        for m in data.get("members", [])
-                        if isinstance(m, dict)
+                        _member_from_dict(m) for m in data.get("members", []) if isinstance(m, dict)
                     ]
                     rooms.append(
                         Room(

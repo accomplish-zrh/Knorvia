@@ -503,3 +503,10 @@ class DiscordChannel(BaseChannel):
         task = self._typing_tasks.pop(channel_id, None)
         if task:
             task.cancel()
+
+    async def set_typing(self, chat_id: str, active: bool) -> None:
+        """Unified typing contract (BaseChannel): bracket partner turns."""
+        if active:
+            await self._start_typing(str(chat_id))
+        else:
+            await self._stop_typing(str(chat_id))

@@ -20,7 +20,10 @@ import {
 import type { LLMSelection } from "@/lib/unified-ws";
 import {
   createPartner,
+  getRouterBackends,
   getToolOptions,
+  type PartnerRouting,
+  type RouterBackendsResponse,
   type SoulSpec,
   type ToolOptions,
 } from "@/lib/partners-api";
@@ -64,6 +67,15 @@ export default function NewPartnerPage() {
   const [backupSelection, setBackupSelection] = useState<LLMSelection | null>(
     null,
   );
+  // grok-bot Router parity: who answers this partner's turns (default: LLM).
+  const [routing, setRouting] = useState<PartnerRouting>({
+    backend: "llm",
+    kind: "",
+    connection: "",
+  });
+  const [routerTable, setRouterTable] = useState<RouterBackendsResponse | null>(
+    null,
+  );
   const [assets, setAssets] = useState<AssetSelection>({
     knowledge_bases: [],
     skills: [],
@@ -98,6 +110,9 @@ export default function NewPartnerPage() {
         setLLMLoading(false);
       }
     })();
+    void getRouterBackends()
+      .then(setRouterTable)
+      .catch(() => {});
     void getToolOptions()
       .then((options) => {
         setToolOptions(options);
@@ -132,6 +147,9 @@ export default function NewPartnerPage() {
         soul,
         llm_selection: selection,
         backup_llm_selection: backupSelection,
+        routing: routing.kind
+          ? routing
+          : { backend: "llm", kind: "", connection: "" },
         language: language || undefined,
         emoji: face.emoji || undefined,
         color: face.color || undefined,
@@ -190,6 +208,10 @@ export default function NewPartnerPage() {
   );
   const modelSummary = describeSelection(selection, t("System default"));
   const backupSummary = describeSelection(backupSelection, t("No backup"));
+  const routerSummary = routing.kind
+    ? (routerTable?.backends.find((b) => b.kind === routing.kind)?.display_name ??
+      routing.kind)
+    : t("LLM pipeline");
 
   const assetCount =
     assets.knowledge_bases.length +
@@ -371,32 +393,66 @@ export default function NewPartnerPage() {
             <div className="space-y-6">
               <div>
                 <h3 className="mb-2 text-[13px] font-medium text-[var(--muted-foreground)]">
-                  {t("Primary model")}
+                  {t("Router")}
                 </h3>
-                <PartnerModelPicker
-                  options={llmOptions}
-                  activeDefault={activeLLMDefault}
-                  value={selection}
-                  loading={llmLoading}
-                  error={llmError}
-                  onChange={setSelection}
-                />
+                <select
+                  value={routing.kind || "llm"}
+                  onChange={(e) => {
+                    const kind = e.target.value;
+                    setRouting(
+                      kind === "llm"
+                        ? { backend: "llm", kind: "", connection: "" }
+                        : { backend: "cli", kind, connection: "" },
+                    );
+                  }}
+                  className="w-full max-w-md rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[13px] outline-none focus:border-[var(--ring)]"
+                >
+                  <option value="llm">{t("LLM pipeline")}</option>
+                  {routerTable?.backends.map((backend) => (
+                    <option key={backend.kind} value={backend.kind}>
+                      {backend.display_name}
+                      {backend.available ? "" : ` (${t("Not detected")})`}
+                    </option>
+                  ))}
+                </select>
+                <p className="mt-1 text-[11.5px] text-[var(--muted-foreground)]">
+                  {t(
+                    "Who answers this partner's turns — the configured LLM, or a local agent CLI.",
+                  )}
+                </p>
               </div>
-              <div>
-                <h3 className="mb-2 text-[13px] font-medium text-[var(--muted-foreground)]">
-                  {t("Backup model")}
-                </h3>
-                <PartnerModelSelect
-                  options={llmOptions}
-                  activeDefault={activeLLMDefault}
-                  value={backupSelection}
-                  loading={llmLoading}
-                  error={llmError}
-                  noneLabel={t("No backup")}
-                  noneDetail={t("Failed turns are not retried.")}
-                  onChange={setBackupSelection}
-                />
-              </div>
+              {routing.kind === "llm" && (
+                <>
+                  <div>
+                    <h3 className="mb-2 text-[13px] font-medium text-[var(--muted-foreground)]">
+                      {t("Primary model")}
+                    </h3>
+                    <PartnerModelPicker
+                      options={llmOptions}
+                      activeDefault={activeLLMDefault}
+                      value={selection}
+                      loading={llmLoading}
+                      error={llmError}
+                      onChange={setSelection}
+                    />
+                  </div>
+                  <div>
+                    <h3 className="mb-2 text-[13px] font-medium text-[var(--muted-foreground)]">
+                      {t("Backup model")}
+                    </h3>
+                    <PartnerModelSelect
+                      options={llmOptions}
+                      activeDefault={activeLLMDefault}
+                      value={backupSelection}
+                      loading={llmLoading}
+                      error={llmError}
+                      noneLabel={t("No backup")}
+                      noneDetail={t("Failed turns are not retried.")}
+                      onChange={setBackupSelection}
+                    />
+                  </div>
+                </>
+              )}
               <ToolPicker
                 options={toolOptions}
                 enabledTools={enabledTools}
@@ -433,6 +489,7 @@ export default function NewPartnerPage() {
                   [t("Name"), name.trim() || "—"],
                   [t("Description"), description.trim() || "—"],
                   [t("Soul"), soulSummary],
+                  [t("Router"), routerSummary],
                   [t("Model"), modelSummary],
                   [t("Backup model"), backupSummary],
                   [

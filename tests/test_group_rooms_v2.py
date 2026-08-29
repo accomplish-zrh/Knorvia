@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Redesigned group rooms: CLI-backed members + room-anchored sessions."""
+
 from __future__ import annotations
 
 import asyncio
@@ -25,8 +26,17 @@ class FakeBackend:
         self.reply = reply
         self.consults: list[dict] = []
 
-    async def consult(self, question, *, on_event, cwd=None, session_id=None,
-                      config=None, images=None, partner_id=None):  # noqa: ANN001, ANN003
+    async def consult(
+        self,
+        question,
+        *,
+        on_event,
+        cwd=None,
+        session_id=None,
+        config=None,
+        images=None,
+        partner_id=None,
+    ):  # noqa: ANN001, ANN003
         self.consults.append({"question": question[:60], "session_id": session_id})
         from knorvia.services.subagent.types import ConsultResult
 
@@ -37,17 +47,13 @@ class FakeBackend:
 @pytest.fixture()
 def harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
     backend = FakeBackend("done")
-    monkeypatch.setattr(
-        "knorvia.services.subagent.get_backend", lambda kind: backend
-    )
+    monkeypatch.setattr("knorvia.services.subagent.get_backend", lambda kind: backend)
     monkeypatch.setattr(
         "knorvia.services.subagent.list_backend_kinds",
         lambda: ["codex", "claude_code"],
     )
     settings = type("S", (), {"backend": lambda self, kind: object()})()
-    monkeypatch.setattr(
-        "knorvia.services.subagent.load_subagent_settings", lambda: settings
-    )
+    monkeypatch.setattr("knorvia.services.subagent.load_subagent_settings", lambda: settings)
 
     # Session registry: real module but pointed at a temp file via path service?
     # Simpler: wrap remember/get with an in-memory dict through monkeypatching
@@ -55,9 +61,7 @@ def harness(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> dict:
     import knorvia.services.subagent.sessions as sess
 
     store: dict[str, str] = {}
-    monkeypatch.setattr(
-        sess, "get_session", lambda key: store.get(key)
-    )
+    monkeypatch.setattr(sess, "get_session", lambda key: store.get(key))
     monkeypatch.setattr(
         sess,
         "remember_session",
@@ -79,12 +83,13 @@ def test_add_member_requires_known_backend(harness: dict) -> None:
     engine = harness["engine"]
     room = engine.create_room("r")
     with pytest.raises(ValueError):
-        engine.add_member(
-            room.id, backend="nonexistent", connection="c1"
-        )
+        engine.add_member(room.id, backend="nonexistent", connection="c1")
     seated = engine.add_member(
-        room.id, backend="codex", connection="my-codex",
-        display_name="研究员", persona="严谨、简洁",
+        room.id,
+        backend="codex",
+        connection="my-codex",
+        display_name="研究员",
+        persona="严谨、简洁",
     )
     assert seated is not None and len(seated.members) == 1
     assert seated.members[0].display_name == "研究员"
@@ -105,12 +110,8 @@ def test_member_cap_and_duplicates(harness: dict) -> None:
 def test_update_member_is_room_local(harness: dict) -> None:
     engine = harness["engine"]
     room = engine.create_room("r")
-    engine.add_member(
-        room.id, backend="codex", connection="my-codex", display_name="旧名"
-    )
-    updated = engine.update_member(
-        room.id, "my-codex", display_name="新名", persona="幽默"
-    )
+    engine.add_member(room.id, backend="codex", connection="my-codex", display_name="旧名")
+    updated = engine.update_member(room.id, "my-codex", display_name="新名", persona="幽默")
     assert updated is not None
     assert updated.members[0].display_name == "新名"
     assert updated.members[0].persona == "幽默"
@@ -135,9 +136,7 @@ async def test_say_consults_backends_and_anchors_sessions(
     sessions = harness["sessions"]
 
     room = engine.create_room("r")
-    engine.add_member(
-        room.id, backend="codex", connection="my-codex", display_name="研究员"
-    )
+    engine.add_member(room.id, backend="codex", connection="my-codex", display_name="研究员")
     await engine.send_user_message(room.id, "第一个问题")
 
     anchor = f"room:{room.id}::my-codex"
@@ -153,9 +152,7 @@ async def test_say_consults_backends_and_anchors_sessions(
 
 
 @pytest.mark.asyncio
-async def test_two_rooms_never_share_sessions(
-    harness: dict, tmp_path: Path
-) -> None:
+async def test_two_rooms_never_share_sessions(harness: dict, tmp_path: Path) -> None:
     engine: GroupChatEngine = harness["engine"]
 
     room_a = engine.create_room("A")
@@ -185,9 +182,7 @@ async def test_mention_routes_by_display_name(harness: dict) -> None:
     engine = harness["engine"]
     backend = harness["backend"]
     room = engine.create_room("r")
-    engine.add_member(
-        room.id, backend="codex", connection="c1", display_name="研究员"
-    )
+    engine.add_member(room.id, backend="codex", connection="c1", display_name="研究员")
     engine.add_member(room.id, backend="claude_code", connection="c2", display_name="作家")
 
     result = await engine.send_user_message(room.id, "@作家 你来写")
