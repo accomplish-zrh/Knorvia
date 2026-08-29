@@ -1,6 +1,6 @@
 {
   "name": "knorvia-web",
-  "version": "1.8.0",
+  "version": "1.9.0-dev",
   "private": true,
   "scripts": {
     "dev": "node ./scripts/dev.mjs",
@@ -62,5 +62,10 @@
     "tailwindcss": "^3.4.17",
     "tsx": "^4.19.0",
     "typescript": "^5"
+  },
+  "overrides": {
+    "exceljs": {
+      "uuid": "^11.1.1"
+    }
   }
 }

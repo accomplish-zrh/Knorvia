@@ -1,0 +1,43 @@
+# CODEOWNERS — module owners for the 1.9.0 stabilization cycle.
+#
+# A module owner signs off on schema changes, dependency bumps inside their
+# area, and architecture-guard limit changes. Security-sensitive areas
+# (auth, uploads, sandbox, cron, credentials) additionally require the
+# security reviewer per SECURITY.md "Release requirements".
+#
+# Owner handles live here until the upstream remote exists; update the
+# @handles in one commit when the repo is pushed to a shared host.
+
+# Default owner: everything not matched below.
+*                                   @17018
+
+# Security-sensitive: auth, uploads, sandbox, cron, credentials.
+/knorvia/services/auth.py           @17018
+/knorvia/api/routers/auth.py        @17018
+/knorvia/services/pocketbase_client.py @17018
+/knorvia/services/sandbox*          @17018
+/knorvia/services/cron/             @17018
+/knorvia/api/routers/uploads.py     @17018
+
+# Session storage / chat core.
+/knorvia/services/session/          @17018
+/knorvia/api/routers/chat.py        @17018
+
+# Partners (bot) subsystem.
+/knorvia/services/partners/         @17018
+/knorvia/partners/                  @17018
+/knorvia/api/routers/partners.py    @17018
+/web/components/partners/           @17018
+
+# Knowledge bases / RAG engines.
+/knorvia/api/routers/knowledge.py   @17018
+/knorvia/services/rag/              @17018
+
+# Desktop shell & packaging.
+/desktop/                           @17018
+/scripts/build_windows_desktop.ps1  @17018
+
+# Web frontend shell, i18n, shared libs.
+/web/components/layout/             @17018
+/web/locales/                       @17018
+/web/lib/                           @17018

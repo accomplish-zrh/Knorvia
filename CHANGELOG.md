@@ -7,7 +7,151 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.9.0-dev] — stabilization
+
+### Security
+
+- **Dependency security sweep**:
+  - `python-jose` → `pyjwt[crypto]`: token signing/verification migrated in
+    `knorvia/services/auth.py`; `python-jose` and its vulnerable `ecdsa`
+    transitive are gone from the tree, and CI no longer ignores
+    PYSEC-2026-1325 (the 2026-10-01 exception is resolved early).
+  - ExcelJS's vulnerable `uuid` (GHSA-w5hq-g745-h8pq): scoped npm `overrides`
+    pins `exceljs`'s uuid to `^11.1.1`; `npm audit --omit=dev` reports zero
+    findings (the 2026-10-01 exception is resolved early).
+  - RAG stack: `rag-lightrag` now floors `lightrag-hku` at `1.5.6` (with
+    `raganything>=1.3.1`); compat verified against our adapter surface.
+  - `liteparse` pinned exactly to `2.14.2` (Windows CPython 3.12 wheels;
+    2.13.0 had none). `pyarrow` 22.x (PYSEC-2026-113, via graphrag 3.x which
+    caps `pyarrow<23`) is the one open, documented time-bounded exception in
+    SECURITY.md, expiring 2027-01-01.
+
+### Changed
+
+- **Version discipline**: the tree moves to `1.9.0-dev` — the shipped 1.8.0
+  name is no longer used for interim builds; installers are only built from
+  clean commits (see `docs/MAINTENANCE.md`).
+
 ### Added
+
+- **Partner inference router (grok-bot parity)**: a partner's config gains a
+  `routing` block — the product LLM pipeline (default) or a local agent CLI
+  (Claude Code / Codex / Gemini CLI / …) driven through the subagent registry
+  with the partner's Soul injected as the CLI system prompt and per-(partner,
+  session, backend) session continuity. Router failures fall back to the LLM
+  path and surface "Router error: …" in-band. Configured from the partner
+  Configure tab or the new-partner wizard (Router section); `/status` shows
+  the active route; invalid kinds 422 at the API and degrade to `llm` on disk.
+- **Per-partner usage ledger**: every completed turn appends a row to
+  `data/partners/{id}/usage.jsonl` (turns, prompt/completion/total tokens,
+  estimated cost from the pricing table for LLM turns; one request row for
+  CLI-routed turns). `GET /api/v1/partners/{id}/usage?days=N` folds it into
+  totals + per-day + per-backend, shown in the Configure tab's Usage panel.
+- **Message reactions**: session records gain a stable `message_id` and an
+  emoji-reaction sidecar (`sessions/_reactions.json`, follows archives).
+  `POST /api/v1/partners/{id}/history/reaction` toggles idempotently; the
+  history API merges reactions; the partner chat renders hover reactions with
+  optimistic toggling.
+- **Real /stop + typing indicators**: `/stop` (IM) and the web stop button
+  now cancel the in-flight turn through one shared per-session turn map —
+  the user message is kept, no half answer is persisted, and the channel is
+  told. Channels gain a `set_typing(chat_id, active)` contract (Telegram and
+  Discord drive their native typing indicators; `send_typing` per-channel
+  flag), and the web chat shows typing dots until the first streamed token.
+
+### Performance
+
+- **Desktop wallpaper + frost as separate layers**: a 16:9 campus photo sits
+  under the real chrome; frosted panels stay the existing window-frost
+  switch. Built-in presets, custom PNG/JPG/WebP upload, and restore-original
+  live in Appearance. Default is wallpaper off.
+
+### Performance
+
+- **Session listing no longer scans every message per poll**: the sidebar /
+  dashboard / history summary query replaced its `LEFT JOIN messages … GROUP BY`
+  materialisation with a correlated scalar count over `idx_messages_session_created`,
+  so cost scales with the *page* rather than the whole transcript table.
+- **SQLite reads stop queueing behind writes**: pure read paths (session get/
+  list/search/export, message fetch, turn events, message path) bypass the
+  store-wide asyncio lock — WAL plus a fresh connection per call already keep
+  them correct, and one long turn-write no longer stalls history/dashboard
+  polls from every session.
+- **Runtime settings & model catalog are mtime-cached**: hot paths (every chat
+  turn's language/model/tool resolution, admin settings polls, attachment
+  limits) re-read + re-normalized those JSON files several times per request;
+  a stat-guarded memo now serves them without disk hits, invalidated by any
+  write, returning deep copies so caller-mutation semantics are unchanged.
+  Missing/empty settings files also no longer rewrite defaults on *every*
+  read.
+- **Chat streaming renders O(n) not O(n²)**: pairing assistant rows with their
+  user message does one forward pass instead of copy+reverse+find per row; WS
+  event dedupe compares a bounded recent tail instead of the whole turn; the
+  subagent-tab watcher re-opens panels only when a group's event count grew;
+  viewer/reader panels get stable callbacks so their `memo` works; the
+  save-to-notebook transcript mapping only runs while that modal is open.
+- **Long transcripts render in windows**: ChatMessageList mounts the newest 80
+  rows with "Show earlier messages" prepending one window per click instead of
+  mounting every trace panel/KaTeX/Mermaid row at once.
+- **API reads default to `cache: no-store`** in `apiFetch` for GET/HEAD —
+  endpoints whose wrapper forgot it were serving stale JSON from the browser's
+  heuristic cache after cross-page mutations.
+- Smaller: tab-refocus refreshes coalesce within 5 s (was issuing duplicated
+  KB/tools GETs); DirectorDesk timeline polling pauses on hidden tabs and skips
+  identical payloads; Image Studio multi-file uploads run 3-at-a-time; the cron
+  run journal keeps an in-memory line counter instead of recounting its file
+  after each append; `npm run dev` now regenerates `app.overrides.json` like
+  builds do; singletons (`get_sqlite_session_store`, cron service) guard lazy
+  init behind a lock; dashboard `limit` is bounded (`1..200`).
+
+### Added
+
+- **Desktop wallpaper skin**: Appearance can set a campus photo (or an
+  uploaded PNG/JPG/WebP) as the app background. Frosted glass stays an
+  independent control and sits on top of the picture; clearing the
+  wallpaper restores the original solid canvas. Custom files stay in
+  desktop userData, not the repository.
+- **Automation hub** (`/settings/schedule`, relabelled 定时任务 → 自动化):
+  the page now has three tabs — 已配置 (configured tasks), 执行历史
+  (aggregated run history with status/duration/error) and 任务模板
+  (a built-in catalog of eight curated automations: daily AI news brief,
+  brand sentiment weekly, competitor watch, stock monitor, security scan,
+  commit bug hunt, test backfill, change digest). Templates are served by
+  `GET /api/v1/cron/templates?language=zh|en` from the new catalog module
+  `knorvia/services/cron/templates.py`; applying one prefills the create
+  form (never bypassing `CronService` validation/quotas), and a hover
+  action sends the template straight to the chat agent instead. Tasks can
+  be edited in place (name/message/schedule/conversation via the existing
+  PATCH endpoint). Run history merges per-job `run_history` with the new
+  cross-job journal (append-only `jobs.runs.jsonl`, capped at 500 entries)
+  exposed at `GET /api/v1/cron/jobs/runs`, so runs stay visible after a
+  task is deleted or finishes as a one-shot. Schedule descriptions are
+  humanized per locale ("Weekdays at 09:00" / "工作日 09:00"), run statuses
+  and timestamps follow the UI language, and live data re-syncs on window
+  focus or tab switch. "在对话中创建" stashes a starter sentence in
+  sessionStorage and opens chat with it prefilled via the new
+  `web/lib/composer-draft.ts` handoff — the agent schedules it with its
+  existing cron tool.
+- **Desktop window chrome**: the Electron shell no longer uses a separate
+  Win32 caption bar. Content owns the surface to the top edge; Windows 11
+  min/max/close overlay the client area; the sidebar header and a titlebar
+  slot are the drag regions.
+- **Restored desktop windows use 16px corners** via `SetWindowRgn` so
+  maximize/restore stay native (a layered HWND cannot unmaximize).
+  Maximized and fullscreen stay square. Picker dialogs clip to their
+  own radius instead of filling a sharp wrapper rectangle.
+- **Frosted dialogs and search fields keep their CSS radius** on Windows.
+  The dialog role wrapper is no longer filled as a sharp rectangle behind
+  rounded picker cards. Native textareas drop the Win32 Edit fill (the
+  white rectangle inside the composer) by using a zero-alpha background
+  instead of the `transparent` keyword.
+- **Window frost is independent of colour theme**: Appearance now has a
+  Frosted glass switch plus See-through and Panels sliders. Any palette
+  (Default, Cream, Dark, Glass) can enable live Windows acrylic / macOS
+  vibrancy. See-through controls how much of the desktop and other apps
+  shows through the canvas; Panels keeps cards, dialogs and the composer
+  solid enough to read. Existing Glass-theme users keep frost on. Glass
+  itself is now just a cool mist palette.
 
 - **Fine-grained UX pass** (third sweep, GitHub parity details):
   - Code blocks in AI answers gained a copy button with copied-state

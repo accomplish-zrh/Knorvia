@@ -26,9 +26,7 @@ logger = logging.getLogger(__name__)
 # attributes are resolved lazily via module __getattr__, and _build_client
 # prefers an explicit module-level override so tests can still stub
 # ``openai_sdk.AsyncOpenAI`` with monkeypatch.
-_LAZY_SDK_ATTRS = frozenset(
-    {"AsyncOpenAI", "APIConnectionError", "APIError", "APIStatusError"}
-)
+_LAZY_SDK_ATTRS = frozenset({"AsyncOpenAI", "APIConnectionError", "APIError", "APIStatusError"})
 
 
 def __getattr__(name: str):
@@ -122,6 +120,7 @@ class OpenAISDKEmbeddingAdapter(BaseEmbeddingAdapter):
         # Error types come from the same deferred SDK import as the client;
         # fetch them lazily so module import stays SDK-free.
         from openai import APIConnectionError, APIError, APIStatusError
+
         try:
             response = await client.embeddings.create(**kwargs)
         except APIStatusError as exc:

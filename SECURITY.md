@@ -40,14 +40,21 @@ workspace with operating-system permissions.
 
 ## Time-bounded advisory exceptions
 
-- `PYSEC-2026-1325` (`ecdsa`, transitive through `python-jose`) has no fixed
-  release. Knorvia configures the cryptography-backed JWT algorithms and does
-  not call `ecdsa` directly. Exception expires **2026-10-01**; migrate token
-  handling to a maintained JOSE/JWT implementation before that date.
-- ExcelJS currently brings an old `uuid` used by its workbook internals. The
-  application does not pass attacker-controlled output buffers to UUID v3/v5/
-  v6 generators. This moderate exception expires **2026-10-01** and does not
-  waive high/critical npm findings.
+- `PYSEC-2026-113` (`pyarrow` <23.0.1, transitive through `graphrag` 3.x,
+  which hard-caps `pyarrow>=22.0,<23.dev0` — no resolvable fix until a
+  graphrag line allowing pyarrow>=23 lands). Compensating controls: graphrag
+  is an opt-in extra never shipped in `app`/`all`; parquet buffers are only
+  read from KB indexes the local admin built, never from untrusted uploads.
+  Exception expires **2027-01-01**; re-audit graphrag 4.x availability then.
+
+Resolved ahead of expiry (see CHANGELOG):
+
+- `PYSEC-2026-1325` (`ecdsa`, transitive through `python-jose`): token
+  handling migrated to `pyjwt[crypto]` (cryptography-backed, no `ecdsa` in
+  the tree); `python-jose` was removed from the `server` extra and the lock.
+- ExcelJS's vulnerable `uuid` (GHSA-w5hq-g745-h8pq, missing buffer bounds
+  check in v3/v5/v6): pinned to `^11.1.1` via a scoped npm `overrides` entry
+  for `exceljs` only; `npm audit --omit=dev` reports zero findings.
 
 ## Incident response
 

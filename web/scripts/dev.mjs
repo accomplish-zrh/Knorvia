@@ -21,7 +21,7 @@
  * NODE_OPTIONS ceiling from the developer always wins.
  */
 
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -30,6 +30,15 @@ import { fileURLToPath } from "node:url";
 const HEAP_CEILING_MB = 4096;
 const WEB_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const NEXT_BIN = path.join(WEB_DIR, "node_modules", "next", "dist", "bin", "next");
+
+// `npm run build` regenerates locales/en/app.overrides.json before compiling;
+// dev never did, so edits to non-identity English strings silently showed the
+// stale committed artifact until the next production build. One cheap sync
+// pass per dev boot keeps both entrypoints consistent.
+spawnSync(process.execPath, [path.join(WEB_DIR, "scripts", "build_en_overrides.mjs")], {
+  cwd: WEB_DIR,
+  stdio: "inherit",
+});
 
 /** Memory this process may actually use, in MB — cgroup limit included so the
  *  container dev stage sizes to its own budget rather than the host's RAM. */

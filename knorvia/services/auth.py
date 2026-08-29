@@ -219,7 +219,7 @@ def get_user_info(username: str) -> dict | None:
 
 def create_token(username: str, role: str = "user", user_id: str | None = None) -> str:
     """Create a signed JWT for the given username and role."""
-    from jose import jwt
+    import jwt
 
     if not user_id:
         record = _load_users().get(username) or {}
@@ -261,7 +261,7 @@ def decode_token(token: str) -> TokenPayload | None:
         )
 
     # Standard JWT + bcrypt mode
-    from jose import JWTError, jwt
+    import jwt
 
     if not AUTH_SECRET:
         return None
@@ -276,7 +276,10 @@ def decode_token(token: str) -> TokenPayload | None:
             record = _load_users().get(str(username)) or {}
             user_id = str(record.get("id") or "")
         return TokenPayload(username=username, role=payload.get("role", "user"), user_id=user_id)
-    except JWTError:
+    except jwt.PyJWTError:
+        # Covers every PyJWT failure (expired signature, bad signature,
+        # malformed token) — the same blanket rejection python-jose's
+        # JWTError provided before the PYSEC-2026-1325 migration.
         return None
 
 

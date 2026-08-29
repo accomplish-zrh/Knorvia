@@ -9,6 +9,6 @@ Versioning is independent from DeepTutor's 1.5.x line; 1.7.0 introduces
 Knorvia's durable, agent-accessible Video Studio product line.
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0-dev"
 
 __all__ = ("__version__",)

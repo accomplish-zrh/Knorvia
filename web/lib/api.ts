@@ -79,6 +79,18 @@ export async function apiFetch(
   init?: RequestInit & { skipAuthRedirect?: boolean },
 ): Promise<Response> {
   const { skipAuthRedirect, ...fetchInit } = init ?? {};
+  // JSON APIs must not depend on the browser's heuristic cache — wrappers
+  // forgetting `cache:"no-store"` served stale settings after cross-page
+  // mutations. Default GET/HEAD to no-store; callers may still opt back in.
+  const rawMethod =
+    fetchInit.method ?? (input instanceof Request ? input.method : "GET");
+  const httpMethod = (rawMethod ?? "GET").toUpperCase();
+  if (
+    !fetchInit.cache &&
+    (httpMethod === "GET" || httpMethod === "HEAD")
+  ) {
+    fetchInit.cache = "no-store";
+  }
   let res: Response;
   const desktop = typeof window !== "undefined" ? window.knorviaDesktop : undefined;
   if (desktop) {

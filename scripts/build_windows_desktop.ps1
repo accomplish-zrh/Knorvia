@@ -19,7 +19,9 @@ if (-not $VersionLine) {
     throw "Could not read __version__ from $VersionFile"
 }
 $Version = $VersionLine.Matches[0].Groups[1].Value
-if ($Version -notmatch '^\d+\.\d+\.\d+$') {
+# Allow a pre-release dev suffix (e.g. 1.9.0-dev): the tree between releases
+# must never package under the shipped version's name.
+if ($Version -notmatch '^\d+\.\d+\.\d+(-[A-Za-z0-9.]+)?$') {
     throw "Unexpected version format: $Version"
 }
 if ($Prerelease -and $Prerelease -notmatch '^[A-Za-z0-9.-]+$') {
@@ -116,7 +118,11 @@ Remove-Item -LiteralPath (Join-Path $PythonRoot "Lib\EXTERNALLY-MANAGED") -Force
 New-Item -ItemType Directory -Force -Path (Join-Path $RuntimeRoot "node") | Out-Null
 $NodeExe = (Get-Command node.exe -ErrorAction Stop).Source
 Copy-Item -LiteralPath $NodeExe -Destination (Join-Path $RuntimeRoot "node\node.exe") -Force
-$Wheel = Get-ChildItem (Join-Path $ProjectRoot "dist\knorvia-$Version-*.whl") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
+# Wheel filenames are PEP-440-normalized ("1.9.0-dev" → "1.9.0.dev0"), so the
+# glob must use the normalized spelling while every other artifact keeps the
+# human label.
+$WheelVersion = $Version -replace '-dev$', '.dev0' -replace '-rc', 'rc'
+$Wheel = Get-ChildItem (Join-Path $ProjectRoot "dist\knorvia-$WheelVersion-*.whl") | Sort-Object LastWriteTime -Descending | Select-Object -First 1
 if (-not $Wheel) { throw "No wheel found for version $Version under dist\" }
 # The published wheel intentionally defaults to the lightweight core.  The
 # desktop application needs the complete browser/server runtime, so request the
@@ -135,7 +141,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Desktop main-process syntax check failed" }
     node --check protocol-stream.js
     if ($LASTEXITCODE -ne 0) { throw "Desktop stream-bridge syntax check failed" }
-    foreach ($JsFile in @("preload.js", "frontend-host.js")) {
+    foreach ($JsFile in @("preload.js", "frontend-host.js", "window-chrome.js", "win32-corners.js", "wallpaper.js")) {
         node --check $JsFile
         if ($LASTEXITCODE -ne 0) { throw "Desktop $JsFile syntax check failed" }
     }
@@ -145,8 +151,8 @@ try {
     npm run dist
     if ($LASTEXITCODE -ne 0) { throw "Desktop packaging failed with exit code $LASTEXITCODE" }
     $AppAsar = Join-Path (Join-Path $ProjectRoot "release\win-unpacked\resources") "app.asar"
-    node -e "const asar=require('@electron/asar'); const files=asar.listPackage(process.argv[1]); if(!files.some(p=>p.replaceAll('\\','/').endsWith('/protocol-stream.js'))){throw new Error('protocol-stream.js missing from app.asar')}" $AppAsar
-    if ($LASTEXITCODE -ne 0) { throw "Desktop stream bridge is missing from the packaged app" }
+    node -e "const asar=require('@electron/asar'); const files=asar.listPackage(process.argv[1]).map(p=>p.replaceAll('\\','/')); for (const need of ['protocol-stream.js','window-chrome.js','win32-corners.js','wallpaper.js']) { if(!files.some(p=>p.endsWith('/'+need))) throw new Error(need+' missing from app.asar') }" $AppAsar
+    if ($LASTEXITCODE -ne 0) { throw "Desktop asar is missing a required main-process file" }
     if ($Prerelease) {
         # electron-builder names the installer from package.json's
         # ``artifactName`` (Knorvia-${version}-setup.exe) and silently ignores
