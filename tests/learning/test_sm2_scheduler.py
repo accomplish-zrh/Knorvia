@@ -83,7 +83,9 @@ def test_is_correct_bool_still_supported(scheduler: SpacedRepetitionScheduler) -
     assert advanced.ease_factor == sm2_ease_update(SM2_DEFAULT_EASE, 4)
 
 
-def test_debug_mode_uses_seconds(scheduler: SpacedRepetitionScheduler, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_debug_mode_uses_seconds(
+    scheduler: SpacedRepetitionScheduler, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setenv("LEARNING_DEBUG", "1")
     debug_sched = SpacedRepetitionScheduler()
     state = debug_sched.get_initial_state(KnowledgeType.MEMORY)

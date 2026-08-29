@@ -2124,9 +2124,13 @@ def _html_to_markdown(title: str, html: str) -> str:
         )
     # Links + images (best effort; keep href/src text)
     html = _re.sub(r'<img[^>]*src="([^"]*)"[^>]*alt="([^"]*)"[^>]*>', r"!\2(\1)", html, flags=_re.I)
-    html = _re.sub(r'<img[^>]*alt="([^"]*)"[^>]*src="([^"]*)"[^>]*>', r"！\1(\2)", html, flags=_re.I)
+    html = _re.sub(
+        r'<img[^>]*alt="([^"]*)"[^>]*src="([^"]*)"[^>]*>', r"！\1(\2)", html, flags=_re.I
+    )
     html = _re.sub(r'<img[^>]*src="([^"]*)"[^>]*>', r"(\1)", html, flags=_re.I)
-    html = _re.sub(r'<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)</a>', r"[\2](\1)", html, flags=_re.I | _re.S)
+    html = _re.sub(
+        r'<a[^>]*href="([^"]*)"[^>]*>([\s\S]*?)</a>', r"[\2](\1)", html, flags=_re.I | _re.S
+    )
     # Blocks -> paragraphs / breaks
     html = _re.sub(r"</(p|div|li|tr|h[1-6])>", "\n", html, flags=_re.I)
     html = _re.sub(r"<(br|hr)\s*/?>", "\n", html, flags=_re.I)
@@ -2166,14 +2170,14 @@ async def import_url_to_kb(
     manager, resolved_name, kb_base_dir = _writable_kb(kb_name)
     kb_entry = _load_kb_entry_or_404(manager, resolved_name)
     _assert_kb_writable_or_409(resolved_name, kb_entry)
-    kb_provider = _validate_registered_provider(
-        kb_entry.get("rag_provider") or DEFAULT_PROVIDER
-    )
+    kb_provider = _validate_registered_provider(kb_entry.get("rag_provider") or DEFAULT_PROVIDER)
     _assert_provider_ready(kb_provider)
 
     try:
         async with httpx.AsyncClient(follow_redirects=True, timeout=30.0) as client:
-            response = await client.get(url, headers={"User-Agent": "Knorvia/1.8 (+knowledge-import)"})
+            response = await client.get(
+                url, headers={"User-Agent": "Knorvia/1.8 (+knowledge-import)"}
+            )
             response.raise_for_status()
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"Fetch failed: {exc}") from exc

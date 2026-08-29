@@ -32,6 +32,7 @@ import {
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import type { SelectedRecord } from "@/lib/notebook-selection-types";
+import { takeComposerDraft } from "@/lib/composer-draft";
 import type { SelectedHistorySession } from "@/components/chat/HistorySessionPicker";
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import ChatComposer from "@/components/chat/home/ChatComposer";
@@ -45,6 +46,12 @@ import SessionLoadingView from "@/components/chat/home/SessionLoadingView";
 import FilePreviewDrawer from "@/components/chat/preview/FilePreviewDrawer";
 import { buildSessionActivity } from "@/components/chat/home/SessionActivityPanel";
 import Tooltip from "@/components/common/Tooltip";
+import {
+  GeogebraTabBridge,
+  HeaderActionButton,
+  QuizFollowupBridge,
+  SubagentTabWatcher,
+} from "@/components/chat/home/PageBridges";
 import ImmersiveReader from '@/components/chat/home/ImmersiveReader'
 import SessionViewerPanel, {
   type SessionViewerPanelHandle,
@@ -342,6 +349,13 @@ function readContextBudget(
 /*  Chat page                                                         */
 /* ------------------------------------------------------------------ */
 
+/** Shared stable empty value for the gated save-modal transcript prop. */
+const EMPTY_CHAT_SAVE_MESSAGES: Array<{
+  role: "user" | "assistant" | "system";
+  content: string;
+  capability?: string;
+}> = [];
+
 export default function ChatPage() {
   const params = useParams<{ sessionId?: string[] }>();
   const router = useRouter();
@@ -449,6 +463,20 @@ export default function ChatPage() {
       }
       return next;
     });
+  }, []);
+  // Stable-identity handlers for memo'd panels — inline arrows handed
+  // SessionViewerPanel / ImmersiveReader a fresh prop every render (i.e.
+  // every stream event) and defeated their React.memo.
+  const handleCloseViewerPanel = useCallback(
+    () => setViewerOpen(false),
+    [setViewerOpen],
+  );
+  const handleAutoOpenViewerPanel = useCallback(
+    () => setViewerOpen(true),
+    [setViewerOpen],
+  );
+  const handleCloseImmersiveReader = useCallback(() => {
+    setReaderSource(null);
   }, []);
   /**
    * Force the panel open on its Activity home. Used by the send-gate when the
@@ -605,6 +633,14 @@ export default function ChatPage() {
     };
     window.addEventListener("dt:visualize-prompt", onVizPrompt);
     return () => window.removeEventListener("dt:visualize-prompt", onVizPrompt);
+  }, [handlePrefillComposer]);
+
+  // Cross-page handoff: a non-chat page (e.g. Automations → "Create in chat")
+  // stashes a draft in sessionStorage before navigating here — drop it into
+  // the composer prefilled, user still confirms sending.
+  useEffect(() => {
+    const text = takeComposerDraft();
+    if (text) handlePrefillComposer(text);
   }, [handlePrefillComposer]);
 
   const activeCap = useMemo(
@@ -858,13 +894,17 @@ export default function ChatPage() {
     [selectedMemoryFiles],
   );
   const chatSaveMessages = useMemo(
-    () =>
-      state.messages.map((msg) => ({
+    () => {
+      // Only the save modal consumes this — don't rebuild the whole
+      // transcript mapping on every stream event while it stays closed.
+      if (!showSaveModal) return EMPTY_CHAT_SAVE_MESSAGES;
+      return state.messages.map((msg) => ({
         role: msg.role,
         content: msg.content,
         capability: msg.capability,
-      })),
-    [state.messages],
+      }));
+    },
+    [showSaveModal, state.messages],
   );
   const chatSavePayload = useMemo(() => {
     if (!state.messages.length) return null;
@@ -1138,7 +1178,16 @@ export default function ChatPage() {
 
   useEffect(() => {
     if (typeof window === "undefined") return;
+    // Returning to the tab fires focus AND visibilitychange(→visible) in one
+    // cluster; without a floor each event force-busts the same caches,
+    // duplicating the KB-list and tools GETs. 5 s keeps rapid tab-flapping
+    // cheap while still feeling instant on genuine returns.
+    const FOCUS_REFRESH_FLOOR_MS = 5000;
+    let lastForcedRefresh = 0;
     const refresh = () => {
+      const now = Date.now();
+      if (now - lastForcedRefresh < FOCUS_REFRESH_FLOOR_MS) return;
+      lastForcedRefresh = now;
       void refreshKnowledgeBases({ force: true });
       void refreshLLMOptions({ force: true, background: true });
       // Picks up toggles the user changed in another tab (/settings/tools).
@@ -1939,7 +1988,10 @@ export default function ChatPage() {
             wrapper — without it the whole chat column collapses to content
             height and the empty-state composer sticks to the top. */}
         <div className="flex h-full min-h-0 flex-1 overflow-hidden">
-        <ImmersiveReader source={readerSource} onClose={() => setReaderSource(null)} />
+        <ImmersiveReader
+          source={readerSource}
+          onClose={handleCloseImmersiveReader}
+        />
         <div
           // When the preview drawer is open AND the viewport is wide enough,
           // push the chat content to the left by the drawer's width so the two
@@ -2248,141 +2300,12 @@ export default function ChatPage() {
             sessionId={state.sessionId}
             activity={sessionActivity}
             configSection={capabilityConfigSection}
-            onClose={() => setViewerOpen(false)}
-            onAutoOpen={() => setViewerOpen(true)}
+            onClose={handleCloseViewerPanel}
+            onAutoOpen={handleAutoOpenViewerPanel}
           />
         </div>
         </div>
       </GeogebraTabProvider>
     </QuizFollowupProvider>
-  );
-}
-
-/**
- * Bridges the SessionViewerPanel's imperative ``openQuizFollowupTab`` into
- * the QuizFollowupController so descendants (QuizViewer) can call
- * ``controller.openFollowupTab(...)`` without prop-drilling the panel ref
- * through several layers of components.
- */
-function QuizFollowupBridge({
-  viewerPanelRef,
-}: {
-  viewerPanelRef: React.MutableRefObject<SessionViewerPanelHandle | null>;
-}) {
-  const controller = useQuizFollowupController();
-  useEffect(() => {
-    controller.setOpenTabHandler((ctx) => {
-      viewerPanelRef.current?.openQuizFollowupTab(ctx);
-    });
-    return () => controller.setOpenTabHandler(null);
-  }, [controller, viewerPanelRef]);
-  return null;
-}
-
-/**
- * Same shape as QuizFollowupBridge, for the GeoGebra-tab opener exposed
- * to in-message CTAs (the ``ggbscript`` markdown fence becomes a card
- * that calls ``controller.openTab(...)`` here).
- */
-function GeogebraTabBridge({
-  viewerPanelRef,
-}: {
-  viewerPanelRef: React.MutableRefObject<SessionViewerPanelHandle | null>;
-}) {
-  const controller = useGeogebraTabOpener();
-  useEffect(() => {
-    if (!controller) return;
-    controller.setOpenHandler((payload) => {
-      viewerPanelRef.current?.openGeogebraTab(payload);
-    });
-    return () => controller.setOpenHandler(null);
-  }, [controller, viewerPanelRef]);
-  return null;
-}
-
-/**
- * Watches the turn's messages for connected-subagent runs and mirrors each
- * (grouped by the consult's call id) into its own side-viewer tab — opening +
- * focusing the panel when a consult starts, then live-refreshing as the
- * agent's native events stream in. Keeps the chat trace compact while the full
- * run shows in the sidebar.
- */
-function SubagentTabWatcher({
-  messages,
-  viewerPanelRef,
-}: {
-  messages: { events?: StreamEvent[] }[];
-  viewerPanelRef: React.MutableRefObject<SessionViewerPanelHandle | null>;
-}) {
-  useEffect(() => {
-    // Group by turn so all of one turn's consults (Knorvia may ask the agent
-    // several questions in a row, each its own tool call) land in one tab as a
-    // single running dialogue; fall back to the call id when no turn is set.
-    const groups = new Map<string, { label: string; events: StreamEvent[] }>();
-    for (const msg of messages) {
-      for (const ev of msg.events ?? []) {
-        const meta = (ev.metadata ?? {}) as Record<string, unknown>;
-        if (meta.trace_kind !== "subagent_event") continue;
-        const key = String(meta.turn_id || meta.call_id || meta.trace_id || "");
-        if (!key) continue;
-        const existing = groups.get(key);
-        const label = String(
-          meta.subagent_name || existing?.label || "Subagent",
-        );
-        if (existing) {
-          existing.label = label;
-          existing.events.push(ev);
-        } else {
-          groups.set(key, { label, events: [ev] });
-        }
-      }
-    }
-    for (const [key, group] of groups) {
-      viewerPanelRef.current?.openSubagentTab(key, group.label, group.events);
-    }
-  }, [messages, viewerPanelRef]);
-  return null;
-}
-
-/**
- * Header action button that auto-collapses to icon-only when the chat
- * column gets squeezed (Viewer panel open, narrow viewport, etc.). The
- * label stays as the button's `title` so hovering an icon still reveals
- * what it does. Optional `active` flag paints the button with a primary
- * tint, used by the panel-toggle buttons to surface their on/off state.
- */
-// Claude-style icon-only header action: bare 16px glyph, function revealed
-// by an instant tooltip; active state gets a primary tint.
-function HeaderActionButton({
-  onClick,
-  disabled,
-  active,
-  icon: Icon,
-  label,
-  title,
-}: {
-  onClick: () => void;
-  disabled?: boolean;
-  active?: boolean;
-  icon: LucideIcon;
-  label: string;
-  title?: string;
-}) {
-  return (
-    <Tooltip label={title ?? label} side="bottom">
-      <button
-        onClick={onClick}
-        disabled={disabled}
-        aria-label={label}
-        aria-pressed={active}
-        className={`inline-flex h-8 w-8 shrink-0 items-center justify-center rounded-lg transition-[background-color,color,transform] duration-150 active:scale-90 disabled:cursor-not-allowed disabled:opacity-40 ${
-          active
-            ? "bg-[var(--primary)]/10 text-[var(--primary)]"
-            : "text-[var(--muted-foreground)] hover:bg-[var(--muted)]/55 hover:text-[var(--foreground)] disabled:hover:bg-transparent disabled:hover:text-[var(--muted-foreground)]"
-        }`}
-      >
-        <Icon size={16} strokeWidth={1.7} className="shrink-0" />
-      </button>
-    </Tooltip>
   );
 }

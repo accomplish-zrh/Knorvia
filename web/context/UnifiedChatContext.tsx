@@ -320,6 +320,24 @@ function isSameTurnEvent(a: StreamEvent, b: StreamEvent): boolean {
   return Boolean(aTurn && bTurn && aTurn === bTurn);
 }
 
+/**
+ * Duplicate WS deliveries are re-sends of *recent* events, so comparing
+ * against the last few dozen suffices — a full scan of the turn's event
+ * list made every incoming token O(k) and every turn O(k²) overall.
+ */
+const EVENT_DEDUPE_WINDOW = 64;
+
+function hasRecentDuplicateEvent(
+  events: StreamEvent[],
+  candidate: StreamEvent,
+): boolean {
+  const start = Math.max(0, events.length - EVENT_DEDUPE_WINDOW);
+  for (let i = events.length - 1; i >= start; i--) {
+    if (isSameTurnEvent(events[i], candidate)) return true;
+  }
+  return false;
+}
+
 function reducer(state: ProviderState, action: Action): ProviderState {
   switch (action.type) {
     case "SET_TOOLS":
@@ -489,11 +507,7 @@ function reducer(state: ProviderState, action: Action): ProviderState {
         });
         last = msgs[msgs.length - 1];
       }
-      if (
-        (last?.events || []).some((event) =>
-          isSameTurnEvent(event, action.event),
-        )
-      ) {
+      if (hasRecentDuplicateEvent(last?.events || [], action.event)) {
         return state;
       }
       const events = [...(last?.events || []), action.event];

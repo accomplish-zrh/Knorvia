@@ -523,8 +523,12 @@ export const ComposerInput = memo(
                 )
               : t("How can I help you today?"))
           }
-          className="w-full resize-none overflow-hidden bg-transparent text-[16px] leading-relaxed text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
-          style={{ transition: "height 0.15s ease-out" }}
+          className="w-full resize-none overflow-hidden appearance-none bg-transparent text-[16px] leading-relaxed text-[var(--foreground)] outline-none placeholder:text-[var(--muted-foreground)]"
+          style={{
+            transition: "height 0.15s ease-out",
+            backgroundColor: "rgba(0,0,0,0)",
+            backgroundImage: "none",
+          }}
         />
       </div>
     );

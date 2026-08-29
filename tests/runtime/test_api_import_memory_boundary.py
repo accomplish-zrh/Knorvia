@@ -40,8 +40,7 @@ print(json.dumps(loaded))
     )
 
     assert result.stdout.strip(), (
-        f"probe produced no stdout: rc={result.returncode} "
-        f"stderr_tail={result.stderr[-500:]!r}"
+        f"probe produced no stdout: rc={result.returncode} stderr_tail={result.stderr[-500:]!r}"
     )
     # The probe prints exactly one JSON line; any other output means the API
     # module logged to stdout instead of stderr during import.

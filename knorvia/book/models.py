@@ -434,9 +434,7 @@ class Progress(BaseModel):
     def completion_summary(self, total_pages: int) -> dict[str, Any]:
         attempts = len(self.quiz_attempts)
         correct = sum(1 for a in self.quiz_attempts if a.is_correct)
-        visited_ratio = (
-            len(self.visited_page_ids) / total_pages if total_pages > 0 else 0.0
-        )
+        visited_ratio = len(self.visited_page_ids) / total_pages if total_pages > 0 else 0.0
         return {
             "total_pages": total_pages,
             "visited": len(self.visited_page_ids),
@@ -447,6 +445,7 @@ class Progress(BaseModel):
             "quiz_accuracy": round(correct / attempts, 3) if attempts else None,
             "weak_chapters": list(self.weak_chapters),
         }
+
     updated_at: float = Field(default_factory=_now)
 
 

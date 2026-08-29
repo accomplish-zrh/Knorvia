@@ -59,8 +59,8 @@ export const SimpleComposerInput = memo(function SimpleComposerInput({
       // this size belongs in an attachment, not in the textarea body.
       maxLength={32000}
       disabled={disabled}
-      className="flex-1 resize-none rounded-xl border border-[var(--border)] bg-transparent px-4 py-2.5 text-[14px] text-[var(--foreground)] outline-none transition-colors focus:border-[var(--ring)] disabled:opacity-50 placeholder:text-[var(--muted-foreground)]/40"
-      style={{ minHeight: 42 }}
+      className="flex-1 resize-none appearance-none rounded-xl border border-[var(--border)] bg-transparent px-4 py-2.5 text-[14px] text-[var(--foreground)] outline-none transition-colors focus:border-[var(--ring)] disabled:opacity-50 placeholder:text-[var(--muted-foreground)]/40"
+      style={{ minHeight: 42, backgroundColor: "rgba(0,0,0,0)" }}
     />
   );
 });

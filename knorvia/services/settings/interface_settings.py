@@ -18,6 +18,14 @@ DEFAULT_UI_SETTINGS: dict[str, Any] = {
     "theme": "snow",
     "language": "en",
     "response_language": "en",
+    # Window frost is independent of the colour theme.
+    "window_frost": False,
+    "frost_clarity": 62,
+    "frost_plates": 86,
+    "wallpaper_enabled": False,
+    "wallpaper_source": "none",
+    "wallpaper_fit": "cover",
+    "wallpaper_dim": 38,
 }
 
 
@@ -85,7 +93,12 @@ def get_ui_settings() -> dict[str, Any]:
         try:
             with open(settings_file, encoding="utf-8") as f:
                 saved = json.load(f) or {}
-            return {**DEFAULT_UI_SETTINGS, **saved, **resolve_languages(saved)}
+            merged = {**DEFAULT_UI_SETTINGS, **saved, **resolve_languages(saved)}
+            # Existing Glass-theme users keep a frosted window after the
+            # effect was split out of the colour palette.
+            if "window_frost" not in saved and saved.get("theme") == "glass":
+                merged["window_frost"] = True
+            return merged
         except Exception:
             # On any parse error, fall back to defaults (safe)
             return DEFAULT_UI_SETTINGS.copy()

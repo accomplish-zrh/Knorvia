@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 """Book progress e2e test (store-level, no LLM)."""
+
 import os
 import tempfile
 

@@ -665,9 +665,9 @@ export default memo(function ChatComposer({
 
       <div className="relative">
         <div
-          className={`relative rounded-[26px] border bg-[var(--card)] shadow-[0_1px_2px_rgba(0,0,0,0.025),0_10px_28px_-10px_rgba(0,0,0,0.08)] transition-colors ${
+          className={`relative rounded-[26px] border shadow-[0_1px_2px_rgba(0,0,0,0.025),0_10px_28px_-10px_rgba(0,0,0,0.08)] transition-colors ${
             dragging
-              ? "border-[var(--primary)] bg-[var(--primary)]/[0.03]"
+              ? "border-[var(--primary)]"
               : "border-[var(--border)]/55"
           }`}
           onDragEnter={onDragEnter}
@@ -676,6 +676,12 @@ export default memo(function ChatComposer({
           onDrop={onDrop}
           data-drag-counter={dragCounter.current}
         >
+          <div
+            aria-hidden="true"
+            className={`pointer-events-none absolute inset-0 z-0 overflow-hidden rounded-[26px] ${
+              dragging ? "bg-[var(--primary)]/[0.03]" : "bg-[var(--card)]"
+            }`}
+          />
           {dragging && (
             <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-[26px] border-2 border-dashed border-[var(--primary)]/50 bg-[var(--primary)]/[0.04]">
               <div className="flex flex-col items-center gap-1 text-[var(--primary)]">

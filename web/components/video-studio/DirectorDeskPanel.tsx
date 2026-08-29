@@ -173,10 +173,17 @@ export function DirectorDeskPanel({
     if (!ready || !client) return
     let cancelled = false
     const poll = () => {
+      // Hidden tabs keep the iframe alive but nobody is watching — skip the
+      // round-trip and the 1 Hz setTimeline churn until the tab returns.
+      if (document.hidden) return
       client
         .getTimeline()
         .then(next => {
-          if (!cancelled) setTimeline(next)
+          if (cancelled) return
+          // Same payload every second was re-rendering the desk for nothing.
+          setTimeline(prev =>
+            JSON.stringify(prev) === JSON.stringify(next) ? prev : next,
+          )
         })
         .catch(() => {})
     }

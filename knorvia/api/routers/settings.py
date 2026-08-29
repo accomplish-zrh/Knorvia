@@ -119,6 +119,13 @@ class UISettings(BaseModel):
     code_block_theme: Optional[str] = None
     code_block_show_line_numbers: Optional[bool] = None
     code_block_wrap_long_lines: Optional[bool] = None
+    window_frost: bool = False
+    frost_clarity: int = Field(default=62, ge=0, le=100)
+    frost_plates: int = Field(default=86, ge=0, le=100)
+    wallpaper_enabled: bool = False
+    wallpaper_source: str = "none"
+    wallpaper_fit: str = "cover"
+    wallpaper_dim: int = Field(default=38, ge=0, le=100)
 
 
 class UISettingsUpdate(BaseModel):
@@ -142,6 +149,13 @@ class UISettingsUpdate(BaseModel):
     code_block_theme: str | None = None
     code_block_show_line_numbers: bool | None = None
     code_block_wrap_long_lines: bool | None = None
+    window_frost: bool | None = None
+    frost_clarity: int | None = Field(default=None, ge=0, le=100)
+    frost_plates: int | None = Field(default=None, ge=0, le=100)
+    wallpaper_enabled: bool | None = None
+    wallpaper_source: str | None = None
+    wallpaper_fit: str | None = None
+    wallpaper_dim: int | None = Field(default=None, ge=0, le=100)
 
 
 class VoiceAutoplayUpdate(BaseModel):

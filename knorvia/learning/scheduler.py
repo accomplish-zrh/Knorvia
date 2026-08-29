@@ -93,9 +93,7 @@ class SpacedRepetitionScheduler:
             # behaviour that existing users/tests rely on.
             if state.consecutive_wrong >= 2:
                 state.consecutive_wrong = 0
-            state.next_review_at = (
-                time.time() + intervals[0] * self._seconds_per_unit()
-            )
+            state.next_review_at = time.time() + intervals[0] * self._seconds_per_unit()
             return state
 
         # Correct path (quality >= 3): SM-2 interval progression.
@@ -108,7 +106,9 @@ class SpacedRepetitionScheduler:
         elif state.repetitions == 2:
             interval_days = 6.0
         else:
-            base = state.last_interval_days or float(intervals[min(state.interval_index, max_index)])
+            base = state.last_interval_days or float(
+                intervals[min(state.interval_index, max_index)]
+            )
             interval_days = base * ease
 
         # Never shorter than the legacy ladder at the advanced index — keeps

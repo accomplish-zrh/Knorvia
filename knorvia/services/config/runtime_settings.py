@@ -343,6 +343,20 @@ class RuntimeSettingsService:
         self.process_env = process_env if process_env is not None else os.environ
         self._external_process_keys: set[str] = set()
         self._internal_exported_values: dict[str, str] = {}
+        # mtime-guarded read cache: file stem -> ((mtime_ns, size), normalized
+        # dict). Hot paths re-read these files several times per request/turn;
+        # every write (ours or external) bumps mtime/size so a stale entry can
+        # never be served. Callers get a deepcopy — same contract as before,
+        # where every load returned a freshly parsed dict they may mutate.
+        self._load_cache: dict[str, tuple[tuple[int, int], dict[str, Any]]] = {}
+
+    @staticmethod
+    def _stat_key(path: Path) -> tuple[int, int] | None:
+        try:
+            stat = path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
 
     @classmethod
     def get_instance(
@@ -594,15 +608,26 @@ class RuntimeSettingsService:
         normalizer: Callable[[dict[str, Any]], dict[str, Any]],
     ) -> dict[str, Any]:
         path = self.path_for(name)
+        stat_key = self._stat_key(path)
+        cached = self._load_cache.get(name)
+        if cached is not None and stat_key is not None and cached[0] == stat_key:
+            return deepcopy(cached[1])
+
         loaded = _json_object(path)
         if loaded:
             normalized = normalizer({**defaults, **loaded})
             if normalized != loaded:
                 _atomic_write_json(path, normalized)
-            return normalized
+        else:
+            # Missing/empty/corrupt file: seed it with the defaults. The old
+            # code rewrote on EVERY such read; writing once now and caching
+            # the result (keyed by the post-write stat) breaks that loop.
+            normalized = normalizer(_deepcopy_default(defaults))
+            _atomic_write_json(path, normalized)
 
-        normalized = normalizer(_deepcopy_default(defaults))
-        _atomic_write_json(path, normalized)
+        fresh_key = self._stat_key(path) or stat_key
+        if fresh_key is not None:
+            self._load_cache[name] = (fresh_key, deepcopy(normalized))
         return normalized
 
     def _migrate_legacy_document_parsing_file(self) -> None:

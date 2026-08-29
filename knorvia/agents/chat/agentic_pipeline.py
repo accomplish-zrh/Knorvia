@@ -61,6 +61,14 @@ logger = logging.getLogger(__name__)
 # Chat memory tools a partner turn replaces with the partner_* variants.
 _PARTNER_SUPPRESSED_TOOLS: tuple[str, ...] = ("read_memory", "write_memory")
 
+# Tools whose server-side caller identity gets stamped into the call kwargs
+# on a partner turn ("send, don't wait" DM + roster management).
+_SENDER_STAMPED_PARTNER_TOOLS: tuple[str, ...] = (
+    "send_partner_message",
+    "create_partner",
+    "update_partner",
+)
+
 
 CHAT_EXCLUDED_TOOLS: set[str] = set()
 CHAT_OPTIONAL_TOOLS = default_optional_tools(excluded=CHAT_EXCLUDED_TOOLS)
@@ -1084,10 +1092,11 @@ class AgenticChatPipeline:
             # written in the turn's language. Injected server-side; the tool
             # exposes no ``language`` parameter for the model to get wrong.
             kwargs["language"] = context.language or "en"
-        elif tool_name == "send_partner_message":
-            # Bot-to-bot DM: stamp the sender's identity server-side so the
-            # receiving side can attribute the message and self-send is
-            # blocked. Partner session ids are "partner:<id>:<key>".
+        elif tool_name in _SENDER_STAMPED_PARTNER_TOOLS:
+            # Bot-to-bot DM / roster management: stamp the sender's identity
+            # server-side so the receiving side can attribute the message (and
+            # e.g. inherit model selection when creating a teammate) and
+            # self-send is blocked. Partner session ids are "partner:<id>:<key>".
             if context.session_id.startswith("partner:"):
                 sender_id = context.session_id.split(":", 2)[1]
                 kwargs["_sender_partner_id"] = sender_id

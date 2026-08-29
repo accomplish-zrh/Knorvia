@@ -324,7 +324,11 @@ class QuestionBankOrganizeTool(BaseTool):
                     )
                 raw_ids = kwargs.get("entry_ids") or []
                 if isinstance(raw_ids, str):
-                    raw_ids = [part for part in raw_ids.replace("[", "").replace("]", "").split(",") if part.strip()]
+                    raw_ids = [
+                        part
+                        for part in raw_ids.replace("[", "").replace("]", "").split(",")
+                        if part.strip()
+                    ]
                 ids: list[int] = []
                 for value in raw_ids:
                     try:

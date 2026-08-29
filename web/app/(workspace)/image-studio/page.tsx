@@ -662,9 +662,19 @@ export default function ImageStudioPage() {
     setBusy(true)
     setMessage('')
     try {
+      const chosen = Array.from(files).slice(0, role === 'mask' ? 1 : maxInputs)
       const uploaded: StudioAsset[] = []
-      for (const file of Array.from(files).slice(0, role === 'mask' ? 1 : maxInputs))
-        uploaded.push(await uploadStudioAsset(activeProjectId, file))
+      // Small bounded concurrency: serial awaits multiplied by upload RTT for
+      // multi-file picks, but unbounded would saturate the browser's per-host
+      // connection pool.
+      for (let start = 0; start < chosen.length; start += 3) {
+        const batch = await Promise.all(
+          chosen.slice(start, start + 3).map(file =>
+            uploadStudioAsset(activeProjectId, file),
+          ),
+        )
+        uploaded.push(...batch)
+      }
       if (!isCurrentProject()) return
       setReferences(current => {
         let next = current

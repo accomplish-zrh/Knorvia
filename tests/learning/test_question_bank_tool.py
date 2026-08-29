@@ -23,6 +23,7 @@ def _payload(result):
         return {"question_bank": meta["question_bank"], "success": result.success}
     return json.loads(result.content)
 
+
 def _tool() -> QuestionBankOrganizeTool:
     return QuestionBankOrganizeTool()
 

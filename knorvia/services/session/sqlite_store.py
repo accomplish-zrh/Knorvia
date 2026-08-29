@@ -17,11 +17,13 @@ import os
 from pathlib import Path
 import re
 import sqlite3
+import threading
 import time
 from typing import Any
 import uuid
 
 from knorvia.services.path_service import get_path_service
+from knorvia.services.session import sqlite_store_migrations as _migrations
 
 
 def _json_dumps(value: Any) -> str:
@@ -316,191 +318,42 @@ class SQLiteSessionStore:
             self._migrate_notebook_entries_add_ai_judgment(conn)
             conn.commit()
 
+    # Schema migrations live in sqlite_store_migrations.py (architecture line
+    # budget); the staticmethods below are thin aliases kept so existing
+    # call sites and tests read unchanged.
+
     @staticmethod
     def _migrate_session_fts(conn: sqlite3.Connection) -> None:
-        """Full-text index over message content (FTS5) for history search.
-
-        Kept in sync by triggers so every write path is covered without
-        touching call sites. Existing rows are backfilled once; the trigger
-        definitions are (re)created idempotently on every startup.
-        """
-        # FTS5 ships with CPython's bundled SQLite on Windows/macOS and with
-        # every distro build we support; guard anyway so a exotic build only
-        # loses search instead of failing startup.
-        try:
-            capabilities = {
-                row[0]
-                for row in conn.execute("SELECT * FROM pragma_compile_options").fetchall()
-                if row[0]
-            }
-        except sqlite3.Error:
-            capabilities = set()
-        if any(opt == "ENABLE_FTS5" for opt in capabilities):
-            has_fts = True
-        else:
-            try:
-                conn.execute(
-                    'CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts '
-                    'USING fts5(content, content=""'
-                    ")"
-                )
-                conn.execute("DROP TABLE IF EXISTS messages_fts")
-                has_fts = True
-            except sqlite3.Error:
-                logger.warning("SQLite built without FTS5; session search falls back to LIKE")
-                has_fts = False
-        if not has_fts:
-            return
-
-        conn.execute(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-                content,
-                content='messages',
-                content_rowid='id',
-                tokenize='unicode61 remove_diacritics 2'
-            )
-            """
-        )
-        # Rebuild is cheap relative to correctness here and repairs any drift
-        # from a crash between a message write and its trigger.
-        conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')")
-
-        conn.executescript(
-            """
-            CREATE TRIGGER IF NOT EXISTS messages_fts_insert AFTER INSERT ON messages BEGIN
-                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS messages_fts_delete AFTER DELETE ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                VALUES ('delete', old.id, old.content);
-            END;
-            CREATE TRIGGER IF NOT EXISTS messages_fts_update AFTER UPDATE OF content ON messages BEGIN
-                INSERT INTO messages_fts(messages_fts, rowid, content)
-                VALUES ('delete', old.id, old.content);
-                INSERT INTO messages_fts(rowid, content) VALUES (new.id, new.content);
-            END;
-            """
-        )
+        _migrations.migrate_session_fts(conn)
 
     @staticmethod
     def _migrate_notebook_entries_add_turn_id(conn: sqlite3.Connection) -> None:
-        """Add ``turn_id`` to legacy notebook_entries and re-scope the UNIQUE
-        constraint to ``(session_id, turn_id, question_id)``.
-
-        The old unique constraint conflated quizzes generated in the same chat
-        (issue #487): regenerating a quiz with the same positional
-        ``question_id`` (e.g. ``q_1``) would collide with the previous quiz's
-        notebook entries and the UI hydrated stale answers. Scoping by
-        ``turn_id`` keeps each quiz isolated.
-        """
-        notebook_cols = {
-            row[1] for row in conn.execute("PRAGMA table_info(notebook_entries)").fetchall()
-        }
-        if not notebook_cols:
-            return
-        if "turn_id" not in notebook_cols:
-            conn.execute("ALTER TABLE notebook_entries ADD COLUMN turn_id TEXT NOT NULL DEFAULT ''")
-        # SQLite stores table-level UNIQUE constraints as auto-indexes whose
-        # names start with ``sqlite_autoindex_notebook_entries_``; the columns
-        # they cover live in PRAGMA index_info. Detect whether any existing
-        # auto-index still covers only (session_id, question_id) and, if so,
-        # rebuild the table to swap in the new scope.
-        needs_rebuild = False
-        for idx_row in conn.execute("PRAGMA index_list(notebook_entries)").fetchall():
-            idx_name = idx_row[1]
-            if not idx_name.startswith("sqlite_autoindex_notebook_entries_"):
-                continue
-            cols = [r[2] for r in conn.execute(f"PRAGMA index_info({idx_name})").fetchall()]
-            if cols == ["session_id", "question_id"]:
-                needs_rebuild = True
-                break
-        if not needs_rebuild:
-            return
-        conn.executescript(
-            """
-            CREATE TABLE notebook_entries_new (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
-                turn_id TEXT NOT NULL DEFAULT '',
-                question_id TEXT NOT NULL,
-                question TEXT NOT NULL,
-                question_type TEXT DEFAULT '',
-                options_json TEXT DEFAULT '{}',
-                correct_answer TEXT DEFAULT '',
-                explanation TEXT DEFAULT '',
-                difficulty TEXT DEFAULT '',
-                user_answer TEXT DEFAULT '',
-                is_correct INTEGER DEFAULT 0,
-                bookmarked INTEGER DEFAULT 0,
-                followup_session_id TEXT DEFAULT '',
-                created_at REAL NOT NULL,
-                updated_at REAL NOT NULL,
-                UNIQUE(session_id, turn_id, question_id)
-            );
-
-            INSERT INTO notebook_entries_new (
-                id, session_id, turn_id, question_id, question, question_type,
-                options_json, correct_answer, explanation, difficulty,
-                user_answer, is_correct, bookmarked, followup_session_id,
-                created_at, updated_at
-            )
-            SELECT
-                id, session_id, COALESCE(turn_id, ''), question_id, question,
-                question_type, options_json, correct_answer, explanation,
-                difficulty, user_answer, is_correct, bookmarked,
-                followup_session_id, created_at, updated_at
-            FROM notebook_entries;
-
-            DROP TABLE notebook_entries;
-            ALTER TABLE notebook_entries_new RENAME TO notebook_entries;
-
-            CREATE INDEX IF NOT EXISTS idx_notebook_entries_session
-                ON notebook_entries(session_id, created_at DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_notebook_entries_bookmarked
-                ON notebook_entries(bookmarked, created_at DESC);
-            """
-        )
+        _migrations.migrate_notebook_entries_add_turn_id(conn)
 
     @staticmethod
     def _migrate_notebook_entries_add_user_answer_images(
         conn: sqlite3.Connection,
     ) -> None:
-        """Back-fill ``user_answer_images_json`` on legacy DBs.
-
-        The column stores a JSON array of ``{id, url, filename, mime_type}``
-        records for image attachments uploaded as part of the learner's
-        answer. The bytes themselves live in the AttachmentStore; we only
-        keep references in the row so notebook_entries stays lean.
-        """
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(notebook_entries)").fetchall()}
-        if not cols:
-            return
-        if "user_answer_images_json" not in cols:
-            conn.execute(
-                "ALTER TABLE notebook_entries ADD COLUMN user_answer_images_json TEXT DEFAULT '[]'"
-            )
+        _migrations.migrate_notebook_entries_add_user_answer_images(conn)
 
     @staticmethod
     def _migrate_notebook_entries_add_ai_judgment(
         conn: sqlite3.Connection,
     ) -> None:
-        """Back-fill ``ai_judgment`` on legacy DBs.
-
-        Stores the latest AI-judge text per entry as plain markdown. Empty
-        string means the learner has not run the AI judge for this entry
-        yet.
-        """
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(notebook_entries)").fetchall()}
-        if not cols:
-            return
-        if "ai_judgment" not in cols:
-            conn.execute("ALTER TABLE notebook_entries ADD COLUMN ai_judgment TEXT DEFAULT ''")
+        _migrations.migrate_notebook_entries_add_ai_judgment(conn)
 
     async def _run(self, fn, *args):
         async with self._lock:
             return await asyncio.to_thread(fn, *args)
+
+    async def _run_read(self, fn, *args):
+        # Read-only operations skip the process-wide lock: every call opens a
+        # fresh connection and WAL + busy_timeout=30s already keep concurrent
+        # readers correct against an in-flight write. Without this, one long
+        # turn-write would serialise every sidebar/history/dashboard poll
+        # behind it at the Python level. Only verified pure readers may use
+        # this path — anything that writes MUST go through `_run`.
+        return await asyncio.to_thread(fn, *args)
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -620,7 +473,7 @@ class SQLiteSessionStore:
         return payload
 
     async def get_session(self, session_id: str) -> dict[str, Any] | None:
-        return await self._run(self._get_session_sync, session_id)
+        return await self._run_read(self._get_session_sync, session_id)
 
     async def ensure_session(
         self,
@@ -706,7 +559,7 @@ class SQLiteSessionStore:
         return self._serialize_turn(row)
 
     async def get_turn(self, turn_id: str) -> dict[str, Any] | None:
-        return await self._run(self._get_turn_sync, turn_id)
+        return await self._run_read(self._get_turn_sync, turn_id)
 
     def _get_active_turn_sync(self, session_id: str) -> dict[str, Any] | None:
         with self._connect() as conn:
@@ -727,7 +580,7 @@ class SQLiteSessionStore:
         return self._serialize_turn(row)
 
     async def get_active_turn(self, session_id: str) -> dict[str, Any] | None:
-        return await self._run(self._get_active_turn_sync, session_id)
+        return await self._run_read(self._get_active_turn_sync, session_id)
 
     def _list_active_turns_sync(self, session_id: str) -> list[dict[str, Any]]:
         with self._connect() as conn:
@@ -910,7 +763,7 @@ class SQLiteSessionStore:
         ]
 
     async def get_turn_events(self, turn_id: str, after_seq: int = 0) -> list[dict[str, Any]]:
-        return await self._run(self._get_turn_events_sync, turn_id, after_seq)
+        return await self._run_read(self._get_turn_events_sync, turn_id, after_seq)
 
     def _update_session_title_sync(self, session_id: str, title: str) -> bool:
         with self._connect() as conn:
@@ -1384,10 +1237,10 @@ class SQLiteSessionStore:
         return chain
 
     async def get_message_path(self, session_id: str, leaf_message_id: int) -> list[dict[str, Any]]:
-        return await self._run(self._get_message_path_sync, session_id, int(leaf_message_id))
+        return await self._run_read(self._get_message_path_sync, session_id, int(leaf_message_id))
 
     async def get_messages(self, session_id: str) -> list[dict[str, Any]]:
-        return await self._run(self._get_messages_sync, session_id)
+        return await self._run_read(self._get_messages_sync, session_id)
 
     def _get_messages_for_context_sync(
         self, session_id: str, leaf_message_id: int | None = None
@@ -1451,6 +1304,12 @@ class SQLiteSessionStore:
     # chat loop can re-open and continue them) but carry an ``imported_`` id
     # prefix. That prefix is the discriminator — it travels with the primary
     # key, so we filter on it instead of adding a column + migration.
+    #
+    # message_count is a correlated scalar subquery rather than LEFT JOIN +
+    # GROUP BY: the join forced SQLite to materialise one row per message in
+    # EVERY matched session before ORDER BY/LIMIT applied — O(total messages)
+    # per sidebar/dashboard poll. Via idx_messages_session_created the
+    # subquery is an index-only count on just the LIMIT page's sessions.
     _SESSION_SUMMARY_SQL = """
         SELECT
             s.id,
@@ -1462,7 +1321,8 @@ class SQLiteSessionStore:
             s.compressed_summary,
             s.summary_up_to_msg_id,
             s.preferences_json,
-            COUNT(m.id) AS message_count,
+            (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id)
+                AS message_count,
             COALESCE(
                 (SELECT t.status FROM turns t WHERE t.session_id = s.id
                  ORDER BY t.updated_at DESC LIMIT 1),
@@ -1485,15 +1345,13 @@ class SQLiteSessionStore:
                 ''
             ) AS last_message
         FROM sessions s
-        LEFT JOIN messages m ON m.session_id = s.id
         {where}
-        GROUP BY s.id
         ORDER BY s.pinned DESC, s.updated_at DESC
         LIMIT ? OFFSET ?
     """
 
-    # ``ESCAPE '\'`` makes the underscore in ``imported_`` literal rather than
-    # the LIKE single-char wildcard.
+    # ``ESCAPE '\'`` makes the underscore in ``imported_`` literal rather
+    # than the LIKE single-char wildcard.
     _WHERE_NATIVE = r"WHERE s.id NOT LIKE 'imported\_%' ESCAPE '\'"
     _WHERE_IMPORTED = r"WHERE s.id LIKE 'imported\_%' ESCAPE '\'"
 
@@ -1554,9 +1412,7 @@ class SQLiteSessionStore:
         offset: int = 0,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        return await self._run(
-            self._list_sessions_sync, limit, offset, include_archived
-        )
+        return await self._run_read(self._list_sessions_sync, limit, offset, include_archived)
 
     async def list_imported_sessions(
         self,
@@ -1564,12 +1420,11 @@ class SQLiteSessionStore:
         offset: int = 0,
         include_archived: bool = False,
     ) -> list[dict[str, Any]]:
-        return await self._run(
-            self._list_imported_sessions_sync, limit, offset, include_archived
-        )
+        return await self._run(self._list_imported_sessions_sync, limit, offset, include_archived)
 
-    def _set_flag_sync(self, session_id: str, *, pinned: bool | None = None,
-                       archived: bool | None = None) -> bool:
+    def _set_flag_sync(
+        self, session_id: str, *, pinned: bool | None = None, archived: bool | None = None
+    ) -> bool:
         sets: list[str] = []
         args: list[Any] = []
         if pinned is not None:
@@ -1590,18 +1445,12 @@ class SQLiteSessionStore:
         return cur.rowcount > 0
 
     async def set_session_pinned(self, session_id: str, pinned: bool) -> bool:
-        return await self._run(
-            lambda sid: self._set_flag_sync(sid, pinned=pinned), session_id
-        )
+        return await self._run(lambda sid: self._set_flag_sync(sid, pinned=pinned), session_id)
 
     async def set_session_archived(self, session_id: str, archived: bool) -> bool:
-        return await self._run(
-            lambda sid: self._set_flag_sync(sid, archived=archived), session_id
-        )
+        return await self._run(lambda sid: self._set_flag_sync(sid, archived=archived), session_id)
 
-    def _search_sessions_sync(
-        self, query: str, limit: int = 30
-    ) -> list[dict[str, Any]]:
+    def _search_sessions_sync(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
         """Full-text search over message content + title substring fallback.
 
         Returns compact hits: one row per matching session with the best
@@ -1664,11 +1513,9 @@ class SQLiteSessionStore:
         return out[:limit]
 
     async def search_sessions(self, query: str, limit: int = 30) -> list[dict[str, Any]]:
-        return await self._run(self._search_sessions_sync, query, limit)
+        return await self._run_read(self._search_sessions_sync, query, limit)
 
-    def _fork_from_message_sync(
-        self, session_id: str, message_id: int
-    ) -> dict[str, Any] | None:
+    def _fork_from_message_sync(self, session_id: str, message_id: int) -> dict[str, Any] | None:
         """Copy this session's ancestor chain of ``message_id`` into a new
         session (Open WebUI-style fork). Returns the new session summary."""
         with self._connect() as conn:
@@ -1769,14 +1616,10 @@ class SQLiteSessionStore:
             "last_message": "",
             "pinned": 0,
             "archived_at": None,
-            "preferences": {
-                "forked_from": {"session": session_id, "message": int(message_id)}
-            },
+            "preferences": {"forked_from": {"session": session_id, "message": int(message_id)}},
         }
 
-    async def fork_from_message(
-        self, session_id: str, message_id: int
-    ) -> dict[str, Any] | None:
+    async def fork_from_message(self, session_id: str, message_id: int) -> dict[str, Any] | None:
         return await self._run(self._fork_from_message_sync, session_id, message_id)
 
     def _export_session_sync(self, session_id: str) -> dict[str, Any] | None:
@@ -1806,7 +1649,7 @@ class SQLiteSessionStore:
         }
 
     async def export_session(self, session_id: str) -> dict[str, Any] | None:
-        return await self._run(self._export_session_sync, session_id)
+        return await self._run_read(self._export_session_sync, session_id)
 
     def _update_summary_sync(self, session_id: str, summary: str, up_to_msg_id: int) -> bool:
         with self._connect() as conn:
@@ -2280,11 +2123,18 @@ def _fts_query(raw: str) -> str:
     return f'"{escaped}"'
 
 
+_instance_lock = threading.Lock()
+
+
 def get_sqlite_session_store() -> SQLiteSessionStore:
+    # Constructor runs migrations + (first boot) an FTS rebuild — two callers
+    # racing in worker threads must not build duplicate stores.
     db_path = get_path_service().get_chat_history_db().resolve()
     key = str(db_path)
     if key not in _instances:
-        _instances[key] = SQLiteSessionStore(db_path=db_path)
+        with _instance_lock:
+            if key not in _instances:
+                _instances[key] = SQLiteSessionStore(db_path=db_path)
     return _instances[key]
 
 

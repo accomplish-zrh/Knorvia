@@ -103,6 +103,11 @@ export function getModeBadgeLabel(capability?: string | null): string {
   return capability
 }
 
+/** Rows rendered per window in ChatMessageList — long transcripts mount
+ * heavyweight rows (trace panels, KaTeX, Mermaid), so the list shows the
+ * newest slice and grows one window per "Show earlier" click. */
+const RENDER_WINDOW_STEP = 80
+
 function imageSrcForAttachment(attachment: MessageAttachment): string | null {
   if (attachment.url) {
     if (
@@ -1248,6 +1253,16 @@ export const ChatMessageList = memo(function ChatMessageList({
     // System messages are backend grounding (e.g. quiz follow-up context) and
     // must never be rendered as a chat bubble. Filter them out defensively in
     // addition to the hydration-time filter in UnifiedChatContext.
+    // One forward pass recording, for each position, its nearest earlier user
+    // message — the per-row copy+reverse+find used to make this O(n²) over
+    // the transcript, re-running on every stream event.
+    const nearestUserAt = new Map<number, ChatMessageItem | null>()
+    let lastUser: ChatMessageItem | null = null
+    for (let idx = 0; idx < visibleMessages.length; idx++) {
+      const candidate = visibleMessages[idx]
+      if (candidate.role === 'user') lastUser = candidate
+      nearestUserAt.set(idx, lastUser)
+    }
     return visibleMessages
       .map((msg, index) => ({ msg, originalIndex: index }))
       .filter(({ msg, originalIndex }) => {
@@ -1275,10 +1290,7 @@ export const ChatMessageList = memo(function ChatMessageList({
             pairedUserMessage: null as ChatMessageItem | null,
           }
         }
-        const pairedUserMessage =
-          [...visibleMessages.slice(0, originalIndex)]
-            .reverse()
-            .find(previous => previous.role === 'user') ?? null
+        const pairedUserMessage = nearestUserAt.get(originalIndex) ?? null
         return { msg: effectiveMsg, originalIndex, pairedUserMessage }
       })
   }, [visibleMessages, deepResearchMergeMap])
@@ -1299,10 +1311,15 @@ export const ChatMessageList = memo(function ChatMessageList({
   const [prevStreaming, setPrevStreaming] = useState(isStreaming)
   const [prevSession, setPrevSession] = useState(sessionId)
   const [freshlyCompletedIndex, setFreshlyCompletedIndex] = useState<number | null>(null)
+  // Render only the newest slice of long transcripts; each session's rows are
+  // heavyweight (trace panels, KaTeX, Mermaid). "Show earlier" prepends one
+  // window per click — bottom-anchored auto-scroll keeps its position.
+  const [renderedWindowSteps, setRenderedWindowSteps] = useState(0)
   if (prevSession !== sessionId) {
     setPrevSession(sessionId)
     setPrevStreaming(false)
     setFreshlyCompletedIndex(null)
+    setRenderedWindowSteps(0)
   } else if (prevStreaming !== isStreaming) {
     setPrevStreaming(isStreaming)
     if (!isStreaming && lastRenderedAssistantIndex >= 0) {
@@ -1310,9 +1327,26 @@ export const ChatMessageList = memo(function ChatMessageList({
     }
   }
 
+  const renderedRows =
+    messageRows.length > RENDER_WINDOW_STEP * (renderedWindowSteps + 1)
+      ? messageRows.slice(
+          messageRows.length - RENDER_WINDOW_STEP * (renderedWindowSteps + 1),
+        )
+      : messageRows
+  const hiddenRowCount = messageRows.length - renderedRows.length
+
   return (
     <>
-      {messageRows.map(({ msg, originalIndex, pairedUserMessage }) => {
+      {hiddenRowCount > 0 ? (
+        <button
+          type="button"
+          onClick={() => setRenderedWindowSteps(steps => steps + 1)}
+          className="mx-auto my-2 block rounded-full border border-[var(--border)] px-3 py-1 text-[12px] text-[var(--muted-foreground)] hover:bg-[var(--muted)]/50"
+        >
+          {t('Show earlier messages ({{count}})', { count: hiddenRowCount })}
+        </button>
+      ) : null}
+      {renderedRows.map(({ msg, originalIndex, pairedUserMessage }) => {
         const i = originalIndex
         const messageKey =
           msg.id !== undefined && msg.id !== null ? `${msg.role}-${msg.id}` : `${msg.role}-row-${i}`

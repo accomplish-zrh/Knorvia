@@ -59,6 +59,19 @@ class ModelCatalogService:
     def __init__(self, path: Path | None = None):
         self.path = path or CATALOG_PATH
         self._lock = threading.RLock()
+        # mtime-guarded load cache (see load()): every admin settings poll and
+        # every turn validation used to re-read + re-normalize the catalog and
+        # could even rewrite it. Any write to the file changes mtime/size, so
+        # a stale entry can never be served; callers still get a deepcopy.
+        self._cache_stat: tuple[int, int] | None = None
+        self._cache_catalog: dict[str, Any] | None = None
+
+    def _stat_key(self) -> tuple[int, int] | None:
+        try:
+            stat = self.path.stat()
+        except OSError:
+            return None
+        return (stat.st_mtime_ns, stat.st_size)
 
     @classmethod
     def get_instance(cls, path: Path | None = None) -> "ModelCatalogService":
@@ -69,25 +82,36 @@ class ModelCatalogService:
         return cls._instances[key]
 
     def load(self) -> dict[str, Any]:
-        loaded = self._read_existing_catalog()
-        if loaded:
-            legacy_version = int(loaded.get("version") or 1)
-            catalog = _default_catalog()
-            catalog.update({k: v for k, v in loaded.items() if k != "services"})
-            catalog["services"].update(loaded.get("services", {}))
-            merged_defaults = catalog != loaded
-            before = deepcopy(catalog)
-            self._normalize(catalog)
-            if merged_defaults or catalog != before:
-                if legacy_version < 2:
-                    self._backup_legacy_catalog()
-                self.save(catalog)
-            return catalog
+        with self._lock:
+            stat_key = self._stat_key()
+            if (
+                stat_key is not None
+                and self._cache_stat == stat_key
+                and self._cache_catalog is not None
+            ):
+                return deepcopy(self._cache_catalog)
 
-        catalog = _default_catalog()
-        self._normalize(catalog)
-        self.save(catalog)
-        return catalog
+            loaded = self._read_existing_catalog()
+            if loaded:
+                legacy_version = int(loaded.get("version") or 1)
+                catalog = _default_catalog()
+                catalog.update({k: v for k, v in loaded.items() if k != "services"})
+                catalog["services"].update(loaded.get("services", {}))
+                merged_defaults = catalog != loaded
+                before = deepcopy(catalog)
+                self._normalize(catalog)
+                if merged_defaults or catalog != before:
+                    if legacy_version < 2:
+                        self._backup_legacy_catalog()
+                    self.save(catalog)
+            else:
+                catalog = _default_catalog()
+                self._normalize(catalog)
+                self.save(catalog)
+
+            self._cache_stat = self._stat_key()
+            self._cache_catalog = deepcopy(catalog)
+            return catalog
 
     def _read_existing_catalog(self) -> dict[str, Any]:
         if not self.path.exists() or self.path.stat().st_size == 0:

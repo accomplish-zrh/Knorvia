@@ -66,7 +66,12 @@ def _protocol() -> LabelProtocol:
 async def test_length_finish_triggers_one_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
     """First step ends mid-sentence (length); second completes the reply."""
     steps = [
-        SimpleNamespace(label="FINISH", text="The mitochondria is the powerhouse", tool_calls=[], finish_reason="length"),
+        SimpleNamespace(
+            label="FINISH",
+            text="The mitochondria is the powerhouse",
+            tool_calls=[],
+            finish_reason="length",
+        ),
         SimpleNamespace(label="FINISH", text=" of the cell.", tool_calls=[], finish_reason="stop"),
     ]
     calls = {"n": 0}
@@ -100,7 +105,9 @@ async def test_length_finish_triggers_one_continuation(monkeypatch: pytest.Monke
 @pytest.mark.asyncio
 async def test_stop_finish_skips_continuation(monkeypatch: pytest.MonkeyPatch) -> None:
     steps = [
-        SimpleNamespace(label="FINISH", text="Complete answer.", tool_calls=[], finish_reason="stop"),
+        SimpleNamespace(
+            label="FINISH", text="Complete answer.", tool_calls=[], finish_reason="stop"
+        ),
     ]
     calls = {"n": 0}
 
@@ -131,7 +138,9 @@ async def test_stop_finish_skips_continuation(monkeypatch: pytest.MonkeyPatch) -
 @pytest.mark.asyncio
 async def test_continuation_failure_keeps_partial_text(monkeypatch: pytest.MonkeyPatch) -> None:
     steps = [
-        SimpleNamespace(label="FINISH", text="Partial answer", tool_calls=[], finish_reason="length"),
+        SimpleNamespace(
+            label="FINISH", text="Partial answer", tool_calls=[], finish_reason="length"
+        ),
     ]
 
     async def fake_step(**kwargs):  # noqa: ANN001, ANN003

@@ -224,13 +224,20 @@ def _render_markdown(session: dict, messages: list[dict]) -> str:
     title = session.get("title") or "Untitled conversation"
     created = session.get("created_at") or 0
     stamp = datetime.fromtimestamp(float(created), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    lines = [f"# {title}", "", f"_Exported from Knorvia · started {stamp} · {len(messages)} messages_", ""]
+    lines = [
+        f"# {title}",
+        "",
+        f"_Exported from Knorvia · started {stamp} · {len(messages)} messages_",
+        "",
+    ]
     for m in messages:
         role = m.get("role", "?")
         content = m.get("content") or ""
         if not content.strip():
             continue
-        label = {"user": "🧑 User", "assistant": "🤖 Assistant", "system": "⚙️ System"}.get(role, role.title())
+        label = {"user": "🧑 User", "assistant": "🤖 Assistant", "system": "⚙️ System"}.get(
+            role, role.title()
+        )
         lines.append(f"### {label}")
         lines.append("")
         lines.append(content)
@@ -253,7 +260,12 @@ async def export_session(
     if data is None:
         raise HTTPException(status_code=404, detail="Session not found")
 
-    safe_stem = "".join(c if c.isalnum() or c in "-_ " else "" for c in (data["session"].get("title") or "chat")).strip() or "chat"
+    safe_stem = (
+        "".join(
+            c if c.isalnum() or c in "-_ " else "" for c in (data["session"].get("title") or "chat")
+        ).strip()
+        or "chat"
+    )
     if format == "md":
         body = _render_markdown(data["session"], data["messages"])
         return {

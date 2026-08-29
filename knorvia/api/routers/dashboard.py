@@ -2,7 +2,7 @@
 
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 
 from knorvia.services.session import get_session_store
 
@@ -10,7 +10,9 @@ router = APIRouter()
 
 
 @router.get("/recent")
-async def get_recent_activities(limit: int = 50, type: str | None = None):
+async def get_recent_activities(
+    limit: int = Query(default=50, ge=1, le=200), type: str | None = None
+):
     store = get_session_store()
     sessions = await store.list_sessions(limit=limit, offset=0)
     activities: list[dict[str, Any]] = []
