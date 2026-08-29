@@ -175,6 +175,17 @@ export async function uploadLibraryEntry(file: File, parentId?: string | null, t
   return json(await apiFetch(apiUrl(`${BASE}/entries/upload`), { method: 'POST', body }))
 }
 
+export async function putLibraryEntryContent(entryId: string, file: File): Promise<LibraryEntry> {
+  const body = new FormData()
+  body.append('file', file)
+  return json(
+    await apiFetch(apiUrl(`${BASE}/entries/${encodeURIComponent(entryId)}/content`), {
+      method: 'PUT',
+      body,
+    }),
+  )
+}
+
 export async function deleteLibraryEntry(entryId: string): Promise<void> {
   await json(await apiFetch(apiUrl(`${BASE}/entries/${encodeURIComponent(entryId)}`), { method: 'DELETE' }))
 }

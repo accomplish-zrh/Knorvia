@@ -1,6 +1,7 @@
 'use client'
 
 import Link from 'next/link'
+import dynamic from 'next/dynamic'
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import {
@@ -61,6 +62,10 @@ const CREATE_KINDS = [
   ['canvas', 'New canvas'],
 ] as const
 
+const LibraryExcelEditor = dynamic(() => import('@/components/library/LibraryExcelEditor'), {
+  ssr: false,
+})
+
 export default function LibraryPage() {
   const { t } = useTranslation()
   const fileRef = useRef<HTMLInputElement>(null)
@@ -80,6 +85,7 @@ export default function LibraryPage() {
   const [editing, setEditing] = useState(false)
   const [menuOpen, setMenuOpen] = useState(false)
   const [sidebarOpen, setSidebarOpen] = useState(true)
+  const excelSaveRef = useRef<(() => Promise<void>) | null>(null)
 
   const reload = useCallback(async () => {
     const payload = await listLibraryTree()
@@ -192,9 +198,18 @@ export default function LibraryPage() {
     if (!entry || entry.kind === 'folder') return
     setSaving(true)
     try {
-      const updated = await patchLibraryEntry(entry.id, { title, content: draft })
-      setEntry(updated)
-      await reload()
+      if (entry.kind === 'excel') {
+        const saveExcel = excelSaveRef.current
+        if (!saveExcel) throw new Error(t("Couldn't save this spreadsheet."))
+        await saveExcel()
+        const updated = await getLibraryEntry(entry.id)
+        setEntry(updated)
+        await reload()
+      } else {
+        const updated = await patchLibraryEntry(entry.id, { title, content: draft })
+        setEntry(updated)
+        await reload()
+      }
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : t('Save failed'))
     } finally {
@@ -202,8 +217,9 @@ export default function LibraryPage() {
     }
   }
 
-  const textKind = Boolean(entry && ['markdown', 'csv', 'html', 'text', 'word', 'excel'].includes(entry.kind))
-  const previewable = textKind || entry?.kind === 'canvas'
+  const textKind = Boolean(entry && ['markdown', 'csv', 'html', 'text', 'word'].includes(entry.kind))
+  const excelKind = entry?.kind === 'excel'
+  const previewable = textKind || excelKind || entry?.kind === 'canvas'
 
   return (
     <main data-library-page="" className="flex h-full min-h-0 overflow-hidden bg-[var(--background)]">
@@ -410,7 +426,7 @@ export default function LibraryPage() {
                   <Pencil size={14} />
                 </button>
               ) : null}
-              {textKind || entry.kind === 'canvas' ? (
+              {textKind || entry.kind === 'canvas' || (excelKind && editing) ? (
                 <button
                   type="button"
                   disabled={saving}
@@ -479,16 +495,31 @@ export default function LibraryPage() {
             })()}
             onChange={next => setDraft(JSON.stringify(next))}
           />
+        ) : excelKind && entry ? (
+          editing ? (
+            <LibraryExcelEditor
+              entryId={entry.id}
+              url={`${libraryEntryUrl(entry.id)}?v=${entry.updated_at}`}
+              onRegisterSave={saveFn => {
+                excelSaveRef.current = saveFn
+              }}
+            />
+          ) : (
+            <div
+              data-library-preview=""
+              className="min-h-0 flex-1 overflow-auto bg-[var(--background)]"
+            >
+              <div className="h-full min-h-0">
+                <XlsxPreview url={`${libraryEntryUrl(entry.id)}?v=${entry.updated_at}`} />
+              </div>
+            </div>
+          )
         ) : textKind && entry ? (
           editing ? (
             <div className="flex min-h-0 flex-1 flex-col">
-              {entry.kind === 'word' || entry.kind === 'excel' ? (
+              {entry.kind === 'word' ? (
                 <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-1.5 text-[11px] text-[var(--muted-foreground)]">
-                  <span>
-                    {entry.kind === 'word'
-                      ? t('Editing extracted Word text. Save writes a real .docx.')
-                      : t('Editing extracted Excel text. Save writes a real .xlsx.')}
-                  </span>
+                  <span>{t('Editing extracted Word text. Save writes a real .docx.')}</span>
                 </div>
               ) : null}
               <textarea
@@ -514,10 +545,6 @@ export default function LibraryPage() {
               ) : entry.kind === 'word' ? (
                 <div className="mx-auto max-w-4xl p-6">
                   <DocxPreview url={`${libraryEntryUrl(entry.id)}?v=${entry.updated_at}`} />
-                </div>
-              ) : entry.kind === 'excel' ? (
-                <div className="mx-auto max-w-5xl p-6">
-                  <XlsxPreview url={`${libraryEntryUrl(entry.id)}?v=${entry.updated_at}`} />
                 </div>
               ) : entry.kind === 'csv' ? (
                 <pre className="mx-auto max-w-4xl whitespace-pre-wrap p-8 font-mono text-[12px]">{draft}</pre>

@@ -68,11 +68,11 @@ _TOOL_DESCRIPTION = (
     "files land in the turn workspace. Typical flow: create → add_sheet/"
     "write_cells → formula → style → chart → read (self-check) → optional "
     "export_doc / export_slide → draft_action=ready. `create` starts a "
-    "workbook (`file` required). `write_cells` accepts {\"A1\": \"Title\", "
-    "\"B2\": 123} or a 2D array. `formula` writes formula strings such as "
-    "{\"D2\": \"=SUM(B2:C2)\"}. `style` takes [{target:\"A1:D1\", bold:true, "
-    "bg:\"#B0501E\", color:\"#FFFFFF\", font_size:12}]. `chart` is "
-    "{type:\"bar|line|pie\", data_range:\"A1:B5\", title:\"...\"}. `read` "
+    'workbook (`file` required). `write_cells` accepts {"A1": "Title", '
+    '"B2": 123} or a 2D array. `formula` writes formula strings such as '
+    '{"D2": "=SUM(B2:C2)"}. `style` takes [{target:"A1:D1", bold:true, '
+    'bg:"#B0501E", color:"#FFFFFF", font_size:12}]. `chart` is '
+    '{type:"bar|line|pie", data_range:"A1:B5", title:"..."}. `read` '
     "returns CSV of a range so you can verify writes. `export_doc` renders a "
     "Markdown subset (#/##/### headings, - lists, |a|b| tables, paragraphs) "
     "to .docx. `export_slide` builds a 16:9 deck from an outline (level-1 "
@@ -179,9 +179,7 @@ def _load_openpyxl():
 def _open_workbook(path: Path):
     _Workbook, load_workbook, *_rest = _load_openpyxl()
     if not path.is_file():
-        raise ValueError(
-            f"Workbook {path.name!r} does not exist. Call action=create first."
-        )
+        raise ValueError(f"Workbook {path.name!r} does not exist. Call action=create first.")
     return load_workbook(path)
 
 
@@ -255,12 +253,12 @@ def _apply_cells(ws: Any, cells: Any) -> tuple[int, int]:
         return _write_mapping(ws, payload)
     if isinstance(payload, list):
         return _write_grid(ws, payload)
-    raise ValueError(
-        '`cells` must be an object {"A1": value, ...} or a 2D array [["a","b"],[1,2]]'
-    )
+    raise ValueError('`cells` must be an object {"A1": value, ...} or a 2D array [["a","b"],[1,2]]')
 
 
-def _action_create(path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool) -> ToolResult:
+def _action_create(
+    path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool
+) -> ToolResult:
     Workbook, *_rest = _load_openpyxl()
     path = _ensure_suffix(path, ".xlsx")
     workbook = Workbook()
@@ -306,7 +304,7 @@ def _action_write_cells(path: Path, kwargs: dict[str, Any], workspace: Path) -> 
 def _action_formula(path: Path, kwargs: dict[str, Any], workspace: Path) -> ToolResult:
     payload = _maybe_json(kwargs.get("formula_cells") or kwargs.get("cells"))
     if not isinstance(payload, dict) or not payload:
-        raise ValueError("`formula_cells` is required for formula (e.g. {\"D2\": \"=SUM(B2:C2)\"})")
+        raise ValueError('`formula_cells` is required for formula (e.g. {"D2": "=SUM(B2:C2)"})')
     normalised: dict[str, str] = {}
     for key, value in payload.items():
         text = str(value).strip()
@@ -355,9 +353,7 @@ def _action_style(path: Path, kwargs: dict[str, Any], workspace: Path) -> ToolRe
         if spec.get("bg"):
             fill = PatternFill(fill_type="solid", fgColor=_rgb(str(spec["bg"])))
         font = Font(**font_kwargs) if font_kwargs else None
-        for row in ws.iter_rows(
-            min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col
-        ):
+        for row in ws.iter_rows(min_row=min_row, max_row=max_row, min_col=min_col, max_col=max_col):
             for cell in row:
                 if font is not None:
                     cell.font = font
@@ -494,14 +490,20 @@ def _iter_markdown_blocks(content: str) -> list[tuple[str, Any]]:
             continue
         para: list[str] = [stripped]
         i += 1
-        while i < len(lines) and lines[i].strip() and not lines[i].strip().startswith(("#", "-", "*", "|")):
+        while (
+            i < len(lines)
+            and lines[i].strip()
+            and not lines[i].strip().startswith(("#", "-", "*", "|"))
+        ):
             para.append(lines[i].strip())
             i += 1
         blocks.append(("paragraph", " ".join(para)))
     return blocks
 
 
-def _action_export_doc(path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool) -> ToolResult:
+def _action_export_doc(
+    path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool
+) -> ToolResult:
     try:
         from docx import Document
     except ImportError as exc:  # pragma: no cover
@@ -611,7 +613,9 @@ def _iter_plain_outline(lines: list[str]) -> list[tuple[str, list[str]]]:
     return slides or [("Slide", [])]
 
 
-def _action_export_slide(path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool) -> ToolResult:
+def _action_export_slide(
+    path: Path, kwargs: dict[str, Any], workspace: Path, cwd_fallback: bool
+) -> ToolResult:
     try:
         from pptx import Presentation
         from pptx.util import Inches, Pt
@@ -782,9 +786,7 @@ def _parse_refs(raw: Any) -> list[dict[str, Any]]:
     if isinstance(payload, dict):
         payload = [payload]
     if not isinstance(payload, list):
-        raise ValueError(
-            '`refs` must be a list like [{"to":"sheet","range":"A1:B5"}]'
-        )
+        raise ValueError('`refs` must be a list like [{"to":"sheet","range":"A1:B5"}]')
     refs: list[dict[str, Any]] = []
     for item in payload:
         if not isinstance(item, dict):
@@ -823,9 +825,7 @@ def _action_container_new(
         type_map = {".xlsx": "sheet", ".xlsm": "sheet", ".docx": "doc", ".pptx": "slide"}
         unit_type = type_map.get(suffix)
         if unit_type is None:
-            raise ValueError(
-                "source_file for container_new must be .xlsx / .docx / .pptx"
-            )
+            raise ValueError("source_file for container_new must be .xlsx / .docx / .pptx")
         unit_id = str(kwargs.get("unit_id") or "").strip()
         if not unit_id:
             stem = Path(source_name).stem
@@ -864,12 +864,11 @@ def _action_container_add(
         )
     unit_type = str(kwargs.get("unit_type") or "").strip().lower()
     if unit_type not in UNIT_TYPES:
-        raise ValueError(
-            f"`unit_type` is required for container_add ({', '.join(UNIT_TYPES)})"
-        )
-    unit_name = str(
-        kwargs.get("unit_name") or kwargs.get("name") or kwargs.get("sheet") or ""
-    ).strip() or None
+        raise ValueError(f"`unit_type` is required for container_add ({', '.join(UNIT_TYPES)})")
+    unit_name = (
+        str(kwargs.get("unit_name") or kwargs.get("name") or kwargs.get("sheet") or "").strip()
+        or None
+    )
     unit_id = str(kwargs.get("unit_id") or "").strip() or None
     source_bytes: bytes | None = None
     source_name = str(kwargs.get("source_file") or "").strip()
@@ -1016,8 +1015,10 @@ def execute_office_document(kwargs: dict[str, Any]) -> ToolResult:
     if not action and not draft_action:
         valid = ", ".join(ACTIONS)
         return _fail(f"Invalid action {action!r}. Valid actions: {valid}.")
-    lifecycle = draft_action if draft_action in DRAFT_ACTIONS else (
-        action if action in LIFECYCLE_ACTIONS else ""
+    lifecycle = (
+        draft_action
+        if draft_action in DRAFT_ACTIONS
+        else (action if action in LIFECYCLE_ACTIONS else "")
     )
     writing = action in WRITE_ACTIONS
     workspace, cwd_fallback = _workspace(kwargs)

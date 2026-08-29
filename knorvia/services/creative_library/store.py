@@ -1134,6 +1134,51 @@ class CreativeLibraryStore:
             )
         return self.get_entry(entry_id) or {}
 
+    def replace_entry_bytes(self, entry_id: str, data: bytes) -> dict[str, Any]:
+        """Replace an Excel library file without the text-encode round-trip.
+
+        Agent ``PATCH content`` still goes through ``encode_library_office``.
+        The grid editor writes workbook bytes here so other sheets, formulas,
+        and formatting survive.
+        """
+        current = self._get_entry_row(entry_id)
+        if not current:
+            raise KeyError(entry_id)
+        if current["kind"] != "excel":
+            raise ValueError("Only Excel workbooks can be replaced as a spreadsheet")
+        if not data:
+            raise ValueError("Workbook is empty")
+        if len(data) > MAX_FILE_BYTES:
+            raise ValueError("File too large")
+        if not data.startswith(b"PK\x03\x04"):
+            raise ValueError("Not a valid Excel workbook")
+        from knorvia.services.creative_library.office import office_ext, office_mime
+
+        relative = (
+            str(current.get("relative_path") or "") or f"files/{entry_id}{office_ext('excel')}"
+        )
+        target = (self.root / relative).resolve()
+        if self.root not in target.parents:
+            raise ValueError("Unsafe library path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        digest = hashlib.sha256(data).hexdigest()
+        with self._lock, self._connect() as db:
+            db.execute(
+                """UPDATE entries SET relative_path=?, size_bytes=?, sha256=?, mime=?, content=?, updated_at=?
+                   WHERE id=? AND deleted_at IS NULL""",
+                (
+                    relative,
+                    len(data),
+                    digest,
+                    office_mime("excel"),
+                    "",
+                    time.time(),
+                    entry_id,
+                ),
+            )
+        return self.get_entry(entry_id) or {}
+
     def move_entry(self, entry_id: str, parent_id: str | None) -> dict[str, Any]:
         current = self._get_entry_row(entry_id)
         if not current:

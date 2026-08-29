@@ -275,9 +275,7 @@ class OfficeDraftStore:
             task_dir = _safe_under_root(public_root, str(data.get("task_dir") or ""))
             workspace_raw = str(data.get("workspace_dir") or "")
             workspace_dir = (
-                _safe_under_root(public_root, workspace_raw)
-                if workspace_raw
-                else task_dir / "exec"
+                _safe_under_root(public_root, workspace_raw) if workspace_raw else task_dir / "exec"
             )
             store = cls(task_dir, workspace_dir=workspace_dir, public_root=public_root)
             store.status(draft_id)

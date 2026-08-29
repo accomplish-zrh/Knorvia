@@ -48,9 +48,7 @@ def _as_path(path: str | Path) -> Path:
 def _validate_unit_type(unit_type: str) -> UnitType:
     value = str(unit_type or "").strip().lower()
     if value not in UNIT_TYPES:
-        raise ContainerError(
-            f"unit type must be one of {', '.join(UNIT_TYPES)}; got {unit_type!r}"
-        )
+        raise ContainerError(f"unit type must be one of {', '.join(UNIT_TYPES)}; got {unit_type!r}")
     return value  # type: ignore[return-value]
 
 
@@ -308,9 +306,7 @@ def open_univer(path: str | Path) -> dict[str, Any]:
     for unit in manifest["units"]:
         archive_name = str(unit.get("file") or "")
         if not archive_name or archive_name not in files:
-            raise ContainerError(
-                f"manifest references missing unit file {archive_name!r}"
-            )
+            raise ContainerError(f"manifest references missing unit file {archive_name!r}")
     return manifest
 
 
@@ -337,9 +333,7 @@ def add_unit(
     container = _as_path(path)
     manifest, files = _load_zip_files(container)
     validated_type = _validate_unit_type(unit_type)
-    existing_ids = {
-        str(unit.get("id") or "") for unit in manifest["units"] if unit.get("id")
-    }
+    existing_ids = {str(unit.get("id") or "") for unit in manifest["units"] if unit.get("id")}
     new_id = _validate_unit_id(unit_id) if unit_id else _new_unit_id(validated_type, existing_ids)
     if new_id in existing_ids:
         raise ContainerError(f"unit id {new_id!r} already exists")
@@ -352,9 +346,7 @@ def add_unit(
         else _make_empty_unit_bytes(validated_type, title=label)
     )
 
-    normalised_refs = [
-        _normalise_ref(row, default_from=new_id) for row in (refs or ())
-    ]
+    normalised_refs = [_normalise_ref(row, default_from=new_id) for row in (refs or ())]
     if validated_type == "slide":
         note = _placeholder_for_refs(new_id, normalised_refs)
         if note:

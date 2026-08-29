@@ -166,7 +166,4 @@ async def test_pipeline_publishes_office_draft_metadata() -> None:
     )
     await pipeline._publish_office_draft_metadata(context, outcome, bus)
     assert context.metadata["office_draft"]["draft_id"] == "abcd1234"
-    assert any(
-        (event.metadata or {}).get("trace_kind") == "office_draft"
-        for event in bus._history
-    )
+    assert any((event.metadata or {}).get("trace_kind") == "office_draft" for event in bus._history)

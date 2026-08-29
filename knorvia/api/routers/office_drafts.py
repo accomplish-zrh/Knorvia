@@ -46,7 +46,9 @@ def _load_store(draft_id: str) -> OfficeDraftStore:
     try:
         token = validate_draft_id(draft_id)
     except DraftError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found") from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found"
+        ) from exc
     path_service = _request_path_service()
     try:
         return OfficeDraftStore.locate(
@@ -55,7 +57,9 @@ def _load_store(draft_id: str) -> OfficeDraftStore:
             chat_root=path_service.get_chat_workspace_root(),
         )
     except DraftNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found") from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found"
+        ) from exc
     except DraftError as exc:
         raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(exc)) from exc
 
@@ -81,7 +85,9 @@ async def read_office_draft(
     try:
         return _payload(store, draft_id)
     except DraftNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found") from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found"
+        ) from exc
 
 
 @router.patch("/chat/office-drafts/{draft_id}")
@@ -105,7 +111,9 @@ async def patch_office_draft(
             store.discard(draft_id)
         return _payload(store, draft_id)
     except DraftNotFoundError as exc:
-        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found") from exc
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail="Draft not found"
+        ) from exc
     except DraftTransitionError as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
     except DraftError as exc:

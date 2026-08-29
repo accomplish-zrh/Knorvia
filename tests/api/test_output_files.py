@@ -192,8 +192,7 @@ def test_univer_container_manifest_and_unit_proxy(output_app) -> None:
     alice = TokenPayload(username="alice", role="user", user_id="u_alice")
     client, _admin_root, users_root = output_app({"alice-token": alice})
     target = (
-        PathService(workspace_root=users_root / "u_alice").get_public_outputs_root()
-        / relative_path
+        PathService(workspace_root=users_root / "u_alice").get_public_outputs_root() / relative_path
     )
     pack_univer(
         [

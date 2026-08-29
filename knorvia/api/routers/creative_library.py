@@ -378,6 +378,22 @@ async def get_library_entry_content(entry_id: str) -> Response:
     return Response(content=data, media_type=mime or "application/octet-stream")
 
 
+@router.put("/entries/{entry_id}/content")
+async def put_library_entry_content(
+    entry_id: str,
+    file: UploadFile = File(...),
+) -> dict[str, Any]:
+    data = await file.read(MAX_UPLOAD + 1)
+    if len(data) > MAX_UPLOAD:
+        raise HTTPException(status_code=422, detail="Upload is too large")
+    try:
+        return _store().replace_entry_bytes(entry_id, data)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Library entry not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 @router.patch("/entries/{entry_id}")
 async def patch_library_entry(entry_id: str, payload: EntryPatch) -> dict[str, Any]:
     try:

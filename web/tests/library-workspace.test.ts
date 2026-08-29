@@ -24,6 +24,8 @@ test('library page uses a side file list and a personal canvas, not team spaces'
   assert.match(pageSource, /<LibraryCanvas/)
   assert.match(pageSource, /DocxPreview/)
   assert.match(pageSource, /XlsxPreview/)
+  assert.match(pageSource, /LibraryExcelEditor/)
+  assert.match(pageSource, /excelKind && editing/)
   assert.match(pageSource, /\['markdown', 'New markdown'\]/)
   assert.match(pageSource, /\['csv', 'New CSV'\]/)
   assert.match(pageSource, /\['html', 'New HTML'\]/)

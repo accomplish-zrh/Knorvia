@@ -132,6 +132,45 @@ def test_library_word_and_excel_create_extract_update(tmp_path) -> None:
     assert uploaded["content"] == "uploaded-word"
 
 
+def test_library_excel_replace_bytes_keeps_other_sheets(tmp_path) -> None:
+    from openpyxl import Workbook, load_workbook
+
+    store = CreativeLibraryStore(tmp_path)
+    workbook = Workbook()
+    sales = workbook.active
+    sales.title = "Sales"
+    sales["A1"] = "header"
+    sales["B1"] = 10
+    sales["B2"] = "=B1*2"
+    notes = workbook.create_sheet("Notes")
+    notes["A1"] = "second-sheet"
+    buffer = BytesIO()
+    workbook.save(buffer)
+    payload = buffer.getvalue()
+
+    uploaded = store.upload_entry(payload, "book.xlsx", title="Book")
+    assert uploaded["kind"] == "excel"
+    replaced = store.replace_entry_bytes(uploaded["id"], payload)
+    data = store.entry_bytes(replaced["id"])
+    assert data is not None
+    loaded = load_workbook(BytesIO(data[0]))
+    assert loaded.sheetnames == ["Sales", "Notes"]
+    assert loaded["Notes"]["A1"].value == "second-sheet"
+    assert loaded["Sales"]["A1"].value == "header"
+    assert loaded["Sales"]["B2"].value == "=B1*2"
+
+    word = store.create_entry(kind="word", title="Memo", content="plain")
+    with pytest.raises(ValueError, match="Only Excel"):
+        store.replace_entry_bytes(word["id"], payload)
+    with pytest.raises(ValueError, match="Not a valid Excel"):
+        store.replace_entry_bytes(uploaded["id"], b"not-xlsx")
+
+    flattened = store.update_entry(uploaded["id"], {"content": "flat-text"})
+    destroyed = load_workbook(BytesIO(store.entry_bytes(flattened["id"])[0]))
+    assert destroyed.sheetnames == ["Sheet"]
+    assert extract_library_office("excel", store.entry_bytes(flattened["id"])[0]) == "flat-text"
+
+
 def test_library_canvas_add_card_persists_on_entry(tmp_path) -> None:
     store = CreativeLibraryStore(tmp_path)
     created = store.create_entry(kind="canvas", title="Board")
