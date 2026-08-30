@@ -9,6 +9,13 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **AI Classroom organically wired into Knorvia's own organs**: generation
+  can ground lessons in a selected knowledge base (RAG retrieval feeding the
+  outline stage), saved Personas seat as the classmate agents, graded wrong
+  answers push into the 题库 question bank (SQLite notebook entries under a
+  stable `classroom:{id}` session), and the whole lesson exports to a
+  Notebook ("AI 课堂") as markdown cards.
+
 - **AI Classroom (learning space)** — an OpenMAIC-inspired interactive
   lesson generator and player (MIT, © 2026 THU-MAIC; see
   THIRD_PARTY_NOTICES.md): one topic produces a full micro-lesson via

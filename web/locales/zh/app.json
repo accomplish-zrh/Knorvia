@@ -4046,5 +4046,13 @@
   "Skip": "跳过",
   "Next scene": "下一节",
   "Skip narration": "跳过讲解",
-  "Type your answer…": "输入你的答案…"
+  "Type your answer…": "输入你的答案…",
+  "Ground in KB": "挂接知识库",
+  "No knowledge base": "不使用知识库",
+  "Classmates from your personas (up to 3)": "从你的 Personas 里选同学(最多 3 位)",
+  "Save wrong answers to the question bank": "错题加入题库",
+  "In the question bank": "已入题库",
+  "Wrong answers saved to the question bank": "错题已加入题库",
+  "Save to notebook": "存入笔记本",
+  "Lesson saved to notebook": "课堂已存入笔记本"
 }

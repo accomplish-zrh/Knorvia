@@ -4046,5 +4046,13 @@
   "Skip": "Skip",
   "Next scene": "Next scene",
   "Skip narration": "Skip narration",
-  "Type your answer…": "Type your answer…"
+  "Type your answer…": "Type your answer…",
+  "Ground in KB": "Ground in KB",
+  "No knowledge base": "No knowledge base",
+  "Classmates from your personas (up to 3)": "Classmates from your personas (up to 3)",
+  "Save wrong answers to the question bank": "Save wrong answers to the question bank",
+  "In the question bank": "In the question bank",
+  "Wrong answers saved to the question bank": "Wrong answers saved to the question bank",
+  "Save to notebook": "Save to notebook",
+  "Lesson saved to notebook": "Lesson saved to notebook"
 }

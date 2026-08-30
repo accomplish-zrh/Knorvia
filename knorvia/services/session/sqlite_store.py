@@ -485,6 +485,12 @@ class SQLiteSessionStore:
                 return session
         return await self.create_session()
 
+    async def ensure_session_with_id(self, session_id: str, title: str) -> None:
+        """Create the session with a FIXED id when missing (stable synthetic
+        sessions like ``classroom:{id}`` that other records reference)."""
+        if await self.get_session(session_id) is None:
+            await self._run(self._create_session_sync, title, session_id)
+
     @staticmethod
     def _serialize_turn(row: sqlite3.Row) -> dict[str, Any]:
         return TurnRecord(

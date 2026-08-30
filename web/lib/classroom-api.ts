@@ -173,7 +173,14 @@ async function* readSse(response: Response): AsyncGenerator<{ event: string; dat
 
 /** POST /generate and surface OpenMAIC-style progress + the done payload. */
 export async function generateClassroom(
-  payload: { topic: string; minutes: number; language: string },
+  payload: {
+    topic: string;
+    minutes: number;
+    language: string;
+    /** Organic tie-ins: ground in a KB, seat saved personas as classmates. */
+    kb_name?: string;
+    persona_names?: string[];
+  },
   onProgress: (progress: GenerationProgress) => void,
   signal?: AbortSignal,
 ): Promise<{ id: string; title: string }> {
@@ -269,4 +276,46 @@ export async function gradeQuizScene(
     ),
   );
   return data.results;
+}
+
+/** Push graded quiz answers into the question bank (题库) for review. */
+export async function saveClassroomQuestions(
+  classroomId: string,
+  sceneId: string,
+  entries: {
+    question_id: string;
+    user_answer: string;
+    is_correct: boolean;
+  }[],
+  onlyWrong = true,
+): Promise<{ saved: number }> {
+  const data = await json<{ saved: number }>(
+    await apiFetch(
+      apiUrl(
+        `/api/v1/classroom/${encodeURIComponent(classroomId)}/save-questions`,
+      ),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ scene_id: sceneId, only_wrong: onlyWrong, entries }),
+      },
+    ),
+  );
+  return data;
+}
+
+/** Save the lesson's outline cards into a Notebook (default: "AI 课堂"). */
+export async function exportClassroomToNotebook(
+  classroomId: string,
+  notebookId = "",
+): Promise<{ notebook_id: string }> {
+  const params = notebookId ? `?notebook_id=${encodeURIComponent(notebookId)}` : "";
+  return json(
+    await apiFetch(
+      apiUrl(
+        `/api/v1/classroom/${encodeURIComponent(classroomId)}/export-notebook${params}`,
+      ),
+      { method: "POST" },
+    ),
+  );
 }

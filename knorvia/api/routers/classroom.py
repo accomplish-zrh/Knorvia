@@ -28,12 +28,6 @@ logger = logging.getLogger(__name__)
 router = APIRouter(dependencies=[Depends(require_admin)])
 
 
-class GenerateRequest(BaseModel):
-    topic: str = Field(..., min_length=1, max_length=400)
-    minutes: int = 12
-    language: str = "zh"
-
-
 class DiscussionRequest(BaseModel):
     """One stateless discussion turn (state round-trips from the client)."""
 
@@ -54,6 +48,163 @@ class GradeRequest(BaseModel):
     answers: dict[str, str] = Field(default_factory=dict)
 
 
+def _letter_for_index(index: int) -> str:
+    return chr(ord("A") + index)
+
+
+def _correct_answer_text(question: dict[str, Any]) -> str:
+    """Human-readable correct answer (letters for choice questions)."""
+    qtype = str(question.get("type") or "single")
+    answer = str(question.get("answer") or "").strip()
+    options = [str(o) for o in (question.get("options") or [])]
+    if qtype in {"single", "multiple"} and options:
+        letters = [
+            _letter_for_index(int(part))
+            for part in answer.split(",")
+            if part.strip().isdigit() and int(part) < len(options)
+        ]
+        if letters:
+            return ", ".join(letters)
+    return answer
+
+
+class SaveQuestionsRequest(BaseModel):
+    """Wrong (or all) answers of one graded quiz scene → the question bank.
+
+    Organic tie-in: entries land in the same SQLite notebook-entry store the
+    题库 surface reads, under a synthetic ``classroom:{id}`` session, so
+    classroom mistakes are reviewable next to every other quiz the learner
+    has taken.
+    """
+
+    scene_id: str
+    only_wrong: bool = True
+    entries: list[dict[str, Any]] = Field(default_factory=list)
+
+
+@router.post("/{classroom_id}/save-questions")
+async def save_questions_to_bank(classroom_id: str, payload: SaveQuestionsRequest):
+    document = get_classroom_store().get(classroom_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    scene = next((s for s in document.scenes if s.id == payload.scene_id), None)
+    if scene is None or scene.type != "quiz":
+        raise HTTPException(status_code=404, detail="Quiz scene not found")
+
+    from knorvia.services.session.sqlite_store import get_sqlite_session_store
+
+    store = get_sqlite_session_store()
+    session_id = f"classroom:{classroom_id}"
+    await store.ensure_session_with_id(session_id, f"AI 课堂 · {document.title}")
+
+    by_id = {f"{scene.id}:{q.id}": q.to_dict() for q in scene.questions}
+    items: list[dict[str, Any]] = []
+    for entry in payload.entries:
+        question_key = str(entry.get("question_id") or "")
+        full_key = f"{scene.id}:{question_key}"
+        question = by_id.get(full_key)
+        if question is None:
+            continue
+        if payload.only_wrong and bool(entry.get("is_correct")):
+            continue
+        qtype = str(question.get("type") or "single")
+        options_list = [str(o) for o in (question.get("options") or [])]
+        options_map = (
+            {_letter_for_index(i): option for i, option in enumerate(options_list)}
+            if qtype in {"single", "multiple"}
+            else None
+        )
+        given = str(entry.get("user_answer") or "")
+        if options_map:
+            letters = [
+                _letter_for_index(int(part))
+                for part in given.split(",")
+                if part.strip().isdigit() and int(part) < len(options_list)
+            ]
+            given = ", ".join(letters) if letters else given
+        items.append(
+            {
+                "question_id": full_key,
+                "turn_id": scene.id,
+                "question": str(question.get("question") or ""),
+                "question_type": qtype,
+                "options": options_map,
+                "correct_answer": _correct_answer_text(question),
+                "explanation": str(question.get("analysis") or ""),
+                "user_answer": given,
+                "is_correct": bool(entry.get("is_correct")),
+                "source": f"AI 课堂 · {document.title}",
+            }
+        )
+    if not items:
+        return {"saved": 0, "session_id": session_id}
+    saved = await store.upsert_notebook_entries(session_id, items)
+    return {"saved": saved, "session_id": session_id}
+
+
+@router.post("/{classroom_id}/export-notebook")
+async def export_to_notebook(classroom_id: str, notebook_id: str = ""):
+    """Save the lesson's outline cards into a Notebook (organic tie-in)."""
+    document = get_classroom_store().get(classroom_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+
+    from knorvia.services.notebook import notebook_manager
+
+    target_id = str(notebook_id or "").strip()
+    if not target_id:
+        wanted_name = "AI 课堂"
+        existing = next(
+            (
+                nb
+                for nb in notebook_manager.list_notebooks()
+                if str(nb.get("name") or "") == wanted_name
+            ),
+            None,
+        )
+        target_id = (
+            str(existing.get("id") or "")
+            if existing
+            else str(
+                notebook_manager.create_notebook(
+                    name=wanted_name,
+                    description="AI Classroom lessons (OpenMAIC-inspired).",
+                ).get("id")
+                or ""
+            )
+        )
+    if not target_id:
+        raise HTTPException(status_code=500, detail="Notebook unavailable")
+
+    lines = [f"# {document.title}", "", f"Topic: {document.topic}", ""]
+    for scene in document.scenes:
+        lines.append(f"## {scene.title}")
+        if scene.objective:
+            lines.append(f"*{scene.objective}*")
+        for point in scene.key_points:
+            lines.append(f"- {point}")
+        for question in scene.questions:
+            data = question.to_dict()
+            lines.append("")
+            lines.append(f"**Q: {data.get('question')}**")
+            if data.get("options"):
+                for i, option in enumerate(data["options"]):
+                    lines.append(f"- {_letter_for_index(i)}. {option}")
+            lines.append(f"> 答案: {_correct_answer_text(data)} — {data.get('analysis')}")
+        lines.append("")
+
+    record = notebook_manager.add_record(
+        [target_id],
+        "solve",
+        title=f"AI 课堂 · {document.title}",
+        user_query=document.topic,
+        output="\n".join(lines),
+        summary=document.scenes[0].objective if document.scenes else "",
+        metadata={"classroom_id": document.id, "source": "ai_classroom"},
+    )
+    return {"notebook_id": target_id, "record": record}
+
+
 def _sse(event: str, payload: dict[str, Any]) -> str:
     return f"event: {event}\ndata: {json.dumps(payload, ensure_ascii=False, default=str)}\n\n"
 
@@ -63,9 +214,77 @@ async def list_classrooms():
     return {"classrooms": get_classroom_store().list()}
 
 
+class GenerateRequest(BaseModel):
+    topic: str = Field(..., min_length=1, max_length=400)
+    minutes: int = 12
+    language: str = "zh"
+    # Organic tie-ins: ground the lesson in one of the learner's knowledge
+    # bases, and seat saved Personas as the classmate agents.
+    kb_name: str = ""
+    persona_names: list[str] = Field(default_factory=list, max_length=3)
+
+
+async def _resolve_kb_grounding(kb_name: str, topic: str) -> str:
+    """Retrieve grounding text from *kb_name*; empty string on any problem.
+
+    Uses the existing RAG service against the admin KB root — the same
+    engines the chat pipeline searches, so a lesson teaches the learner's
+    own material rather than the model's priors.
+    """
+    kb_name = str(kb_name or "").strip()
+    if not kb_name:
+        return ""
+    try:
+        from knorvia.multi_user.knowledge_access import admin_kb_base_dir
+        from knorvia.services.rag.service import RAGService
+
+        rag = RAGService(kb_base_dir=str(admin_kb_base_dir()), provider=None)
+        result = await rag.search(topic, kb_name=kb_name)
+        content = str(result.get("content") or result.get("answer") or "").strip()
+        if content:
+            logger.info("Classroom grounding from KB %s: %s chars", kb_name, len(content))
+        return content
+    except Exception:
+        logger.warning(
+            "Classroom KB grounding failed for %s; continuing ungrounded",
+            kb_name,
+            exc_info=True,
+        )
+        return ""
+
+
+def _resolve_persona_specs(persona_names: list[str]) -> list[dict[str, str]]:
+    """Saved Persona profiles (user + admin) as classmate identities."""
+    if not persona_names:
+        return []
+    wanted = [str(name).strip() for name in persona_names if str(name).strip()]
+    if not wanted:
+        return []
+    specs: list[dict[str, str]] = []
+    try:
+        from knorvia.api.routers.personas import _admin_persona_service
+        from knorvia.services.persona import get_persona_service
+
+        seen: dict[str, str] = {}
+        for service in (get_persona_service(), _admin_persona_service()):
+            try:
+                for info in service.list_personas():
+                    seen[info.name] = info.description
+            except Exception:  # noqa: BLE001 - each root is best-effort
+                continue
+        for name in wanted:
+            if name in seen and len(specs) < 3:
+                specs.append({"name": name, "description": seen[name]})
+    except Exception:
+        logger.warning("Persona roster resolution failed", exc_info=True)
+    return specs
+
+
 @router.post("/generate")
 async def generate(payload: GenerateRequest):
     """Generate a lesson, streaming progress events; final event = document."""
+    kb_context = await _resolve_kb_grounding(payload.kb_name, payload.topic)
+    persona_specs = _resolve_persona_specs(payload.persona_names)
 
     async def stream():
         def progress_payload(step: str, info: dict[str, Any]) -> str:
@@ -83,6 +302,8 @@ async def generate(payload: GenerateRequest):
                     minutes=payload.minutes,
                     language=payload.language,
                     on_progress=on_progress,
+                    kb_context=kb_context,
+                    persona_specs=persona_specs,
                 )
                 get_classroom_store().save(document)
                 await queue.put(("done", {"id": document.id, "title": document.title}))

@@ -62,8 +62,35 @@ async def _complete_json(system: str, user: str) -> Any:
     raise RuntimeError(f"Classroom generation stage failed: {last_error}")
 
 
-def _agent_profiles(doc_language: str) -> list[AgentProfile]:
-    return [AgentProfile.from_dict(spec) for spec in prompts.default_agent_profiles(doc_language)]
+def _agent_profiles(
+    doc_language: str, persona_specs: list[dict[str, str]] | None = None
+) -> list[AgentProfile]:
+    """Teacher is builtin; classmates come from the user's saved Personas
+    (organic tie-in) with builtin archetypes filling the remaining seats."""
+    builtin = [
+        AgentProfile.from_dict(spec) for spec in prompts.default_agent_profiles(doc_language)
+    ]
+    teacher_profile = next(p for p in builtin if p.role == "teacher")
+    archetype = [p for p in builtin if p.role == "classmate"]
+
+    seats: list[AgentProfile] = []
+    for spec in (persona_specs or [])[:3]:
+        name = str(spec.get("name") or "").strip()
+        if not name:
+            continue
+        fallback = archetype[len(seats) % len(archetype)]
+        seats.append(
+            AgentProfile(
+                id=f"persona-{len(seats) + 1}",
+                name=name,
+                role="classmate",
+                persona=str(spec.get("description") or "").strip() or fallback.persona,
+                color=fallback.color,
+            )
+        )
+    while len(seats) < 3:
+        seats.append(archetype[len(seats) % len(archetype)])
+    return [teacher_profile, *seats]
 
 
 async def generate_classroom(
@@ -72,8 +99,17 @@ async def generate_classroom(
     minutes: int = 12,
     language: str = "zh",
     on_progress: ProgressCb | None = None,
+    kb_context: str = "",
+    persona_specs: list[dict[str, str]] | None = None,
 ) -> ClassroomDocument:
-    """Run the full pipeline and return the assembled document."""
+    """Run the full pipeline and return the assembled document.
+
+    *kb_context* — retrieved knowledge-base text that grounds the outline
+    (organic tie-in: lessons teach the learner's own KBs). *persona_specs*
+    — saved Persona profiles reused as classmate identities (organic
+    tie-in: the classroom wears the user's own personas); the teacher stays
+    the built-in one and unfilled seats fall back to the builtin archetypes.
+    """
     minutes = max(4, min(45, int(minutes or 12)))
     doc_language = "zh" if str(language).startswith("zh") else "en"
     doc = ClassroomDocument(
@@ -82,7 +118,7 @@ async def generate_classroom(
         topic=topic.strip(),
         language=doc_language,
         created_at=time.time(),
-        agent_profiles=_agent_profiles(doc_language),
+        agent_profiles=_agent_profiles(doc_language, persona_specs=persona_specs),
     )
 
     async def progress(step: str, **payload: Any) -> None:
@@ -93,7 +129,7 @@ async def generate_classroom(
 
     # Stage 1 — outlines (the reviewable intermediate product).
     await progress("generating_outlines", message="")
-    system, user = prompts.outlines_prompt(topic, minutes, doc_language)
+    system, user = prompts.outlines_prompt(topic, minutes, doc_language, grounding=kb_context)
     payload = await _complete_json(system, user)
     doc.title = str(payload.get("title") or topic)[:80]
     raw_outlines = payload.get("outlines") or []

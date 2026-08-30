@@ -15,14 +15,27 @@ from typing import Any
 from knorvia.services.prompt.language import append_language_directive
 
 
-def outlines_prompt(topic: str, minutes: int, language: str) -> tuple[str, str]:
+def outlines_prompt(
+    topic: str, minutes: int, language: str, grounding: str = ""
+) -> tuple[str, str]:
     """Stage 1 — topic → SceneOutline list (reviewable intermediate)."""
     system = append_language_directive(
         "You are a curriculum designer who turns one topic into a tight, interactive micro-lesson.",
         language,
     )
-    user = f"""Design a micro-lesson (about {minutes} minutes) on the topic below.
+    grounding_block = ""
+    if grounding.strip():
+        grounding_block = f"""
+Grounding material retrieved from the learner's knowledge base — base the
+lesson on THIS material (facts, terms, and scope come from it; do not
+invent conflicting content). If it is thin, cover the topic generally:
 
+<kb_grounding>
+{grounding[:6000]}
+</kb_grounding>
+"""
+    user = f"""Design a micro-lesson (about {minutes} minutes) on the topic below.
+{grounding_block}
 Return ONLY a JSON object (no markdown fences):
 {{
   "title": "lesson title",

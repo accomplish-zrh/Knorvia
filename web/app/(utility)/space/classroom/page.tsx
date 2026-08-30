@@ -18,6 +18,8 @@ import {
   type ClassroomCard,
   type GenerationProgress,
 } from "@/lib/classroom-api";
+import { listKnowledgeBases } from "@/lib/knowledge-api";
+import { listPersonas } from "@/lib/personas-api";
 
 export default function ClassroomPage() {
   const { t, i18n } = useTranslation();
@@ -30,6 +32,13 @@ export default function ClassroomPage() {
   const [generating, setGenerating] = useState(false);
   const [progress, setProgress] = useState<GenerationProgress | null>(null);
   const [error, setError] = useState("");
+  // Organic tie-ins: ground in a knowledge base, seat saved personas.
+  const [kbList, setKbList] = useState<{ name: string }[]>([]);
+  const [kbName, setKbName] = useState("");
+  const [personas, setPersonas] = useState<{ name: string; description: string }[]>(
+    [],
+  );
+  const [selectedPersonas, setSelectedPersonas] = useState<string[]>([]);
 
   const refresh = useCallback(() => {
     void listClassrooms()
@@ -39,6 +48,29 @@ export default function ClassroomPage() {
   }, []);
 
   useEffect(refresh, [refresh]);
+
+  useEffect(() => {
+    void listKnowledgeBases()
+      .then((items) => setKbList(items.map((item) => ({ name: item.name }))))
+      .catch(() => {});
+    void listPersonas()
+      .then((items) =>
+        setPersonas(
+          items.map((item) => ({ name: item.name, description: item.description })),
+        ),
+      )
+      .catch(() => {});
+  }, []);
+
+  const togglePersona = (name: string) => {
+    setSelectedPersonas((prev) =>
+      prev.includes(name)
+        ? prev.filter((item) => item !== name)
+        : prev.length < 3
+          ? [...prev, name]
+          : prev,
+    );
+  };
 
   const startGeneration = () => {
     if (!topic.trim() || generating) return;
@@ -50,6 +82,8 @@ export default function ClassroomPage() {
         topic: topic.trim(),
         minutes,
         language: i18n.language?.startsWith("zh") ? "zh" : "en",
+        kb_name: kbName,
+        persona_names: selectedPersonas,
       },
       setProgress,
     )
@@ -110,7 +144,7 @@ export default function ClassroomPage() {
             placeholder={t("e.g. Recursion in programming · How compound interest works")}
             className="w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[13.5px] outline-none focus:border-[var(--ring)]"
           />
-          <div className="mt-3 flex items-center gap-3">
+          <div className="mt-3 flex flex-wrap items-center gap-3">
             <label className="text-[12px] text-[var(--muted-foreground)]">
               {t("Length")}
             </label>
@@ -126,6 +160,24 @@ export default function ClassroomPage() {
                 </option>
               ))}
             </select>
+            {kbList.length > 0 && (
+              <label className="flex items-center gap-1.5 text-[12px] text-[var(--muted-foreground)]">
+                {t("Ground in KB")}
+                <select
+                  value={kbName}
+                  onChange={(e) => setKbName(e.target.value)}
+                  disabled={generating}
+                  className="rounded-lg border border-[var(--border)] bg-transparent px-2.5 py-1.5 text-[12.5px] outline-none focus:border-[var(--ring)]"
+                >
+                  <option value="">{t("No knowledge base")}</option>
+                  {kbList.map((kb) => (
+                    <option key={kb.name} value={kb.name}>
+                      {kb.name}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            )}
             <button
               type="button"
               onClick={startGeneration}
@@ -136,6 +188,34 @@ export default function ClassroomPage() {
               {t("Generate class")}
             </button>
           </div>
+          {personas.length > 0 && (
+            <div className="mt-3">
+              <p className="mb-1.5 text-[11.5px] text-[var(--muted-foreground)]">
+                {t("Classmates from your personas (up to 3)")}
+              </p>
+              <div className="flex flex-wrap gap-1.5">
+                {personas.map((persona) => {
+                  const selected = selectedPersonas.includes(persona.name);
+                  return (
+                    <button
+                      key={persona.name}
+                      type="button"
+                      onClick={() => togglePersona(persona.name)}
+                      disabled={generating}
+                      title={persona.description}
+                      className={`rounded-full border px-2.5 py-1 text-[11.5px] transition-colors ${
+                        selected
+                          ? "border-[var(--ring)] bg-[var(--accent)] text-[var(--foreground)]"
+                          : "border-[var(--border)] text-[var(--muted-foreground)] hover:border-[var(--ring)]"
+                      }`}
+                    >
+                      {persona.name}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {generating && progress && (
             <div
               data-classroom-progress=""

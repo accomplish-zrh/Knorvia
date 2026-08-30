@@ -13,15 +13,19 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
+  BookPlus,
   ChevronRight,
   Loader2,
   MessagesSquare,
+  Save,
   SkipForward,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   discussionTurn,
+  exportClassroomToNotebook,
   gradeQuizScene,
+  saveClassroomQuestions,
   type ClassroomAction,
   type ClassroomAgentProfile,
   type ClassroomDocument,
@@ -46,9 +50,11 @@ interface SpeechLine {
 export default function ClassroomPlayer({
   document: doc,
   onBack,
+  onToast,
 }: {
   document: ClassroomDocument;
   onBack: () => void;
+  onToast?: (message: string) => void;
 }) {
   const { t, i18n } = useTranslation();
   const [sceneIndex, setSceneIndex] = useState(0);
@@ -66,7 +72,9 @@ export default function ClassroomPlayer({
     sceneId: string;
     results: GradeResult[] | null;
     answers: Record<string, string>;
+    savedToBank: boolean;
   }>(null);
+  const [savedNotebook, setSavedNotebook] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
 
   const scene = doc.scenes[sceneIndex];
@@ -129,7 +137,7 @@ export default function ClassroomPlayer({
     }
     const quizAction = current.actions.find((a) => a.type === "quiz_trigger");
     if (quizAction && current.questions?.length) {
-      setQuizState({ sceneId: current.id, results: null, answers: {} });
+      setQuizState({ sceneId: current.id, results: null, answers: {}, savedToBank: false });
     }
   };
 
@@ -236,6 +244,22 @@ export default function ClassroomPlayer({
         <span className="shrink-0 text-[11.5px] text-[var(--muted-foreground)]">
           {sceneIndex + 1} / {doc.scenes.length}
         </span>
+        <button
+          type="button"
+          data-classroom-save-notebook=""
+          onClick={() => {
+            void exportClassroomToNotebook(doc.id).then(() => {
+              setSavedNotebook(true);
+              onToast?.(t("Lesson saved to notebook"));
+            });
+          }}
+          disabled={savedNotebook}
+          className="inline-flex shrink-0 items-center gap-1 rounded-lg border border-[var(--border)] px-2 py-1 text-[11.5px] text-[var(--foreground)] disabled:opacity-50"
+          title={t("Save to notebook")}
+        >
+          {savedNotebook ? <Save size={12} /> : <BookPlus size={12} />}
+          {savedNotebook ? t("Saved") : t("Save to notebook")}
+        </button>
       </div>
 
       {/* Stage: key-point card + speech lines */}
@@ -326,6 +350,22 @@ export default function ClassroomPlayer({
                   ),
                 );
               }}
+              onSaveWrong={() => {
+                if (!quizState.results || quizState.savedToBank) return;
+                const entries = quizState.results.map((result) => ({
+                  question_id: result.question_id,
+                  user_answer: result.given,
+                  is_correct: result.correct,
+                }));
+                void saveClassroomQuestions(doc.id, scene.id, entries).then(() =>
+                  setQuizState((prev) =>
+                    prev ? { ...prev, savedToBank: true } : prev,
+                  ),
+                );
+                onToast?.(t("Wrong answers saved to the question bank"));
+              }}
+              savedToBank={quizState.savedToBank}
+              onToast={onToast}
             />
           )}
 
@@ -421,12 +461,18 @@ function QuizCard({
   answers,
   onAnswer,
   onSubmit,
+  onSaveWrong,
+  savedToBank,
+  onToast,
 }: {
   questions: ClassroomQuizQuestion[];
   results: GradeResult[] | null;
   answers: Record<string, string>;
   onAnswer: (questionId: string, value: string) => void;
   onSubmit: () => void;
+  onSaveWrong?: () => void;
+  savedToBank?: boolean;
+  onToast?: (message: string) => void;
 }) {
   const { t } = useTranslation();
   const resultFor = (id: string) => results?.find((r) => r.question_id === id);
@@ -497,6 +543,17 @@ function QuizCard({
           className="rounded-lg bg-[var(--primary)] px-3.5 py-1.5 text-[12.5px] font-medium text-[var(--primary-foreground)] disabled:opacity-40"
         >
           {t("Submit answers")}
+        </button>
+      )}
+      {results !== null && onSaveWrong && (
+        <button
+          type="button"
+          data-classroom-save-questions=""
+          onClick={onSaveWrong}
+          disabled={savedToBank}
+          className="rounded-lg border border-[var(--border)] px-3.5 py-1.5 text-[12.5px] font-medium text-[var(--foreground)] disabled:opacity-50"
+        >
+          {savedToBank ? t("In the question bank") : t("Save wrong answers to the question bank")}
         </button>
       )}
     </div>
