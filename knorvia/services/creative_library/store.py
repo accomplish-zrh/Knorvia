@@ -309,6 +309,20 @@ class CreativeLibraryStore:
             return None
         return path.read_bytes(), str(row["mime"] or "application/octet-stream")
 
+    def entry_file_bytes(self, entry_id: str) -> tuple[bytes, str] | None:
+        """File bytes for file-backed entries (pdf / office / file kinds)."""
+        with self._connect() as db:
+            row = db.execute(
+                "SELECT mime, relative_path FROM entries WHERE id=? AND deleted_at IS NULL",
+                (entry_id,),
+            ).fetchone()
+        if row is None or not row["relative_path"]:
+            return None
+        path = (self.root / str(row["relative_path"])).resolve()
+        if self.root not in path.parents or not path.is_file():
+            return None
+        return path.read_bytes(), str(row["mime"] or "application/octet-stream")
+
     def _count_assets(self) -> int:
         with self._connect() as db:
             return int(

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Literal
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, UploadFile
 from fastapi.responses import Response
 from pydantic import BaseModel, Field
 
+from knorvia.services.converters import engines
 from knorvia.services.creative_agent.runner import run_canvas, submit_create_generation
 from knorvia.services.creative_library.store import (
     ENTRY_KINDS,
@@ -15,6 +17,8 @@ from knorvia.services.creative_library.store import (
     VIDEO_MIMES,
     get_creative_library_store,
 )
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -152,6 +156,135 @@ async def get_asset_content(asset_id: str) -> Response:
         raise HTTPException(status_code=404, detail="Library file not found")
     data, mime = payload
     return Response(content=data, media_type=mime)
+
+
+# ── Offline conversion toolbox (flyingmouse-format inspired; ideas only) ──
+
+
+class ConvertAssetRequest(BaseModel):
+    target: str = Field(..., min_length=3)
+    page: int = 0
+
+
+def _asset_bytes_for_convert(asset_id: str) -> tuple[dict[str, Any], bytes, str]:
+    asset = _store().get_asset(asset_id)
+    if not asset:
+        raise HTTPException(status_code=404, detail="Library asset not found")
+    payload = _store().asset_bytes(asset_id)
+    if asset["kind"] == "text" or not payload:
+        raise HTTPException(status_code=422, detail="Only media assets can be converted")
+    data, mime = payload
+    return asset, data, mime
+
+
+@router.get("/assets/{asset_id}/convert-targets")
+async def convert_targets(asset_id: str):
+    """Capability discovery for one asset (the flyingmouse "targets" view)."""
+    asset, data, mime = _asset_bytes_for_convert(asset_id)
+    from knorvia.services.converters.service import targets_for
+
+    targets = targets_for(mime)
+    pdf_targets: list[dict[str, str]] = []
+    if mime == "application/pdf":
+        import pymupdf
+
+        try:
+            with pymupdf.open(stream=data, filetype="pdf") as pdf:
+                pages = pdf.page_count
+            pdf_targets = [
+                {"mime": "text/plain", "ext": ".txt", "as": "text"},
+                {"mime": "image/png", "ext": ".png", "as": "page", "pages": pages},
+            ]
+        except Exception:
+            pdf_targets = []
+    return {
+        "mime": mime,
+        "title": asset.get("title") or "",
+        "targets": targets + pdf_targets,
+        "engines": engines.capabilities(),
+    }
+
+
+@router.post("/assets/{asset_id}/convert")
+async def convert_asset(asset_id: str, payload: ConvertAssetRequest):
+    """Convert one library asset offline; the result becomes a new asset."""
+    asset, data, mime = _asset_bytes_for_convert(asset_id)
+    target = payload.target.strip().lower()
+    title = str(asset.get("title") or "converted")
+
+    from knorvia.services.converters.service import (
+        convert_image,
+        convert_media,
+        pdf_text,
+        render_pdf_page_png,
+    )
+
+    try:
+        if target == "text/plain" and mime == "application/pdf":
+            text = pdf_text(data)
+            if not text.strip():
+                raise HTTPException(status_code=422, detail="No extractable text (scanned PDF?)")
+            entry = _store().create_entry(
+                kind="text",
+                title=f"{title} (text)",
+                parent_id=asset.get("parent_id"),
+                content=text[:200000],
+                mime="text/plain",
+            )
+            return {"asset": entry, "kind": "text"}
+        if target == "image/png" and mime == "application/pdf":
+            converted = render_pdf_page_png(data, page=max(0, payload.page))
+            new_mime = "image/png"
+        elif target in {"image/png", "image/jpeg", "image/webp"} and mime.startswith("image/"):
+            converted = convert_image(data, target)
+            new_mime = target
+        elif (
+            target in {"audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4"}
+            and mime.startswith("audio/")
+        ) or (
+            target
+            in {"video/mp4", "video/webm", "audio/mpeg", "audio/wav", "audio/ogg", "audio/mp4"}
+            and mime.startswith("video/")
+        ):
+            converted, new_mime = convert_media(data, mime, target)
+        else:
+            raise HTTPException(status_code=422, detail=f"Cannot convert {mime} to {target}")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from None
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 - surface engine failures cleanly
+        logger.warning("Library conversion failed: %s", exc, exc_info=True)
+        raise HTTPException(
+            status_code=500, detail=f"Conversion failed: {type(exc).__name__}"
+        ) from None
+
+    stem = title.rsplit(".", 1)[0] or "converted"
+    created = _store().create_media_asset(
+        converted,
+        new_mime,
+        title=f"{stem}{new_mime_ext(new_mime)}",
+        source="converted",
+        note=f"Converted from {mime}",
+    )
+    return {"asset": created, "kind": "media"}
+
+
+def new_mime_ext(mime: str) -> str:
+    ext_map = {
+        "image/png": ".png",
+        "image/jpeg": ".jpg",
+        "image/webp": ".webp",
+        "audio/mpeg": ".mp3",
+        "audio/wav": ".wav",
+        "audio/ogg": ".ogg",
+        "audio/mp4": ".m4a",
+        "video/mp4": ".mp4",
+        "video/webm": ".webm",
+    }
+    return ext_map.get(mime, ".bin")
 
 
 @router.patch("/assets/{asset_id}")

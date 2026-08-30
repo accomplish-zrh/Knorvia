@@ -1,4 +1,9 @@
-# Third-party notices
+## FlyingMouse Format (design reference; no incorporated code)
+
+- Project: [LaoFeng-mouse/flyingmouse-format](https://github.com/LaoFeng-mouse/flyingmouse-format) — 飞鼠格式, an offline Windows file converter by 牢蜂 (LaoFeng)
+- License: custom non-commercial license. **No code from it is used in Knorvia**; only uncopyrightable design ideas were absorbed (capability discovery per file, the engine resolution chain env → managed folder → PATH, alpha-aware media conversion, offline-first engine bundling).
+- Engines Knorvia uses for its own conversion toolbox are independent OSS projects resolved on the user's machine: FFmpeg (GPL/LGPL build), LibreOffice, Poppler, Tesseract — plus in-tree PyMuPDF/Pillow/pypdf.
+
 
 ## OpenMAIC (design reference; adapted code and prompts)
 

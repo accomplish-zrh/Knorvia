@@ -9,6 +9,18 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Added
 
+- **Library offline conversion toolbox (flyingmouse-format inspired)** —
+  design ideas absorbed from LaoFeng's FlyingMouse Format (non-commercial
+  license; ideas only, no code reused — see THIRD_PARTY_NOTICES.md):
+  capability discovery per file ("what can this become?"), an engine
+  resolution chain (`KNORVIA_<NAME>_PATH` env → managed `data/engines/` →
+  system PATH), and quality-aware conversion (alpha-channel flattening
+  before yuv encoding). The `library` chat tool gains a `convert_id`
+  action — agents can now convert uploaded images (png/jpg/webp), PDFs
+  (→ text / page PNG via PyMuPDF), and audio/video (FFmpeg: mp3/wav/ogg/
+  m4a/mp4/webm) by themselves; results land as new library entries. HTTP
+  surface: `GET/POST /api/v1/library/assets/{id}/convert-targets|convert`.
+
 - **AI Classroom organically wired into Knorvia's own organs**: generation
   can ground lessons in a selected knowledge base (RAG retrieval feeding the
   outline stage), saved Personas seat as the classmate agents, graded wrong
