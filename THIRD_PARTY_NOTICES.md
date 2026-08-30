@@ -1,5 +1,36 @@
 # Third-party notices
 
+## OpenMAIC (design reference; adapted code and prompts)
+
+- Project: [THU-MAIC/OpenMAIC](https://github.com/THU-MAIC/OpenMAIC) — Open Multi-Agent Interactive Classroom (Tsinghua THU-MAIC team)
+- License: MIT (© 2026 THU-MAIC). Used under the MIT license; the notice below applies to the adapted portions.
+- Use in Knorvia: the AI Classroom feature (learning space) adapts OpenMAIC's three-stage lesson generation (outlines → scenes → actions), the deterministic action-timeline playback model, the stateless discussion director routing rules, the agent-profile registry concept, and two-tier quiz grading. Adapted in `knorvia/services/classroom/`, `knorvia/api/routers/classroom.py`, `web/lib/classroom-api.ts`, and `web/components/classroom/`.
+
+```
+MIT License
+
+Copyright (c) 2026 THU-MAIC
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+```
+
+
 ## Real-ESRGAN / Real-ESRGAN NCNN Vulkan
 
 - Projects: [xinntao/Real-ESRGAN](https://github.com/xinntao/Real-ESRGAN) and [xinntao/Real-ESRGAN-ncnn-vulkan](https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan)

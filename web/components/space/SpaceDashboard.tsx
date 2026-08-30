@@ -10,6 +10,7 @@ import {
   History,
   NotebookPen,
   Plug,
+  Presentation,
   Terminal,
   UserRound,
   Wand2,
@@ -21,6 +22,7 @@ import { getCliApps } from "@/lib/cli-apps-api";
 import { listSessions } from "@/lib/session-api";
 import { listNotebooks, listNotebookEntries } from "@/lib/notebook-api";
 import { listPersonas } from "@/lib/personas-api";
+import { listClassrooms } from "@/lib/classroom-api";
 import { listSkills } from "@/lib/skills-api";
 import { fetchAllProgress } from "@/lib/learning-api";
 
@@ -38,6 +40,7 @@ type Lang = { zh: string; en: string };
 type DashKey =
   | "chat_history"
   | "notebooks"
+  | "ai_classroom"
   | "question_bank"
   | "personas"
   | "skills"
@@ -92,6 +95,19 @@ const GROUPS: DashboardGroup[] = [
         unit: { zh: "个笔记本", en: "notebooks" },
         tile: "bg-amber-500/10 text-amber-600 dark:text-amber-400",
         load: async () => (await listNotebooks()).length,
+      },
+      {
+        key: "ai_classroom",
+        href: "/space/classroom",
+        icon: Presentation,
+        title: { zh: "AI 课堂", en: "AI Classroom" },
+        blurb: {
+          zh: "一个主题生成一堂课:AI 老师讲解,AI 同学讨论。",
+          en: "One topic in, a full class out: AI teacher and classmates.",
+        },
+        unit: { zh: "堂课", en: "lessons" },
+        tile: "bg-violet-500/10 text-violet-600 dark:text-violet-400",
+        load: async () => (await listClassrooms()).length,
       },
       {
         key: "question_bank",

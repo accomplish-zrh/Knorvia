@@ -338,6 +338,7 @@ from knorvia.api.routers import (
     book,
     capabilities_settings,
     chat,
+    classroom,
     co_writer,
     creative_library,
     cron,
@@ -505,6 +506,9 @@ app.include_router(
 )
 app.include_router(tools_router.router, prefix="/api/v1/tools", tags=["tools"], dependencies=_auth)
 app.include_router(cron.router, prefix="/api/v1/cron", tags=["cron"], dependencies=_auth)
+app.include_router(
+    classroom.router, prefix="/api/v1/classroom", tags=["classroom"], dependencies=_auth
+)
 app.include_router(system.router, prefix="/api/v1/system", tags=["system"], dependencies=_auth)
 app.include_router(voice.router, prefix="/api/v1/voice", tags=["voice"], dependencies=_auth)
 app.include_router(

@@ -7,6 +7,21 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **AI Classroom (learning space)** — an OpenMAIC-inspired interactive
+  lesson generator and player (MIT, © 2026 THU-MAIC; see
+  THIRD_PARTY_NOTICES.md): one topic produces a full micro-lesson via
+  three-stage generation (reviewable outline → scene content → action
+  timeline, with the quiz/discussion resource budget), played back as a
+  deterministic scene timeline (AI teacher + AI classmates with
+  length-derived speech beats), interactive two-tier-graded quizzes
+  (objective auto-graded, short answers via LLM, results feed the
+  discussion), and per-scene live discussions driven by a stateless
+  director router (unanswered-learner-question escalates to the teacher,
+  no repeat speakers, client-held state, abort-safe). Surfaces:
+  `knorvia/services/classroom/`, `/api/v1/classroom`, 学习空间 → AI 课堂.
+
 ## [1.9.0-dev] — stabilization
 
 ### Security
