@@ -256,10 +256,16 @@ function ConnectModal({
     setDetecting(true);
     setDetectError("");
     try {
+      // Keep every known local CLI in the list (Codex, Grok Build, …) even
+      // when PATH/PATHEXT probe misses it — hide-only-available was dropping
+      // npm .cmd shims like Codex from both Detect and Add.
       const found = await detectSubagents();
-      const available = found.filter((backend) => backend.available);
-      setBackends(available);
-      setKind((prev) => prev || available[0]?.kind || "");
+      setBackends(found);
+      setKind((prev) => {
+        if (prev && found.some((backend) => backend.kind === prev)) return prev;
+        const firstAvailable = found.find((backend) => backend.available);
+        return firstAvailable?.kind || found[0]?.kind || "";
+      });
     } catch (caught) {
       setBackends([]);
       setDetectError(
@@ -419,7 +425,7 @@ function ConnectModal({
           <div className="mb-4 space-y-2">
             <div className="flex items-center justify-between gap-2">
               <p className="text-[11px] font-semibold uppercase tracking-[0.12em] text-[var(--muted-foreground)]">
-                {tr({ zh: "本机已安装", en: "Installed here" })}
+                {tr({ zh: "本机智能体", en: "Local agents" })}
               </p>
               <button
                 type="button"
@@ -434,7 +440,9 @@ function ConnectModal({
               return (
                 <div
                   key={backend.kind}
-                  className="flex items-center gap-3 rounded-2xl border border-[var(--border)] bg-[var(--background)] px-3 py-2.5"
+                  className={`flex items-center gap-3 rounded-2xl border border-[var(--border)] bg-[var(--background)] px-3 py-2.5 ${
+                    backend.available ? "" : "opacity-80"
+                  }`}
                 >
                   <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl border border-[var(--border)]/60 bg-[var(--card)]">
                     {Glyph ? <Glyph size={18} /> : <Cpu size={16} />}
@@ -444,23 +452,32 @@ function ConnectModal({
                       {backend.display_name}
                     </div>
                     <div className="truncate text-[11px] text-[var(--muted-foreground)]">
-                      {backend.version ||
-                        tr({ zh: "已安装", en: "Installed" })}
+                      {backend.available
+                        ? backend.version ||
+                          tr({ zh: "已安装", en: "Installed" })
+                        : backend.detail ||
+                          tr({ zh: "未检测到", en: "Not detected" })}
                     </div>
                   </div>
-                  <button
-                    type="button"
-                    disabled={busyKey === backend.kind}
-                    onClick={() => void connectDetected(backend)}
-                    className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--foreground)] px-2.5 py-1.5 text-[12px] font-medium text-[var(--background)] disabled:opacity-50"
-                  >
-                    {busyKey === backend.kind ? (
-                      <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                    ) : (
-                      <Plug className="h-3.5 w-3.5" />
-                    )}
-                    {tr({ zh: "连接", en: "Connect" })}
-                  </button>
+                  {backend.available ? (
+                    <button
+                      type="button"
+                      disabled={busyKey === backend.kind}
+                      onClick={() => void connectDetected(backend)}
+                      className="inline-flex shrink-0 items-center gap-1 rounded-lg bg-[var(--foreground)] px-2.5 py-1.5 text-[12px] font-medium text-[var(--background)] disabled:opacity-50"
+                    >
+                      {busyKey === backend.kind ? (
+                        <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                      ) : (
+                        <Plug className="h-3.5 w-3.5" />
+                      )}
+                      {tr({ zh: "连接", en: "Connect" })}
+                    </button>
+                  ) : (
+                    <span className="shrink-0 rounded-lg border border-dashed border-[var(--border)] px-2.5 py-1.5 text-[11.5px] text-[var(--muted-foreground)]">
+                      {tr({ zh: "未安装", en: "Missing" })}
+                    </span>
+                  )}
                 </div>
               );
             })}

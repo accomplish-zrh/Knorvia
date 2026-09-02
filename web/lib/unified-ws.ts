@@ -120,6 +120,12 @@ export interface RegenerateMessage {
   overrides?: Record<string, unknown>;
 }
 
+export interface ContinueMessage {
+  type: "continue";
+  session_id: string;
+  overrides?: Record<string, unknown>;
+}
+
 /**
  * Deliver the user's answer for an ``ask_user`` paused turn so the
  * agentic loop can resume on the same turn. The user's reply is
@@ -145,6 +151,7 @@ export type ChatMessage =
   | UnsubscribeMessage
   | CancelTurnMessage
   | RegenerateMessage
+  | ContinueMessage
   | SubmitUserReplyMessage;
 
 // ---- Connection manager ----

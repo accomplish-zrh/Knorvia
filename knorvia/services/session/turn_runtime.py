@@ -451,6 +451,17 @@ def _extract_persist_user_message(config: dict[str, Any] | None) -> bool:
     return bool(raw)
 
 
+def _extract_continue_message_id(config: dict[str, Any] | None) -> int | None:
+    if not isinstance(config, dict):
+        return None
+    raw = config.pop("_continue_message_id", None)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 def _extract_regenerate_flag(config: dict[str, Any] | None) -> bool:
     if not isinstance(config, dict):
         return False
@@ -702,6 +713,11 @@ class TurnRuntimeManager:
             "_regenerate",
             "_regenerated_from_message_id",
             "_superseded_turn_id",
+            "_continue_assistant",
+            "_continue_message_id",
+            "_continue_prefix",
+            "_continue_events",
+            "_continue_attachments",
             "followup_question_context",
             # Per-turn subagent consult budget (composer stepper). Not part of
             # any capability's public config schema, so it rides as a runtime
@@ -1005,6 +1021,104 @@ class TurnRuntimeManager:
             payload["llm_selection"] = llm_selection
         return await self.start_turn(payload)
 
+    async def continue_last_turn(
+        self,
+        session_id: str,
+        overrides: dict[str, Any] | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]]:
+        """Append more tokens onto the trailing assistant message.
+
+        Unlike regenerate, the existing assistant row is kept and the new
+        generation is concatenated onto it. No extra user bubble is stored.
+        """
+        session_id = str(session_id or "").strip()
+        if not session_id:
+            raise RuntimeError("nothing_to_continue")
+
+        session = await self.store.get_session(session_id)
+        if session is None:
+            raise RuntimeError("nothing_to_continue")
+
+        active = await self.store.get_active_turn(session_id)
+        if active is not None:
+            raise RuntimeError("continue_busy")
+
+        last_user = await self.store.get_last_message(session_id, role="user")
+        if last_user is None:
+            raise RuntimeError("nothing_to_continue")
+
+        last_message = await self.store.get_last_message(session_id)
+        if last_message is None or last_message.get("role") != "assistant":
+            raise RuntimeError("nothing_to_continue")
+
+        preferences = session.get("preferences") or {}
+        overrides = overrides or {}
+        snapshot = {}
+        metadata = last_user.get("metadata") or {}
+        if isinstance(metadata, dict):
+            candidate = metadata.get("request_snapshot") or metadata.get("requestSnapshot")
+            if isinstance(candidate, dict):
+                snapshot = candidate
+
+        capability = str(
+            overrides.get("capability")
+            or last_user.get("capability")
+            or preferences.get("capability")
+            or "chat"
+        )
+        tools = list(
+            overrides.get("tools")
+            if overrides.get("tools") is not None
+            else preferences.get("tools") or []
+        )
+        knowledge_bases = list(
+            overrides.get("knowledge_bases")
+            if overrides.get("knowledge_bases") is not None
+            else preferences.get("knowledge_bases") or []
+        )
+        language = str(overrides.get("language") or preferences.get("language") or "en")
+        continue_prompt = (
+            "继续写"
+            if str(language).lower().startswith("zh")
+            else "Continue the previous reply from where it ended. Do not repeat it."
+        )
+
+        config: dict[str, Any] = dict(overrides.get("config") or {})
+        config.update(
+            {
+                "_persist_user_message": False,
+                "_continue_assistant": True,
+                "_continue_message_id": int(last_message["id"]),
+                "_continue_prefix": str(last_message.get("content") or ""),
+                "_continue_events": list(last_message.get("events") or []),
+                "_continue_attachments": list(last_message.get("attachments") or []),
+            }
+        )
+        llm_selection = (
+            overrides.get("llm_selection")
+            if overrides.get("llm_selection") is not None
+            else snapshot.get("llmSelection") or preferences.get("llm_selection")
+        )
+        mastery_path_id = _mastery_path_id(
+            overrides.get("mastery_path_id")
+            if "mastery_path_id" in overrides
+            else snapshot.get("masteryPathId") or preferences.get("mastery_path_id")
+        )
+        payload: dict[str, Any] = {
+            "session_id": session_id,
+            "capability": capability,
+            "content": continue_prompt,
+            "tools": tools,
+            "knowledge_bases": knowledge_bases,
+            "language": language,
+            "attachments": [],
+            "mastery_path_id": mastery_path_id,
+            "config": config,
+        }
+        if llm_selection:
+            payload["llm_selection"] = llm_selection
+        return await self.start_turn(payload)
+
     async def cancel_turn(self, turn_id: str) -> bool:
         async with self._lock:
             execution = self._executions.get(turn_id)
@@ -1288,6 +1402,11 @@ class TurnRuntimeManager:
             followup_question_context = _extract_followup_question_context(request_config)
             persist_user_message = _extract_persist_user_message(request_config)
             is_regenerate = _extract_regenerate_flag(request_config)
+            continue_message_id = _extract_continue_message_id(request_config)
+            continue_prefix = str(request_config.pop("_continue_prefix", "") or "")
+            continue_events = request_config.pop("_continue_events", None)
+            continue_attachments = request_config.pop("_continue_attachments", None)
+            request_config.pop("_continue_assistant", None)
             request_config.pop("_regenerated_from_message_id", None)
             request_config.pop("_superseded_turn_id", None)
             raw_user_content = str(payload.get("content", "") or "")
@@ -1766,13 +1885,23 @@ class TurnRuntimeManager:
             # The persisted answer is the captured content minus any narration
             # rounds (their text stayed in the trace, never the answer).
             assistant_content = _persisted_answer()
-
+            if continue_message_id:
+                prefix = continue_prefix
+                merged_events = list(continue_events or []) + list(assistant_events)
+                merged_attachments = list(continue_attachments or []) + list(generated_attachments or [])
+                await self.store.update_message(
+                    continue_message_id,
+                    content=f"{prefix}{assistant_content}",
+                    events=merged_events,
+                    attachments=merged_attachments or None,
+                )
+                assistant_message_id = continue_message_id
             # Assistant continues the same branch as the user message it
             # answers. If we just persisted a new user row we chain off
             # that; if we did not (regenerate path) and the caller pinned a
             # parent, we use it; otherwise we let the store auto-append
             # (legacy behavior).
-            if new_user_message_id is not None:
+            elif new_user_message_id is not None:
                 assistant_message_id = await self.store.add_message(
                     session_id=session_id,
                     role="assistant",

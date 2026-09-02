@@ -379,11 +379,24 @@ async def _execute_capability_stream(
                         contextlib.redirect_stdout(stdout_stream),
                         contextlib.redirect_stderr(stderr_stream),
                     ):
-                        async for event in orch.handle(ctx):
-                            if event.type.value == "result":
-                                final_result = dict(event.metadata)
-                                continue
-                            await event_queue.put({"kind": "stream", "payload": event.to_dict()})
+                        from knorvia.services.model_selection.runtime import (
+                            activate_llm_selection,
+                            reset_llm_selection,
+                        )
+
+                        llm_token = None
+                        try:
+                            if body.llm_selection:
+                                _, llm_token = activate_llm_selection(body.llm_selection)
+                            async for event in orch.handle(ctx):
+                                if event.type.value == "result":
+                                    final_result = dict(event.metadata)
+                                    continue
+                                await event_queue.put(
+                                    {"kind": "stream", "payload": event.to_dict()}
+                                )
+                        finally:
+                            reset_llm_selection(llm_token)
         except Exception as exc:
             error_holder["detail"] = str(exc)
         finally:

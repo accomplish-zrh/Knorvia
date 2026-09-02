@@ -247,7 +247,10 @@ async def _kimi_options() -> BackendOptions:
 
 async def _list_cli_models(cli_command: str, *, refresh: bool = False) -> list[ModelOption]:
     """Parse ``<cli> models`` output — one ``provider/model`` slug per line."""
-    cmd = [cli_command, "models"]
+    from knorvia.services.subagent.detect_fallback import resolve_cli_command
+
+    resolved = resolve_cli_command(cli_command) or cli_command
+    cmd = [resolved, "models"]
     if refresh:
         cmd.append("--refresh")
     try:
@@ -329,10 +332,11 @@ async def _grok_build_options(*, refresh: bool = False) -> BackendOptions:
 
 
 async def _list_grok_models(*, refresh: bool = False) -> tuple[str, list[tuple[str, str]]]:
+    from knorvia.services.subagent.detect_fallback import resolve_cli_command
     from knorvia.services.subagent.grok_build import parse_grok_models
 
     backend = get_backend("grok_build")
-    cli = backend.cli_command if backend else "grok"
+    cli = resolve_cli_command(backend.cli_command if backend else "grok") or "grok"
     try:
         process = await asyncio.create_subprocess_exec(
             cli,

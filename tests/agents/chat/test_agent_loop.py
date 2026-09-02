@@ -670,7 +670,7 @@ async def test_midloop_llm_failure_salvages_turn_with_forced_finish(
                                 ),
                             ]
                         )
-                    if parent.call_count == 2:
+                    if parent.call_count <= 4:
                         raise TimeoutError("Request timed out.")
                     return _async_llm_stream([_llm_chunk(content="Best-effort answer.")])
 
@@ -692,8 +692,8 @@ async def test_midloop_llm_failure_salvages_turn_with_forced_finish(
         UnifiedContext(session_id="s1", user_message="Look up", enabled_tools=["web_search"]),
     )
 
-    # 1 tool round + 1 failed round + 1 forced-finish call = 3 create() calls.
-    assert client.call_count == 3
+    # 1 tool round + 3 timeout attempts (original + 2 extra) + forced finish = 5.
+    assert client.call_count == 5
     # The turn produced an answer instead of failing.
     result = _result(events)
     assert result.metadata["response"] == "Best-effort answer."

@@ -15,12 +15,16 @@ export default function HomePage() {
     const sessionId = params.get("session");
     const capability = params.get("capability");
     const tools = params.getAll("tool");
+    const assistant = params.get("assistant");
+    const cowriter = params.get("cowriter");
 
     let target = sessionId ? `/home/${sessionId}` : "/home";
 
     const query: string[] = [];
     if (capability) query.push(`capability=${encodeURIComponent(capability)}`);
     tools.forEach((t) => query.push(`tool=${encodeURIComponent(t)}`));
+    if (assistant) query.push(`assistant=${encodeURIComponent(assistant)}`);
+    if (cowriter) query.push(`cowriter=${encodeURIComponent(cowriter)}`);
     if (query.length) target += `?${query.join("&")}`;
 
     router.replace(target);

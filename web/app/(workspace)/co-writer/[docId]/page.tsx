@@ -45,6 +45,7 @@ import {
 import { useParams, useRouter } from "next/navigation";
 import { apiFetch, apiUrl } from "@/lib/api";
 import { listKnowledgeBases } from "@/lib/knowledge-api";
+import CoWriterChatPanel from "@/components/co-writer/CoWriterChatPanel";
 import {
   getCoWriterDocument,
   updateCoWriterDocument,
@@ -232,6 +233,7 @@ export default function CoWriterPage() {
 
   const [editorCollapsed, setEditorCollapsed] = useState(false);
   const [previewCollapsed, setPreviewCollapsed] = useState(false);
+  const [rightPane, setRightPane] = useState<"chat" | "preview">("chat");
   const [editorRatio, setEditorRatio] = useState(0.5);
   const [isResizingSplit, setIsResizingSplit] = useState(false);
   const [syncScrollEnabled, setSyncScrollEnabled] = useState(true);
@@ -2012,9 +2014,30 @@ export default function CoWriterPage() {
             }}
           >
             <div className="flex shrink-0 items-center justify-between border-b border-[var(--border)] px-3 py-1">
-              <span className="text-xs font-medium text-[var(--muted-foreground)]">
-                {t("Preview")}
-              </span>
+              <div className="flex items-center gap-1">
+                <button
+                  type="button"
+                  onClick={() => setRightPane("chat")}
+                  className={`rounded-md px-2 py-0.5 text-xs font-medium transition-colors ${
+                    rightPane === "chat"
+                      ? "bg-[var(--muted)] text-[var(--foreground)]"
+                      : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                  }`}
+                >
+                  {t("Chat")}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setRightPane("preview")}
+                  className={`rounded-md px-2 py-0.5 text-xs font-medium transition-colors ${
+                    rightPane === "preview"
+                      ? "bg-[var(--muted)] text-[var(--foreground)]"
+                      : "text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                  }`}
+                >
+                  {t("Preview")}
+                </button>
+              </div>
               <button
                 title={t("Collapse preview")}
                 onClick={() => setPreviewCollapsed(true)}
@@ -2023,6 +2046,18 @@ export default function CoWriterPage() {
                 <ChevronRight size={14} />
               </button>
             </div>
+            {rightPane === "chat" && docId ? (
+              <CoWriterChatPanel
+                docId={docId}
+                onInsert={(chunk) =>
+                  handleMarkdownChange(
+                    markdown
+                      ? markdown.replace(/\s*$/, "\n\n") + chunk
+                      : chunk,
+                  )
+                }
+              />
+            ) : (
             <div
               ref={previewScrollRef}
               onScroll={handlePreviewScrollSync}
@@ -2034,6 +2069,7 @@ export default function CoWriterPage() {
                 trackSourceLines
               />
             </div>
+            )}
           </div>
         )}
       </div>

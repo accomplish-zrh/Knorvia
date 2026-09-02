@@ -341,3 +341,9 @@ celerybeat.pid
 # User-uploaded desktop wallpapers (never commit custom files)
 **/settings/wallpapers/
 
+
+# One-shot v1.0.0 migration/edit scripts and packaging scratch output (2026-09-02)
+scripts/_apply_v100_*.py
+scripts/_peek.py
+scripts/_retry_nsis*.ps1
+release-pack/

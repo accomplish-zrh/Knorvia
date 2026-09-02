@@ -9,8 +9,8 @@ import {
   useRef,
   useState,
 } from "react";
-import Image from "next/image";
 import { useParams, useRouter } from "next/navigation";
+import BrandMark from "@/components/common/BrandMark";
 
 import {
   BarChart3,
@@ -36,6 +36,9 @@ import { takeComposerDraft } from "@/lib/composer-draft";
 import type { SelectedHistorySession } from "@/components/chat/HistorySessionPicker";
 import type { SelectedQuestionEntry } from "@/components/chat/QuestionBankPicker";
 import ChatComposer from "@/components/chat/home/ChatComposer";
+import CoWriterSplit from "@/components/chat/home/CoWriterSplit";
+import ModelSelector from "@/components/chat/home/ModelSelector";
+import { loadCoWriterSplitState, saveCoWriterSplitState } from "@/lib/cowriter-split";
 import type { ContextBudget } from "@/components/chat/home/ContextBudgetChip";
 import { ChatMessageList } from "@/components/chat/home/ChatMessages";
 import { TurnNavigator } from "@/components/chat/home/TurnNavigator";
@@ -64,7 +67,7 @@ import {
   GeogebraTabProvider,
   useGeogebraTabOpener,
 } from "@/context/GeogebraTabContext";
-import { BookmarkPlus, Download, PanelRight } from "lucide-react";
+import { BookmarkPlus, Download, PanelRight, Columns2 } from "lucide-react";
 import {
   useUnifiedChat,
   type MessageAttachment,
@@ -106,6 +109,8 @@ import {
 import { listKnowledgeBases } from "@/lib/knowledge-api";
 import { getSubagentSettings } from "@/lib/subagents-api";
 import { useLLMOptions } from "@/hooks/useLLMOptions";
+import { useLocalRuntimeModels } from "@/hooks/useLocalRuntimeModels";
+import { mergeLocalRuntimeOptions } from "@/lib/local-runtime-models";
 import {
   getEnabledOptionalTools,
   invalidateEnabledOptionalToolsCache,
@@ -375,6 +380,7 @@ export default function ChatPage() {
     cancelStreamingTurn,
     submitUserReply,
     regenerateLastMessage,
+    continueLastMessage,
     deleteTurn,
     editMessage,
     switchBranch,
@@ -406,12 +412,17 @@ export default function ChatPage() {
   }
   const agentPreselectDoneRef = useRef(false);
   const {
-    options: llmOptions,
+    options: configuredLLMOptions,
     activeDefault: activeLLMDefault,
     loading: llmOptionsLoading,
     error: llmOptionsError,
     refresh: refreshLLMOptions,
   } = useLLMOptions();
+  const localRuntimeOptions = useLocalRuntimeModels();
+  const llmOptions = useMemo(
+    () => mergeLocalRuntimeOptions(configuredLLMOptions, localRuntimeOptions),
+    [configuredLLMOptions, localRuntimeOptions],
+  );
   const [capabilityConfigs, setCapabilityConfigs] =
     useState<CapabilityPlaygroundConfigMap>({});
   // User-toggleable tools the user has enabled in /settings/tools. This is
@@ -437,6 +448,11 @@ export default function ChatPage() {
   // Single right-side panel: the Activity/Viewer. Its home view is the
   // session activity; files and web pages open as tabs alongside it.
   const [viewerPanelOpen, setViewerPanelOpen] = useState(false);
+  const [coWriterOpen, setCoWriterOpen] = useState(false);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    setCoWriterOpen(loadCoWriterSplitState().open);
+  }, []);
   // Immersive reading: KB file opened beside the thread (citation jump or
   // attachment preview promoted to a persistent side panel).
   const [readerSource, setReaderSource] = useState<FilePreviewSource | null>(null);
@@ -1218,7 +1234,17 @@ export default function ChatPage() {
     const qc = p.get("capability");
     const qt = p.getAll("tool");
     const masteryPathId = p.get("mastery_path_id")?.trim();
+    const cowriter = p.get("cowriter")?.trim();
     if (masteryPathId) setMasteryPathId(masteryPathId);
+    if (cowriter) {
+      const current = loadCoWriterSplitState();
+      saveCoWriterSplitState({
+        ...current,
+        open: true,
+        docId: cowriter === "1" ? current.docId : cowriter,
+      });
+      setCoWriterOpen(true);
+    }
     if (qc !== null) handleSelectCapability(qc || "");
     else if (qt.length) {
       const valid = qt.filter((t): t is ToolName =>
@@ -1399,6 +1425,7 @@ export default function ChatPage() {
   const removeAttachment = useCallback((index: number) => {
     setAttachments((prev) => prev.filter((_, i) => i !== index));
   }, []);
+  const clearAttachments = useCallback(() => setAttachments([]), []);
 
   const handlePreviewPendingAttachment = useCallback(
     (index: number) => {
@@ -1784,6 +1811,27 @@ export default function ChatPage() {
     regenerateLastMessage();
   }, [regenerateLastMessage]);
 
+  const handleContinueMessage = useCallback(() => {
+    continueLastMessage();
+  }, [continueLastMessage]);
+
+  useEffect(() => {
+    const onNewChat = () => {
+      router.push("/home");
+      newSession();
+    };
+    const onStop = () => cancelStreamingTurn();
+    const onRetry = () => regenerateLastMessage();
+    window.addEventListener("knorvia:new-chat", onNewChat);
+    window.addEventListener("knorvia:stop-generation", onStop);
+    window.addEventListener("knorvia:retry", onRetry);
+    return () => {
+      window.removeEventListener("knorvia:new-chat", onNewChat);
+      window.removeEventListener("knorvia:stop-generation", onStop);
+      window.removeEventListener("knorvia:retry", onRetry);
+    };
+  }, [router, newSession, cancelStreamingTurn, regenerateLastMessage]);
+
   const handleToggleKB = useCallback(
     (name: string) => {
       const current = state.knowledgeBases;
@@ -1900,6 +1948,14 @@ export default function ChatPage() {
   const handleClearPersona = useCallback(() => {
     setPersonaSelection("");
   }, [setPersonaSelection]);
+  const toggleCoWriterSplit = useCallback(() => {
+    setCoWriterOpen((prev) => {
+      const next = !prev;
+      const current = loadCoWriterSplitState();
+      saveCoWriterSplitState({ ...current, open: next });
+      return next;
+    });
+  }, []);
 
   const handleToggleMemoryFile = useCallback((file: SpaceMemoryFile) => {
     setSelectedMemoryFiles((prev) =>
@@ -1987,6 +2043,7 @@ export default function ChatPage() {
             (not a flex container), so flex-1 alone cannot stretch this
             wrapper — without it the whole chat column collapses to content
             height and the empty-state composer sticks to the top. */}
+        <CoWriterSplit open={coWriterOpen}>
         <div className="flex h-full min-h-0 flex-1 overflow-hidden">
         <ImmersiveReader
           source={readerSource}
@@ -2002,8 +2059,24 @@ export default function ChatPage() {
           // hand-tune it without fighting Tailwind's arbitrary-value parser.
           data-preview-open={previewSource ? "true" : "false"}
           data-viewer-open={viewerPanelOpen ? "true" : "false"}
-          className="chat-preview-shell flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]"
+          className="chat-preview-shell relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-[var(--background)]"
+          onDragEnter={handleDragEnter}
+          onDragLeave={handleDragLeave}
+          onDragOver={handleDragOver}
+          onDrop={handleDrop}
         >
+          {dragging ? (
+            <div data-testid="chat-turn-drop-overlay" className="pointer-events-none absolute inset-0 z-30 flex items-center justify-center border-2 border-dashed border-[var(--primary)]/45 bg-[var(--primary)]/[0.06] backdrop-blur-[2px]">
+              <div className="rounded-2xl border border-[var(--primary)]/30 bg-[var(--card)]/80 px-5 py-4 text-center shadow-sm">
+                <div className="text-[14px] font-medium text-[var(--primary)]">
+                  {t("Attach to this turn only")}
+                </div>
+                <div className="mt-1 text-[12px] text-[var(--muted-foreground)]">
+                  {t("Not added to a knowledge base. Clear the chips after you ask.")}
+                </div>
+              </div>
+            </div>
+          ) : null}
           <div className="mx-auto flex w-full max-w-[960px] flex-wrap items-center justify-between gap-x-3 gap-y-1.5 px-6 pt-3 pb-0">
             <div className="group/title min-w-0 flex flex-1 items-center gap-2">
               {sessionTitleEditing ? (
@@ -2048,6 +2121,26 @@ export default function ChatPage() {
               ) : null}
             </div>
             <div className="flex shrink-0 items-center gap-0.5">
+              <div data-testid="chat-topbar-model">
+                <ModelSelector
+                  options={llmOptions}
+                  activeDefault={activeLLMDefault}
+                  value={state.llmSelection}
+                  loading={llmOptionsLoading}
+                  error={llmOptionsError}
+                  placement="bottom"
+                  alwaysShowLabel
+                  helperText={t("Switch among models already configured on this machine")}
+                  onChange={setLLMSelection}
+                />
+              </div>
+              <HeaderActionButton
+                onClick={toggleCoWriterSplit}
+                active={coWriterOpen}
+                icon={Columns2}
+                label={t("Co-Writer")}
+                title={t("Write the paper on the left. Chat and citations stay on the right.")}
+              />
               <HeaderActionButton
                 onClick={() => setShowSaveModal(true)}
                 disabled={!chatSavePayload}
@@ -2080,15 +2173,7 @@ export default function ChatPage() {
             ) : !hasMessages ? (
               <div className="flex w-full flex-1 min-h-0 items-end justify-center pb-14 animate-fade-in px-6">
                 <div className="w-full max-w-[960px] flex items-center justify-center gap-4">
-                  <Image
-                    src="/logo.png"
-                    alt={t("Knorvia")}
-                    width={40}
-                    height={40}
-                    className="h-10 w-10 select-none"
-                    draggable={false}
-                    priority
-                  />
+                  <BrandMark size="xl" alt={t("Knorvia")} priority />
                   <h1 className="font-serif text-[40px] font-medium leading-[1.1] tracking-[-0.015em] text-[var(--foreground)]">
                     {t(welcomeGreeting)}
                   </h1>
@@ -2143,6 +2228,7 @@ export default function ChatPage() {
                       language={state.language}
                       onCopyAssistantMessage={copyAssistantMessage}
                       onRegenerateMessage={handleRegenerateMessage}
+                      onContinueMessage={handleContinueMessage}
                       onConfirmOutline={handleConfirmOutline}
                       onPreviewAttachment={handlePreviewMessageAttachment}
                       onDeleteTurn={deleteTurn}
@@ -2226,6 +2312,7 @@ export default function ChatPage() {
               onToggleMemoryFile={handleToggleMemoryFile}
               onSend={handleSend}
               onRemoveAttachment={removeAttachment}
+              onClearAttachments={clearAttachments}
               onPreviewAttachment={handlePreviewPendingAttachment}
               onRemoveHistory={handleRemoveHistory}
               onRemoveAgent={handleRemoveAgent}
@@ -2305,6 +2392,7 @@ export default function ChatPage() {
           />
         </div>
         </div>
+        </CoWriterSplit>
       </GeogebraTabProvider>
     </QuizFollowupProvider>
   );

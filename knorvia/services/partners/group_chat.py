@@ -1,17 +1,18 @@
 # -*- coding: utf-8 -*-
-"""Group chat engine: drive partner turns in a shared room.
+"""Group chat engine: Hermes bot-mode rooms.
 
-Round-robin moderation: after a user message, each running member (in
-member order) sees the transcript so far and answers once. Members see
-the room transcript through their own session store — the room injects
-the conversation as an inbound message whose session key is the room id,
-so transcripts persist per-partner exactly like botdm sessions.
+After a user message the room runs up to three serial rounds. @mentioned
+members speak (everyone, when nobody is named). Each member replies
+briefly or passes; a fully silent round settles the room. Members may
+@Name a teammate into the next round or @user to raise a needs-you flag.
+Hard caps: 10 spoken replies per send, 3 rounds.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 from typing import Any
 
@@ -27,6 +28,42 @@ logger = logging.getLogger(__name__)
 
 GROUP_TRANSCRIPT_MAX = 200
 MEMBER_TURN_TIMEOUT_SECONDS = 300
+MAX_ROUNDS = 3
+MAX_MESSAGES_PER_SEND = 10
+
+_PASS_REPLIES = frozenset(
+    {
+        "",
+        "pass",
+        "pass.",
+        "[silent]",
+        "silent",
+        "过",
+        "跳过",
+    }
+)
+_USER_MENTION = re.compile(r"(?<![\w])@user\b", re.IGNORECASE)
+_AT_TOKEN = re.compile(r"@([\w\-\u4e00-\u9fff]+)")
+
+
+def is_pass_reply(text: str) -> bool:
+    """True when the member declined to speak this beat (Hermes pass / SILENT)."""
+    stripped = (text or "").strip()
+    if not stripped:
+        return True
+    low = stripped.lower()
+    if low in _PASS_REPLIES or low in {"[silent]", "silent"}:
+        return True
+    return stripped in {"[SILENT]", "SILENT"}
+
+
+def is_silence_token(text: str) -> bool:
+    """IM-gateway silence: suppress outbound delivery of this exact reply."""
+    return (text or "").strip() in {"[SILENT]", "SILENT", "[silent]"}
+
+
+def mentions_user(text: str) -> bool:
+    return bool(_USER_MENTION.search(text or ""))
 
 _room_locks: dict[str, asyncio.Lock] = {}
 
@@ -144,6 +181,7 @@ class GroupChatEngine:
                     "message_count": len(room.messages),
                     "last_message": (last.content[:120] if last else ""),
                     "last_timestamp": (last.timestamp if last else room.created_at),
+                    "needs_you": bool(room.needs_you),
                 }
             )
         return rooms
@@ -153,13 +191,16 @@ class GroupChatEngine:
     def _resolve_mentions(self, room: "Room", content: str) -> list["RoomMember"] | None:
         """Members explicitly @addressed in *content*, or None for all.
 
-        Matches @display_name and @connection (case-insensitive). Unknown
+        Matches @display_name and @connection (case-insensitive). @user is
+        reserved for human escalation and never selects a member. Unknown
         @names are ignored — a typo falls back to the full round instead of
         swallowing the message.
         """
-        import re
-
-        tokens = {t.lower() for t in re.findall(r"@([\w\-\u4e00-\u9fff]+)", content)}
+        tokens = {
+            t.lower()
+            for t in _AT_TOKEN.findall(content or "")
+            if t.lower() not in {"user", "human"}
+        }
         if not tokens:
             return None
 
@@ -173,6 +214,41 @@ class GroupChatEngine:
                 named.append(member)
         return named or None
 
+    def _member_prompt(
+        self,
+        room: Room,
+        member: RoomMember,
+        *,
+        addressed: bool,
+        round_index: int,
+    ) -> str:
+        name = member.display_name or member.connection
+        persona_line = (
+            f"Your identity in this room: {member.persona}. " if member.persona else ""
+        )
+        teammates = ", ".join(
+            (m.display_name or m.connection)
+            for m in room.members
+            if m.connection != member.connection
+        )
+        roster = f"Teammates: {teammates}. " if teammates else ""
+        turn = (
+            "You were @addressed by name. Respond to the point raised. "
+            if addressed
+            else "It is your turn. Speak only if you have something new; otherwise pass. "
+        )
+        return (
+            f"You are {name}, one of several named bots in a group room with the user. "
+            f"{persona_line}{roster}"
+            f"Round {round_index + 1} of {MAX_ROUNDS}. "
+            f"Transcript so far:\n\n{self._render_transcript(room)}\n\n"
+            f"{turn}"
+            "Reply in one short beat, or pass with a single line PASS (or [SILENT]). "
+            "@Name pulls that teammate into the next round. "
+            "@user escalates a real judgment call to the human. "
+            "Do not recap the whole room. Do not greet."
+        )
+
     async def send_user_message(
         self,
         room_id: str,
@@ -180,7 +256,7 @@ class GroupChatEngine:
         *,
         max_speakers: int | None = None,
     ) -> dict[str, Any]:
-        """User speaks into the room; every member answers once in turn."""
+        """User speaks; members take up to three serial rounds (Hermes bot-mode)."""
         async with _lock_for(room_id):
             return await self._send_user_message_locked(room_id, content, max_speakers=max_speakers)
 
@@ -199,51 +275,108 @@ class GroupChatEngine:
 
         now = time.time()
         room.messages.append(RoomMessage("user", "user", content, now))
+        room.needs_you = False
         mentioned = self._resolve_mentions(room, content)
-        if mentioned is not None:
-            speakers = mentioned
-        else:
-            speakers = list(room.members)
+        speakers: list[RoomMember] = list(mentioned) if mentioned is not None else list(room.members)
         if max_speakers is not None:
             speakers = speakers[: max(1, max_speakers)]
 
         replies: list[dict[str, Any]] = []
-        for member in speakers:
-            name = member.display_name or member.connection
-            transcript = self._render_transcript(room)
-            addressed = mentioned is not None and member in mentioned
-            persona_line = (
-                f"Your identity in this room: {member.persona}. " if member.persona else ""
-            )
-            prompt = (
-                f"You are one of several agents in a group chat with the user. "
-                f"{persona_line}"
-                f"Transcript so far:\n\n{transcript}\n\n"
-                + (
-                    "You were @addressed by name. Respond to the point raised. "
-                    if addressed
-                    else "It is your turn to speak. "
+        failed: set[str] = set()
+        spoken = 0
+        rounds_run = 0
+        settled = "complete"
+
+        for round_index in range(MAX_ROUNDS):
+            if spoken >= MAX_MESSAGES_PER_SEND:
+                settled = "cap"
+                break
+            round_spoke = False
+            pull_ins: list[RoomMember] = []
+            for member in list(speakers):
+                if spoken >= MAX_MESSAGES_PER_SEND:
+                    settled = "cap"
+                    break
+                if member.connection in failed:
+                    continue
+                name = member.display_name or member.connection
+                addressed = mentioned is not None and any(
+                    m.connection == member.connection for m in mentioned
                 )
-                + "Answer the latest message directly and concisely; do not "
-                "repeat what others said."
-            )
-            try:
-                reply = await asyncio.wait_for(
-                    self._consult_member(room, member, prompt),
-                    timeout=MEMBER_TURN_TIMEOUT_SECONDS,
+                prompt = self._member_prompt(
+                    room, member, addressed=addressed, round_index=round_index
                 )
-            except asyncio.TimeoutError:
-                logger.warning("group turn timed out for %s in %s", member.connection, room.id)
-                replies.append({"member": name, "status": "timeout", "reply": ""})
-                continue
-            except Exception as exc:  # noqa: BLE001 - one bad member must not kill the room
-                logger.exception("group turn failed for %s in %s", member.connection, room.id)
-                replies.append({"member": name, "status": "error", "reply": str(exc)})
-                continue
-            reply = (reply or "").strip()
-            if reply:
+                try:
+                    reply = await asyncio.wait_for(
+                        self._consult_member(room, member, prompt),
+                        timeout=MEMBER_TURN_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError:
+                    logger.warning(
+                        "group turn timed out for %s in %s", member.connection, room.id
+                    )
+                    failed.add(member.connection)
+                    replies.append(
+                        {
+                            "member": name,
+                            "status": "timeout",
+                            "reply": "",
+                            "round": round_index + 1,
+                        }
+                    )
+                    continue
+                except Exception as exc:  # noqa: BLE001 - one bad member must not kill the room
+                    logger.exception(
+                        "group turn failed for %s in %s", member.connection, room.id
+                    )
+                    failed.add(member.connection)
+                    replies.append(
+                        {
+                            "member": name,
+                            "status": "error",
+                            "reply": str(exc),
+                            "round": round_index + 1,
+                        }
+                    )
+                    continue
+                reply = (reply or "").strip()
+                if is_pass_reply(reply):
+                    replies.append(
+                        {
+                            "member": name,
+                            "status": "pass",
+                            "reply": "",
+                            "round": round_index + 1,
+                        }
+                    )
+                    continue
                 room.messages.append(RoomMessage(member.connection, name, reply, time.time()))
-            replies.append({"member": name, "status": "ok", "reply": reply})
+                spoken += 1
+                round_spoke = True
+                if mentions_user(reply):
+                    room.needs_you = True
+                pulled = self._resolve_mentions(room, reply)
+                if pulled:
+                    seated = {m.connection for m in speakers}
+                    for extra in pulled:
+                        if extra.connection not in seated:
+                            pull_ins.append(extra)
+                            seated.add(extra.connection)
+                replies.append(
+                    {
+                        "member": name,
+                        "status": "ok",
+                        "reply": reply,
+                        "round": round_index + 1,
+                    }
+                )
+            rounds_run = round_index + 1
+            if not round_spoke:
+                settled = "silent"
+                break
+            if pull_ins:
+                speakers = list(speakers) + pull_ins
+                mentioned = (mentioned or []) + pull_ins
 
         if len(room.messages) > GROUP_TRANSCRIPT_MAX:
             room.messages = room.messages[-GROUP_TRANSCRIPT_MAX:]
@@ -251,8 +384,16 @@ class GroupChatEngine:
         return {
             "room_id": room.id,
             "replies": replies,
+            "rounds": rounds_run,
+            "settled": settled,
+            "needs_you": room.needs_you,
             "transcript": [
-                {"sender": m.sender, "sender_name": m.sender_name, "content": m.content}
+                {
+                    "sender": m.sender,
+                    "sender_name": m.sender_name,
+                    "content": m.content,
+                    "timestamp": m.timestamp,
+                }
                 for m in room.messages[-30:]
             ],
         }

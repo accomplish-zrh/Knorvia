@@ -71,6 +71,8 @@ class Room:
     members: list["RoomMember"] = field(default_factory=list)
     messages: list[RoomMessage] = field(default_factory=list)
     created_at: float = 0.0
+    # Hermes bot-mode: a member wrote @user and the room is waiting on the human.
+    needs_you: bool = False
 
 
 class GroupRoomStore:
@@ -104,6 +106,7 @@ class GroupRoomStore:
                             members=members,
                             messages=msgs,
                             created_at=float(data.get("created_at", 0)),
+                            needs_you=bool(data.get("needs_you", False)),
                         )
                     )
                 except Exception:  # noqa: BLE001 - skip corrupt files

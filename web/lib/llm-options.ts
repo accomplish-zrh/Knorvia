@@ -60,6 +60,30 @@ export async function listLLMOptions(options?: {
   );
 }
 
+
+export interface LLMProviderGroup {
+  label: string;
+  provider: string;
+  options: LLMOption[];
+}
+
+/** Group configured models by provider/relay for the chat top-bar switcher. */
+export function groupLLMOptionsByProvider(options: LLMOption[]): LLMProviderGroup[] {
+  const order: string[] = [];
+  const map = new Map<string, LLMProviderGroup>();
+  for (const option of options) {
+    const provider = option.provider || "custom";
+    const label = option.provider_label || option.profile_name || provider || "LLM";
+    const key = `${provider}::${label}`;
+    if (!map.has(key)) {
+      order.push(key);
+      map.set(key, { label, provider, options: [] });
+    }
+    map.get(key)!.options.push(option);
+  }
+  return order.map((key) => map.get(key)!);
+}
+
 export function invalidateLLMOptionsCache(): void {
   invalidateClientCache(LLM_OPTIONS_CACHE_KEY);
 }

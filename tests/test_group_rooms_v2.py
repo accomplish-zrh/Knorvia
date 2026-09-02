@@ -140,15 +140,17 @@ async def test_say_consults_backends_and_anchors_sessions(
     await engine.send_user_message(room.id, "第一个问题")
 
     anchor = f"room:{room.id}::my-codex"
-    # First turn: no session yet; its id got anchored to this room+member.
+    # First beat: no session yet; its id got anchored to this room+member.
     assert backend.consults[0]["session_id"] is None
     first_anchored = sessions[anchor]
     assert first_anchored  # something was remembered
+    # Hermes: up to 3 rounds while the member keeps speaking.
+    assert len(backend.consults) == 3
 
     await engine.send_user_message(room.id, "第二个问题")
-    assert len(backend.consults) == 2
-    # Second turn resumed exactly the anchored session from turn one.
-    assert backend.consults[1]["session_id"] == first_anchored
+    assert len(backend.consults) == 6
+    # Next user message resumed exactly the anchored session from beat one.
+    assert backend.consults[3]["session_id"] == first_anchored
 
 
 @pytest.mark.asyncio
@@ -187,4 +189,78 @@ async def test_mention_routes_by_display_name(harness: dict) -> None:
 
     result = await engine.send_user_message(room.id, "@作家 你来写")
     members_asked = [r["member"] for r in result["replies"] if r["status"] == "ok"]
-    assert members_asked == ["作家"]
+    assert members_asked
+    assert set(members_asked) == {"作家"}
+    assert result["rounds"] == 3
+
+
+@pytest.mark.asyncio
+async def test_pass_settles_the_room_on_a_silent_round(harness: dict) -> None:
+    engine: GroupChatEngine = harness["engine"]
+    backend = harness["backend"]
+    backend.reply = "PASS"
+    room = engine.create_room("r")
+    engine.add_member(room.id, backend="codex", connection="c1", display_name="研究员")
+    result = await engine.send_user_message(room.id, "anyone?")
+    assert result["settled"] == "silent"
+    assert result["rounds"] == 1
+    assert result["replies"][0]["status"] == "pass"
+    assert all(m["sender"] == "user" for m in result["transcript"])
+
+
+@pytest.mark.asyncio
+async def test_at_user_sets_needs_you_and_clears_on_next_say(harness: dict) -> None:
+    engine: GroupChatEngine = harness["engine"]
+    backend = harness["backend"]
+    backend.reply = "This needs a call @user"
+    room = engine.create_room("r")
+    engine.add_member(room.id, backend="codex", connection="c1", display_name="研究员")
+    result = await engine.send_user_message(room.id, "ship it?")
+    assert result["needs_you"] is True
+    listed = engine.list_rooms()
+    assert listed[0]["needs_you"] is True
+    backend.reply = "PASS"
+    again = await engine.send_user_message(room.id, "ship it, I confirm")
+    assert again["needs_you"] is False
+
+
+@pytest.mark.asyncio
+async def test_member_can_pull_a_teammate_into_the_next_round(
+    harness: dict, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from knorvia.services.subagent.types import ConsultResult
+
+    class Scripted:
+        kind = "codex"
+        consults: list[str] = []
+
+        async def consult(self, question, *, on_event, **kwargs):  # noqa: ANN003
+            Scripted.consults.append(question)
+            if "You are 研究员" in question:
+                return ConsultResult(final_text="@作家 please draft", session_id="a")
+            return ConsultResult(final_text="drafting now", session_id="b")
+
+    monkeypatch.setattr("knorvia.services.subagent.get_backend", lambda kind: Scripted())
+    engine: GroupChatEngine = harness["engine"]
+    room = engine.create_room("r")
+    engine.add_member(room.id, backend="codex", connection="c1", display_name="研究员")
+    engine.add_member(room.id, backend="claude_code", connection="c2", display_name="作家")
+    result = await engine.send_user_message(room.id, "@研究员 look")
+    names = [r["member"] for r in result["replies"] if r["status"] == "ok"]
+    assert "研究员" in names
+    assert "作家" in names
+
+
+@pytest.mark.asyncio
+async def test_hard_cap_stops_a_runaway_room(harness: dict, monkeypatch: pytest.MonkeyPatch) -> None:
+    from knorvia.services.partners import group_chat as gc
+
+    monkeypatch.setattr(gc, "MAX_MESSAGES_PER_SEND", 2)
+    engine: GroupChatEngine = harness["engine"]
+    room = engine.create_room("r")
+    engine.add_member(room.id, backend="codex", connection="c1", display_name="A")
+    engine.add_member(room.id, backend="claude_code", connection="c2", display_name="B")
+    result = await engine.send_user_message(room.id, "go")
+    spoken = [r for r in result["replies"] if r["status"] == "ok"]
+    assert len(spoken) == 2
+    assert result["settled"] == "cap"

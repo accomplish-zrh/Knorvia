@@ -1021,6 +1021,63 @@ class SQLiteSessionStore:
             conn.commit()
         return cur.rowcount > 0
 
+
+    def _update_message_sync(
+        self,
+        message_id: int | str,
+        content: str | None,
+        events: list[dict[str, Any]] | None,
+        attachments: list[dict[str, Any]] | None,
+        metadata: dict[str, Any] | None,
+    ) -> bool:
+        now = time.time()
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT id, session_id, content, events_json, attachments_json, metadata_json
+                FROM messages WHERE id = ?
+                """,
+                (int(message_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            new_content = row["content"] if content is None else content
+            new_events = row["events_json"] if events is None else _json_dumps(events)
+            new_attachments = row["attachments_json"] if attachments is None else _json_dumps(attachments)
+            new_metadata = row["metadata_json"] if metadata is None else _json_dumps(metadata)
+            conn.execute(
+                """
+                UPDATE messages
+                SET content = ?, events_json = ?, attachments_json = ?, metadata_json = ?
+                WHERE id = ?
+                """,
+                (new_content, new_events, new_attachments, new_metadata, int(message_id)),
+            )
+            conn.execute(
+                "UPDATE sessions SET updated_at = ? WHERE id = ?",
+                (now, row["session_id"]),
+            )
+            conn.commit()
+        return True
+
+    async def update_message(
+        self,
+        message_id: int | str,
+        *,
+        content: str | None = None,
+        events: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        return await self._run(
+            self._update_message_sync,
+            message_id,
+            content,
+            events,
+            attachments,
+            metadata,
+        )
+
     async def delete_message(self, message_id: int | str) -> bool:
         return await self._run(self._delete_message_sync, message_id)
 

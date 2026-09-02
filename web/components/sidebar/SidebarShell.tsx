@@ -1,7 +1,7 @@
 "use client";
 
-import Image from "next/image";
 import Link from "next/link";
+import BrandMark from "@/components/common/BrandMark";
 import { usePathname, useRouter } from "next/navigation";
 import { useEffect, useState, type ReactNode } from "react";
 import { useAppShell } from "@/context/AppShellContext";
@@ -351,13 +351,7 @@ export function SidebarShell({
             aria-label={t("Knorvia")}
             className="flex items-center justify-center transition-opacity duration-150 group-hover/sb:opacity-0"
           >
-            <Image
-              src="/logo.png"
-              alt={t("Knorvia")}
-              width={22}
-              height={22}
-              className="h-[22px] w-[22px] rounded-md"
-            />
+            <BrandMark size="sm" alt={t("Knorvia")} priority />
           </Link>
           <button
             onClick={() => setCollapsed(false)}
@@ -495,13 +489,12 @@ export function SidebarShell({
         data-sidebar-header="expanded"
         className="flex h-14 items-center justify-between px-4"
       >
-        <Link href="/" className="group flex items-center gap-1.5">
-          <Image
-            src="/logo.png"
+        <Link href="/" className="group flex items-center gap-2">
+          <BrandMark
+            size="md"
             alt={t("Knorvia")}
-            width={22}
-            height={22}
-            className="h-[22px] w-[22px] transition-transform duration-200 group-hover:scale-105"
+            priority
+            className="transition-transform duration-200 group-hover:scale-105"
           />
           <span className="text-[17px] font-semibold tracking-[-0.025em] text-[var(--foreground)] transition-transform duration-200 group-hover:scale-105">
             {t("Knorvia")}

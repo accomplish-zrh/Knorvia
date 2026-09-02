@@ -263,7 +263,12 @@ def _validate_llm_selection_payload(
     try:
         selection = normalize_partner_llm_selection(value)
         if selection:
-            apply_llm_selection_to_catalog(get_model_catalog_service().load(), selection)
+            from knorvia.multi_user.personal_models import merge_personal_llm_profiles
+
+            apply_llm_selection_to_catalog(
+                merge_personal_llm_profiles(get_model_catalog_service().load()),
+                selection,
+            )
         return selection
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from None
@@ -383,6 +388,7 @@ async def get_group_room(room_id: str):
         "room": {
             "id": room.id,
             "name": room.name,
+            "needs_you": bool(room.needs_you),
             "members": [m.to_dict() for m in room.members],
             "messages": [
                 {

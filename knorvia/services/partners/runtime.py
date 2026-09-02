@@ -152,6 +152,10 @@ class PartnerRunner:
             )
             final = f"Sorry, something went wrong while processing your message: {exc}"
         if final:
+            from knorvia.services.partners.group_chat import is_silence_token
+
+            if is_silence_token(final):
+                return
             await self.bus.publish_outbound(
                 OutboundMessage(
                     channel=msg.channel,
@@ -184,6 +188,19 @@ class PartnerRunner:
         when the reply was already delivered live via stream deltas).
         """
         session_key = msg.session_key
+
+        if (msg.metadata or {}).get("_observe_only"):
+            # Hermes group-channel observe: record unmentioned chatter as
+            # context without dispatching a turn or sending a reply.
+            self.store.append(
+                session_key,
+                "user",
+                msg.content,
+                channel=msg.channel,
+                sender_id=msg.sender_id,
+                metadata={"observed": True, **(msg.metadata or {})},
+            )
+            return ""
 
         # /stop must act while the running turn holds the session lock —
         # dispatching it through the lock would make every stop arrive one

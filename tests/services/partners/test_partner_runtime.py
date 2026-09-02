@@ -252,6 +252,29 @@ class TestTurnExecution:
         assert final == "Which topic do you mean?"
 
     @pytest.mark.asyncio
+    async def test_observe_only_appends_without_running_the_loop(
+        self, partners_root, fake_orchestrator
+    ):
+        runner = _runner(partners_root)
+        msg = _msg("sideline chatter")
+        msg.metadata["_observe_only"] = True
+        final = await runner.process_message(msg)
+        assert final == ""
+        assert fake_orchestrator.seen_contexts == []
+        history = runner.store.conversation_history("telegram:42")
+        assert history[0]["role"] == "user"
+        assert history[0]["content"] == "sideline chatter"
+
+    @pytest.mark.asyncio
+    async def test_silence_token_is_not_published_to_the_channel(
+        self, partners_root, fake_orchestrator
+    ):
+        fake_orchestrator.script = _finish("[SILENT]")
+        runner = _runner(partners_root)
+        await runner._handle_inbound(_msg("keep quiet"))
+        assert runner.bus.outbound.empty()
+
+    @pytest.mark.asyncio
     async def test_backup_model_retries_failed_turn(self, partners_root, fake_orchestrator):
         primary = {"profile_id": "p1", "model_id": "m1"}
         backup = {"profile_id": "p2", "model_id": "m2"}

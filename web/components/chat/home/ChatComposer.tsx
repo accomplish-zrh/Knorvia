@@ -232,6 +232,7 @@ export default memo(function ChatComposer({
   onToggleMemoryFile,
   onSend,
   onRemoveAttachment,
+  onClearAttachments,
   onPreviewAttachment,
   onRemoveHistory,
   onRemoveAgent,
@@ -338,6 +339,7 @@ export default memo(function ChatComposer({
   onToggleMemoryFile: (file: SpaceMemoryFile) => void;
   onSend: (content: string) => void;
   onRemoveAttachment: (index: number) => void;
+  onClearAttachments?: () => void;
   onPreviewAttachment?: (index: number) => void;
   onRemoveHistory: (sessionId: string) => void;
   onRemoveAgent: (sessionId: string) => void;
@@ -687,10 +689,10 @@ export default memo(function ChatComposer({
               <div className="flex flex-col items-center gap-1 text-[var(--primary)]">
                 <Paperclip size={22} strokeWidth={1.6} />
                 <span className="text-[13px] font-medium">
-                  {t("Drop files here")}
+                  {t("Attach to this turn only")}
                 </span>
                 <span className="text-[11px] text-[var(--primary)]/70">
-                  {t("Images, Office docs, code & text")}
+                  {t("Not added to a knowledge base. Clear the chips after you ask.")}
                 </span>
               </div>
             </div>
@@ -758,7 +760,16 @@ export default memo(function ChatComposer({
           />
 
           {!!attachments.length && (
-            <div className="flex flex-wrap gap-2 px-4 pb-2">
+            <div className="flex flex-wrap gap-2 px-4 pb-2" data-testid="turn-attachment-chips">
+              {onClearAttachments ? (
+                <button
+                  type="button"
+                  onClick={onClearAttachments}
+                  className="rounded-full border border-[var(--border)] px-2 py-0.5 text-[11px] text-[var(--muted-foreground)] hover:text-[var(--foreground)]"
+                >
+                  {t("Clear attachments")}
+                </button>
+              ) : null}
               {attachments.map((a, i) => {
                 const previewLabel = t("Preview");
                 const removeLabel = t("Remove attachment");

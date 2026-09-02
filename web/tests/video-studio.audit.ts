@@ -918,10 +918,10 @@ test('complete workbench handles model changes, CAS conflicts, confirmation, and
   await page.setViewportSize({ width: 1600, height: 1000 })
   await page.goto('/video-studio')
   await expect(page.getByRole('heading', { name: 'Video Studio' })).toBeVisible()
-  await expect(page.getByText('v1.8.0', { exact: true })).toBeVisible()
+  await expect(page.getByText('v1.0.0', { exact: true })).toBeVisible()
   await expect(page.getByLabel('Video project', { exact: true })).toHaveValue('project-1')
   await expect(page.getByText('Generation queue')).toBeVisible()
-  await page.screenshot({ path: path.join(screenshotDir, 'video-studio-1600-full-v1.8.0.png') })
+  await page.screenshot({ path: path.join(screenshotDir, 'video-studio-1600-full-v1.0.0.png') })
 
   await page.locator('summary[aria-label="Select video model"]').click()
   await page.getByRole('button', { name: /Cinematic Fast/ }).click()
@@ -969,7 +969,7 @@ test('agent deep links open the requested project only when it belongs to the li
   await expect(page.getByLabel('Project title')).toHaveValue('Agent Opened Project')
 })
 
-test('current production build renders the complete workbench in Chinese with the 1.8.0 badge', async ({ page }) => {
+test('current production build renders the complete workbench in Chinese with the 1.0.0 badge', async ({ page }) => {
   await page.addInitScript(() => {
     window.localStorage.setItem('knorvia-language', 'zh')
   })
@@ -977,9 +977,9 @@ test('current production build renders the complete workbench in Chinese with th
   await page.setViewportSize({ width: 1600, height: 1000 })
   await page.goto('/video-studio')
   await expect(page.getByRole('heading', { name: '视频创作' })).toBeVisible()
-  await expect(page.getByText('v1.8.0', { exact: true })).toBeVisible()
+  await expect(page.getByText('v1.0.0', { exact: true })).toBeVisible()
   await expect(page.getByText('生成队列')).toBeVisible()
-  await page.screenshot({ path: path.join(screenshotDir, 'video-studio-1600-zh-v1.8.0.png') })
+  await page.screenshot({ path: path.join(screenshotDir, 'video-studio-1600-zh-v1.0.0.png') })
 })
 
 test('no-model state stays useful at 1366px', async ({ page }) => {

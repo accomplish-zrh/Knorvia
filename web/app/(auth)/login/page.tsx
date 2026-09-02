@@ -5,6 +5,7 @@ import { useRouter, useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useTranslation } from "react-i18next";
 import { login, fetchAuthStatus, checkIsFirstUser } from "@/lib/auth";
+import BrandMark from "@/components/common/BrandMark";
 
 function safeNextPath(raw: string | null): string {
   // Only allow same-site relative paths: reject absolute URLs and
@@ -60,12 +61,12 @@ function LoginPageContent() {
 
   return (
     <div className="w-full max-w-sm">
-      {/* Logo / Title */}
-      <div className="text-center mb-8">
-        <h1 className="font-serif text-2xl font-semibold text-[var(--foreground)] tracking-tight">
+      <div className="mb-8 flex flex-col items-center text-center">
+        <BrandMark size="hero" alt="" priority />
+        <h1 className="mt-4 font-serif text-2xl font-semibold tracking-tight text-[var(--foreground)]">
           {t("Knorvia")}
         </h1>
-        <p className="mt-1 text-sm text-[var(--muted-foreground)]">
+        <p className="mt-1.5 text-sm text-[var(--muted-foreground)]">
           {t("Sign in to your account")}
         </p>
       </div>
@@ -78,7 +79,7 @@ function LoginPageContent() {
       )}
 
       {/* Card */}
-      <div className="bg-[var(--card)] border border-[var(--border)] rounded-2xl shadow-sm px-8 py-8">
+      <div className="chrome-card border border-[var(--border)] bg-[var(--card)] px-8 py-8 shadow-[0_16px_40px_-18px_rgba(28,24,22,0.18)]">
         <form onSubmit={handleSubmit} className="space-y-5">
           {/* Email or username */}
           <div>
@@ -95,11 +96,9 @@ function LoginPageContent() {
               required
               value={username}
               onChange={(e) => setUsername(e.target.value)}
-              className="w-full px-3.5 py-2.5 rounded-lg border border-[var(--border)]
-                         bg-[var(--background)] text-[var(--foreground)]
-                         placeholder:text-[var(--muted-foreground)]
-                         focus:outline-none focus:ring-2 focus:ring-[var(--primary)] focus:border-transparent
-                         transition-shadow text-sm"
+              className="w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3.5 py-2.5
+                         text-sm text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]
+                         transition-shadow focus:border-transparent focus:outline-none focus:ring-2 focus:ring-[var(--ring)]/40"
               placeholder={t("you@example.com")}
             />
           </div>
@@ -119,11 +118,9 @@ function LoginPageContent() {
               required
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              className="w-full px-3.5 py-2.5 rounded-lg border border-[var(--border)]
-                         bg-[var(--background)] text-[var(--foreground)]
-                         placeholder:text-[var(--muted-foreground)]
-                         focus:outline-none focus:ring-2 focus:ring-[var(--primary)] focus:border-transparent
-                         transition-shadow text-sm"
+              className="w-full rounded-xl border border-[var(--border)] bg-[var(--background)] px-3.5 py-2.5
+                         text-sm text-[var(--foreground)] placeholder:text-[var(--muted-foreground)]
+                         transition-shadow focus:border-transparent focus:outline-none focus:ring-2 focus:ring-[var(--ring)]/40"
               placeholder="••••••••"
             />
           </div>
@@ -139,11 +136,10 @@ function LoginPageContent() {
           <button
             type="submit"
             disabled={loading}
-            className="w-full py-2.5 px-4 rounded-lg font-medium text-sm
-                       bg-[var(--primary)] text-[var(--primary-foreground)]
-                       hover:opacity-90 active:opacity-80
-                       disabled:opacity-50 disabled:cursor-not-allowed
-                       transition-opacity"
+            className="w-full rounded-xl bg-[var(--primary)] px-4 py-2.5 text-sm font-medium
+                       text-[var(--primary-foreground)] shadow-md shadow-[var(--primary)]/15
+                       transition-all hover:opacity-90 active:scale-[0.99]
+                       disabled:cursor-not-allowed disabled:opacity-50 disabled:active:scale-100"
           >
             {loading ? t("Signing in…") : t("Sign in")}
           </button>

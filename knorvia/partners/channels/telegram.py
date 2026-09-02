@@ -202,6 +202,8 @@ class TelegramConfig(DeliveryOverrides, StreamingSupport):
     proxy: str | None = None
     reply_to_message: bool = False
     group_policy: Literal["open", "mention"] = "mention"
+    # Hermes: keep unmentioned group lines as observed context, no turn.
+    observe_unmentioned_group_messages: bool = False
     # Outbound API connection pool; long-polling uses its own small pool so
     # getUpdates never starves sends.
     connection_pool_size: int = 16
@@ -908,6 +910,22 @@ class TelegramChannel(BaseChannel):
         self._chat_ids[sender_id] = chat_id
 
         if not await self._is_group_message_for_bot(message):
+            if (
+                message.chat.type != "private"
+                and getattr(self.config, "observe_unmentioned_group_messages", False)
+            ):
+                observed = (message.text or message.caption or "").strip()
+                if observed:
+                    await self._handle_message(
+                        sender_id=sender_id,
+                        chat_id=str(chat_id),
+                        content=observed,
+                        metadata={
+                            "is_group": True,
+                            "_observe_only": True,
+                            "message_id": str(message.message_id),
+                        },
+                    )
             return
 
         # Build content from text and/or media

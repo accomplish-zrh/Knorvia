@@ -218,6 +218,22 @@ class CoWriterStorage:
         self._write(document)
         return document
 
+    def chat_path(self, doc_id: str) -> Path:
+        return self.doc_root(doc_id) / "chat.json"
+
+    def load_chat(self, doc_id: str) -> list[dict[str, Any]]:
+        data = _read_json(self.chat_path(doc_id))
+        if isinstance(data, dict) and isinstance(data.get("messages"), list):
+            return [m for m in data["messages"] if isinstance(m, dict)]
+        if isinstance(data, list):
+            return [m for m in data if isinstance(m, dict)]
+        return []
+
+    def save_chat(self, doc_id: str, messages: list[dict[str, Any]]) -> None:
+        self.ensure_doc_root(doc_id)
+        clipped = messages[-80:]
+        _atomic_write_json(self.chat_path(doc_id), {"messages": clipped})
+
     def delete_document(self, doc_id: str) -> bool:
         root = self.doc_root(doc_id)
         if not root.exists():

@@ -44,6 +44,7 @@ class DiscordConfig(DeliveryOverrides, StreamingSupport):
     gateway_url: str = "wss://gateway.discord.gg/?v=10&encoding=json"
     intents: int = 37377
     group_policy: Literal["mention", "open"] = "mention"
+    observe_unmentioned_group_messages: bool = False
 
 
 class DiscordChannel(BaseChannel):
@@ -411,6 +412,17 @@ class DiscordChannel(BaseChannel):
         # Check group channel policy (DMs always respond if is_allowed passes)
         if guild_id is not None:
             if not self._should_respond_in_group(payload, content):
+                if getattr(self.config, "observe_unmentioned_group_messages", False) and content:
+                    await self._handle_message(
+                        sender_id=sender_id,
+                        chat_id=channel_id,
+                        content=content,
+                        metadata={
+                            "message_id": str(payload.get("id", "")),
+                            "guild_id": guild_id,
+                            "_observe_only": True,
+                        },
+                    )
                 return
 
         content_parts = [content] if content else []

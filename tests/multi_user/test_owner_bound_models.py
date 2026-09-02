@@ -47,7 +47,12 @@ def test_owner_bound_profile_is_withheld_from_granted_users(tmp_path, monkeypatc
     token = set_current_user(make_user(tmp_path))
     try:
         assert model_access.redacted_model_access()["llm"] == []
-        assert model_access.allowed_llm_options()["options"] == []
+        granted = [
+            o
+            for o in model_access.allowed_llm_options()["options"]
+            if o.get("source") != "local"
+        ]
+        assert granted == []
         assert model_access.has_capability_access("llm") is False
         with pytest.raises(PermissionError):
             model_access.apply_allowed_llm_selection(
@@ -87,6 +92,19 @@ def test_ordinary_shared_profiles_stay_grantable(tmp_path, monkeypatch):
         assert model_access.apply_allowed_llm_selection(
             {"profile_id": CODEX_PROFILE, "model_id": "m-sol"}
         ) == {"profile_id": CODEX_PROFILE, "model_id": "m-sol"}
+    finally:
+        reset_current_user(token)
+
+
+def test_apply_allowed_llm_selection_allows_local_runtime(tmp_path):
+    token = set_current_user(make_user(tmp_path))
+    try:
+        assert model_access.apply_allowed_llm_selection(
+            {"profile_id": "__local_ollama", "model_id": "llama3.2"}
+        ) == {"profile_id": "__local_ollama", "model_id": "llama3.2"}
+        assert model_access.apply_allowed_llm_selection(
+            {"profile_id": "__local_lmstudio", "model_id": "gemma-2-9b"}
+        ) == {"profile_id": "__local_lmstudio", "model_id": "gemma-2-9b"}
     finally:
         reset_current_user(token)
 

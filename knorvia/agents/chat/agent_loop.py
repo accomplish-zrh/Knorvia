@@ -538,6 +538,7 @@ class AgentLoop:
             result.text,
             visible_text=result.visible_text,
             continued_answer_parts=continued_answer_parts,
+            finish_reason=result.finish_reason,
         )
 
     async def _finalize_finish(
@@ -546,6 +547,7 @@ class AgentLoop:
         *,
         visible_text: str | None = None,
         continued_answer_parts: list[str] | None = None,
+        finish_reason: str = "",
     ) -> LoopOutcome:
         cleaned_text = self._clean(raw_text)
         if continued_answer_parts:
@@ -555,6 +557,16 @@ class AgentLoop:
             )
         else:
             final_text = cleaned_text
+        if _finish_was_truncated(finish_reason):
+            await self.stream.progress(
+                self.pipeline._t(
+                    "notices.output_still_truncated",
+                    default="The reply is still incomplete. You can continue writing.",
+                ),
+                source="chat",
+                stage=LOOP_STAGE,
+                metadata={"output_truncated": True, "finish_reason": finish_reason},
+            )
         if not final_text:
             # The finish round produced no usable text; nothing streamed to
             # the user, so emit a fallback answer here.
@@ -797,12 +809,18 @@ class AgentLoop:
         stage: str,
     ) -> Any:
         try:
-            return await self.client.chat.completions.create(**kwargs)
+            from knorvia.services.llm.transient import retry_transient
+
+            return await retry_transient(
+                lambda: self.client.chat.completions.create(**kwargs)
+            )
         except Exception as exc:
             if "stream_options" in kwargs and is_stream_options_unsupported(exc):
                 retry_kwargs = dict(kwargs)
                 retry_kwargs.pop("stream_options", None)
-                return await self.client.chat.completions.create(**retry_kwargs)
+                return await retry_transient(
+                    lambda: self.client.chat.completions.create(**retry_kwargs)
+                )
             if kwargs.get("tools") and is_tool_schema_unsupported(exc):
                 await self.stream.progress(
                     self.pipeline._t(
@@ -820,7 +838,9 @@ class AgentLoop:
                 retry_kwargs.pop("tools", None)
                 retry_kwargs.pop("tool_choice", None)
                 self.tool_schemas = None
-                return await self.client.chat.completions.create(**retry_kwargs)
+                return await retry_transient(
+                    lambda: self.client.chat.completions.create(**retry_kwargs)
+                )
             if is_image_input_unsupported(exc) and should_degrade_to_text(
                 self.pipeline.binding,
                 self.pipeline.model,
@@ -839,7 +859,9 @@ class AgentLoop:
                         {"trace_kind": "warning", "image_fallback": True},
                     ),
                 )
-                return await self.client.chat.completions.create(**kwargs)
+                return await retry_transient(
+                    lambda: self.client.chat.completions.create(**kwargs)
+                )
             raise
 
 

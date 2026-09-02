@@ -366,6 +366,37 @@ class PocketBaseSessionStore:
             logger.warning(f"add_message failed: {exc}")
             return 0
 
+
+    async def update_message(
+        self,
+        message_id: int | str,
+        *,
+        content: str | None = None,
+        events: list[dict[str, Any]] | None = None,
+        attachments: list[dict[str, Any]] | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> bool:
+        def _update():
+            payload: dict[str, Any] = {}
+            if content is not None:
+                payload["content"] = content
+            if events is not None:
+                payload["events_json"] = events
+            if attachments is not None:
+                payload["attachments_json"] = attachments
+            if metadata is not None:
+                payload["metadata_json"] = metadata
+            if not payload:
+                return True
+            _pb().collection("messages").update(str(message_id), payload)
+            return True
+
+        try:
+            return await asyncio.to_thread(_update)
+        except Exception as exc:
+            logger.warning(f"update_message failed: {exc}")
+            return False
+
     async def delete_message(self, message_id: int | str) -> bool:
         def _delete():
             _pb().collection("messages").delete(str(message_id))

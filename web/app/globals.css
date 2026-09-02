@@ -130,6 +130,15 @@
     scrollbar-color: var(--border) transparent;
   }
 
+  ::selection {
+    background: color-mix(in srgb, #8fd4c8 42%, transparent);
+    color: var(--foreground);
+  }
+
+  html.dark ::selection {
+    background: color-mix(in srgb, #8fd4c8 28%, transparent);
+  }
+
   html,
   body {
     height: 100%;
@@ -281,18 +290,6 @@
   /* Home keeps atmosphere; denser task views add a readability wash. */
   html[data-wallpaper-scene="work"] [data-wallpaper-layer] {
     box-shadow: inset 0 0 0 100vmax color-mix(in srgb, #12100e 18%, transparent);
-  }
-
-  /* The photo owns the whole window: the sidebar rail turns into a translucent
-     wash so the wallpaper reads through it instead of stopping at the content. */
-  html[data-wallpaper] aside[data-app-sidebar] {
-    background-color: color-mix(in srgb, var(--secondary) 58%, transparent);
-  }
-
-  html[data-wallpaper][data-window-frost] aside,
-  html[data-wallpaper][data-window-frost] .surface-card {
-    backdrop-filter: blur(18px) saturate(1.3);
-    -webkit-backdrop-filter: blur(18px) saturate(1.3);
   }
 
   button,
@@ -704,6 +701,36 @@
   animation: fade-in 0.35s ease-out forwards;
 }
 
+/* Glass app icon: 22% radius matches the squircle; the hairline keeps a
+   white plate visible on cream rails and dark chrome. */
+.brand-mark {
+  border-radius: 22%;
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, var(--foreground) 10%, transparent),
+    0 1px 2px color-mix(in srgb, var(--foreground) 7%, transparent);
+}
+
+/* Shared overlay / auth card radius (~20px). */
+.chrome-card {
+  border-radius: 20px;
+}
+html.dark .brand-mark {
+  box-shadow:
+    0 0 0 1px color-mix(in srgb, #fff 16%, transparent),
+    0 2px 8px rgb(0 0 0 / 38%);
+}
+
+.auth-aura {
+  background:
+    radial-gradient(ellipse 72% 48% at 50% 40%, rgba(143, 212, 200, 0.2), transparent 62%),
+    radial-gradient(ellipse 52% 42% at 68% 62%, rgba(183, 182, 227, 0.16), transparent 58%);
+}
+html.dark .auth-aura {
+  background:
+    radial-gradient(ellipse 72% 48% at 50% 40%, rgba(143, 212, 200, 0.1), transparent 62%),
+    radial-gradient(ellipse 52% 42% at 68% 62%, rgba(183, 182, 227, 0.12), transparent 58%);
+}
+
 /* Picker chrome: a soft scrim fade + a small spring-in for the card, so
    modal pickers feel placed rather than popped. */
 @keyframes dt-overlay-in {
@@ -1018,8 +1045,35 @@ html[data-window-frost] .surface-card {
   background-clip: padding-box;
 }
 
-html[data-desktop-chrome][data-window-frost] aside {
+/* Wallpaper mode owns the rail itself (wash below), so this frost-only plate
+   steps aside for it. */
+html[data-desktop-chrome][data-window-frost]:not([data-wallpaper]) aside {
   background-color: var(--secondary);
+}
+
+/* The photo owns the whole window: the sidebar rail and the right panel turn
+   into translucent washes so the wallpaper reads through them instead of
+   stopping at the content. Deliberately unlayered — inside `@layer base` the
+   rule loses to the bg-[var(--secondary)] / bg-[var(--card)] utilities on the
+   same elements whenever cascade layers are honored (dev builds keep them),
+   which is exactly how the rails ended up opaque over the wallpaper. */
+html[data-wallpaper] aside[data-app-sidebar],
+html[data-wallpaper] [data-app-panel],
+html[data-wallpaper] [data-app-panel-tabbar] {
+  background-color: color-mix(in srgb, var(--secondary) 58%, transparent);
+}
+
+/* The panel shell provides the wash; the opaque full-size plate behind the
+   tab body would cover it again. */
+html[data-wallpaper] [data-app-panel-body] {
+  background-color: transparent;
+}
+
+html[data-wallpaper][data-window-frost] aside,
+html[data-wallpaper][data-window-frost] [data-app-panel],
+html[data-wallpaper][data-window-frost] .surface-card {
+  backdrop-filter: blur(18px) saturate(1.3);
+  -webkit-backdrop-filter: blur(18px) saturate(1.3);
 }
 
 html[data-window-frost] .prose {

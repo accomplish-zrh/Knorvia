@@ -4,5 +4,5 @@ title: "Knorvia"
 type: software
 authors:
   - name: "Knorvia contributors"
-version: 1.9.0-dev
+version: 1.0.0
 license: Apache-2.0

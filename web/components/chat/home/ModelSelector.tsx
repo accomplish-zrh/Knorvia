@@ -7,6 +7,7 @@ import { useLingerExpand } from "@/hooks/use-linger-expand";
 import ProviderIcon from "@/components/common/ProviderIcon";
 import type { LLMSelection } from "@/lib/unified-ws";
 import {
+  groupLLMOptionsByProvider,
   llmSelectionKey,
   sameLLMSelection,
   type LLMOption,
@@ -112,6 +113,7 @@ export default function ModelSelector({
   systemDefaultDetail,
   helperText,
   placement = "top",
+  alwaysShowLabel = false,
   onChange,
 }: {
   options: LLMOption[];
@@ -124,12 +126,16 @@ export default function ModelSelector({
   systemDefaultDetail?: string;
   helperText?: string;
   placement?: "top" | "bottom";
+  alwaysShowLabel?: boolean;
   onChange: (selection: LLMSelection | null) => void;
 }) {
   const { t } = useTranslation();
   const [open, setOpen] = useState(false);
   const rootRef = useRef<HTMLDivElement>(null);
-  const { expanded, linger, triggerProps: lingerProps } = useLingerExpand(open);
+  const lingerState = useLingerExpand(open);
+  const expanded = alwaysShowLabel ? true : lingerState.expanded;
+  const linger = lingerState.linger;
+  const lingerProps = alwaysShowLabel ? {} : lingerState.triggerProps;
 
   const selectedSelection = allowSystemDefault
     ? value
@@ -260,25 +266,32 @@ export default function ModelSelector({
                 )}
               </button>
             )}
-            {options.map((option) => {
-              const optionSelection = {
-                profile_id: option.profile_id,
-                model_id: option.model_id,
-              };
-              const optionKey = llmSelectionKey(optionSelection);
-              return (
-                <ModelOptionRow
-                  key={optionKey}
-                  option={option}
-                  selected={optionKey === selectedKey}
-                  onSelect={() => {
-                    onChange(optionSelection);
-                    setOpen(false);
-                    linger();
-                  }}
-                />
-              );
-            })}
+            {groupLLMOptionsByProvider(options).map((group) => (
+              <div key={`${group.provider}:${group.label}`}>
+                <div className="px-3 pb-0.5 pt-1.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--muted-foreground)]">
+                  {group.label}
+                </div>
+                {group.options.map((option) => {
+                  const optionSelection = {
+                    profile_id: option.profile_id,
+                    model_id: option.model_id,
+                  };
+                  const optionKey = llmSelectionKey(optionSelection);
+                  return (
+                    <ModelOptionRow
+                      key={optionKey}
+                      option={option}
+                      selected={optionKey === selectedKey}
+                      onSelect={() => {
+                        onChange(optionSelection);
+                        setOpen(false);
+                        linger();
+                      }}
+                    />
+                  );
+                })}
+              </div>
+            ))}
           </div>
         </div>
       )}

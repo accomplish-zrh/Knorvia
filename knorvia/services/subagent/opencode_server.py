@@ -104,8 +104,11 @@ async def _spawn(cli_command: str, *, cwd: str, env_prefix: str, username: str) 
             f"{env_prefix}_SERVER_USERNAME": username,
         }
     )
+    from knorvia.services.subagent.detect_fallback import resolve_cli_command
+
+    resolved = resolve_cli_command(cli_command) or cli_command
     process = await asyncio.create_subprocess_exec(
-        cli_command,
+        resolved,
         "serve",
         "--port",
         str(port),

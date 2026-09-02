@@ -101,7 +101,11 @@ def test_signed_in_user_sees_their_own_codex_models(as_user, monkeypatch, no_gra
         ]
         # The option list, the gate, and selection validation all read that
         # same function, so a personal model works end to end without a grant.
-        options = model_access.allowed_llm_options()["options"]
+        options = [
+            o
+            for o in model_access.allowed_llm_options()["options"]
+            if o.get("source") != "local"
+        ]
         assert [(o["model_id"], o["source"]) for o in options] == [("m-sol", "personal")]
         assert model_access.has_capability_access("llm") is True
         assert model_access.apply_allowed_llm_selection(

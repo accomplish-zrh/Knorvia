@@ -7,15 +7,17 @@ import {
   useEffect,
   useState,
 } from "react";
-import Image from "next/image";
 import Link from "next/link";
-import { usePathname } from "next/navigation";
+import BrandMark from "@/components/common/BrandMark";
+import { usePathname, useRouter } from "next/navigation";
 import { Menu, WifiOff } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useDevice } from "@/hooks/useDevice";
 import CommandPalette, {
   useCommandPaletteHotkey,
-} from "@/components/common/CommandPalette"
+} from "@/components/common/CommandPalette";
+import KeyboardCheatsheet from "@/components/common/KeyboardCheatsheet"
+import { matchChatShortcut } from "@/lib/keyboard-cheatsheet"
 import type { ReactNode } from "react";
 
 /* Lets the sidebar dismiss the drawer after a nav click without every layout
@@ -53,10 +55,48 @@ interface AppShellProps {
 export default function AppShell({ sidebar, children }: AppShellProps) {
   const { t } = useTranslation();
   const pathname = usePathname();
+  const router = useRouter();
   const { isMobile } = useDevice();
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [paletteOpen, setPaletteOpen] = useState(false);
+  const [cheatSheetOpen, setCheatSheetOpen] = useState(false);
   useCommandPaletteHotkey(useCallback(() => setPaletteOpen(true), []));
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      const action = matchChatShortcut(event);
+      if (!action) return;
+      if (action === "cheatsheet") {
+        event.preventDefault();
+        setCheatSheetOpen((open) => !open);
+        return;
+      }
+      if (action === "new-chat") {
+        event.preventDefault();
+        setCheatSheetOpen(false);
+        router.push("/home");
+        window.dispatchEvent(new Event("knorvia:new-chat"));
+        return;
+      }
+      if (action === "stop-generation") {
+        if (cheatSheetOpen) {
+          event.preventDefault();
+          setCheatSheetOpen(false);
+          return;
+        }
+        if (drawerOpen) return;
+        event.preventDefault();
+        window.dispatchEvent(new Event("knorvia:stop-generation"));
+        return;
+      }
+      if (action === "retry") {
+        event.preventDefault();
+        window.dispatchEvent(new Event("knorvia:retry"));
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [cheatSheetOpen, drawerOpen, router]);
   // Offline banner: navigator.onLine + a manual probe, because the browser
   // event alone misses "connected to WiFi but no internet" cases.
   const [offline, setOffline] = useState(false);
@@ -144,14 +184,8 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
             >
               <Menu size={18} strokeWidth={1.7} />
             </button>
-            <Link href="/" className="flex items-center gap-1.5">
-              <Image
-                src="/logo.png"
-                alt={t("Knorvia")}
-                width={20}
-                height={20}
-                className="h-5 w-5"
-              />
+            <Link href="/" className="flex items-center gap-2">
+              <BrandMark size="sm" alt={t("Knorvia")} priority />
               <span className="text-[15px] font-semibold tracking-[-0.02em] text-[var(--foreground)]">
                 {t("Knorvia")}
               </span>
@@ -162,6 +196,7 @@ export default function AppShell({ sidebar, children }: AppShellProps) {
         </main>
         </div>
         <CommandPalette open={paletteOpen} onClose={() => setPaletteOpen(false)} />
+        <KeyboardCheatsheet open={cheatSheetOpen} onClose={() => setCheatSheetOpen(false)} />
       </div>
     </SidebarDrawerContext.Provider>
   );

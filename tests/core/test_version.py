@@ -22,8 +22,8 @@ def test_version_matches_source_of_truth() -> None:
 
 
 def test_version_is_a_release_number() -> None:
-    # Release freeze pin for the current cycle: 1.9.0-dev (stabilization).
+    # Release freeze pin for the current cycle: 1.0.0.
     # Interim builds must never ride a shipped release's name — see
     # docs/MAINTENANCE.md "Release discipline". Bump this pin together with
     # knorvia/__version__.py, desktop/package.json and CITATION.cff.
-    assert knorvia.__version__ == "1.9.0-dev"
+    assert knorvia.__version__ == "1.0.0"

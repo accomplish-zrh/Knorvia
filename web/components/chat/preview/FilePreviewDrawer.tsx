@@ -146,6 +146,7 @@ export default function FilePreviewDrawer({
   return (
     <div
       role="dialog"
+      data-app-panel=""
       aria-hidden={!visible}
       aria-label={t("File preview: {{name}}", { name: filename })}
       // Full-screen sheet below the drawer breakpoint, matching
@@ -169,7 +170,7 @@ export default function FilePreviewDrawer({
       {renderedSource && (
         <>
           {/* Header */}
-          <div className="flex items-center gap-2 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3">
+          <div data-app-panel-body="" className="flex items-center gap-2 border-b border-[var(--border)] bg-[var(--card)] px-4 py-3">
             <div className="flex h-9 w-9 shrink-0 items-center justify-center rounded-md bg-[var(--muted)]/60">
               <HeaderIcon size={18} strokeWidth={1.5} className={spec.tint} />
             </div>

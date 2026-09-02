@@ -45,6 +45,7 @@ import {
 import { extractVisualizeResult } from '@/lib/visualize-types'
 import type { StreamEvent } from '@/lib/unified-ws'
 import { hasVisibleMarkdownContent } from '@/lib/markdown-display'
+import { isTruncatedAssistantMessage } from '@/lib/continue-write'
 import type { SelectedBookReference } from '@/lib/book-references'
 import { buildVisiblePath, type SiblingInfo } from '@/lib/message-branches'
 import { turnAnchorKey } from '@/lib/chat-outline'
@@ -1126,6 +1127,7 @@ export const ChatMessageList = memo(function ChatMessageList({
   language,
   onCopyAssistantMessage,
   onRegenerateMessage,
+  onContinueMessage,
   onConfirmOutline,
   onPreviewAttachment,
   onDeleteTurn,
@@ -1140,6 +1142,7 @@ export const ChatMessageList = memo(function ChatMessageList({
   language?: string
   onCopyAssistantMessage: (content: string) => void | Promise<void>
   onRegenerateMessage: () => void
+  onContinueMessage?: () => void
   onConfirmOutline?: (
     outline: Array<{ title: string; overview: string }>,
     topic: string,
@@ -1377,6 +1380,10 @@ export const ChatMessageList = memo(function ChatMessageList({
           isLastAssistant &&
           Boolean(pairedUserMessage) &&
           (!pairedUserMessage?.capability || pairedUserMessage?.capability === 'chat')
+        const showContinue =
+          showRegenerate &&
+          Boolean(onContinueMessage) &&
+          isTruncatedAssistantMessage(msg)
         const deletableTurnUserId =
           msgDone && pairedUserMessage?.id != null && onDeleteTurn ? pairedUserMessage.id : null
         const showDelete = deletableTurnUserId != null
@@ -1468,6 +1475,13 @@ export const ChatMessageList = memo(function ChatMessageList({
                         icon={RefreshCcw}
                         label={t('Regenerate')}
                         onClick={() => onRegenerateMessage()}
+                      />
+                    )}
+                    {showActions && showContinue && (
+                      <RoughActionButton
+                        icon={Pencil}
+                        label={t('Continue writing')}
+                        onClick={() => onContinueMessage?.()}
                       />
                     )}
                     {showDelete && (

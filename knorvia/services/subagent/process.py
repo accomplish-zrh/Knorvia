@@ -93,6 +93,18 @@ def validate_subagent_cwd(cwd: str | None) -> str:
     return str(assert_path_allowed(raw))
 
 
+def _resolve_cmd(cmd: Sequence[str]) -> list[str]:
+    """Resolve argv[0] through PATH / PATHEXT / known install fallbacks."""
+    if not cmd:
+        return []
+    from knorvia.services.subagent.detect_fallback import resolve_cli_command
+
+    resolved = resolve_cli_command(str(cmd[0]))
+    if not resolved:
+        return list(cmd)
+    return [resolved, *[str(part) for part in cmd[1:]]]
+
+
 async def stream_process_lines(
     cmd: Sequence[str],
     *,
@@ -106,8 +118,9 @@ async def stream_process_lines(
     arrival order via a shared queue.
     """
     full_env = subagent_environment(env)
+    argv = _resolve_cmd(cmd)
     process = await asyncio.create_subprocess_exec(
-        *cmd,
+        *argv,
         cwd=cwd or None,
         env=full_env,
         stdin=asyncio.subprocess.DEVNULL,
@@ -198,9 +211,16 @@ async def probe_version(cmd: Sequence[str], *, timeout: float = 8.0) -> tuple[bo
     Used by backend ``detect`` to answer "is this CLI installed here?" without
     the no-timeout consult semantics — a probe that hangs is a failed probe.
     """
+    from knorvia.services.subagent.detect_fallback import resolve_cli_command
+
+    if not cmd:
+        return False, "not installed"
+    if resolve_cli_command(str(cmd[0])) is None:
+        return False, "not installed"
+    argv = _resolve_cmd(cmd)
     try:
         process = await asyncio.create_subprocess_exec(
-            *cmd,
+            *argv,
             stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,

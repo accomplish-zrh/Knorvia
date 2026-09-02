@@ -368,6 +368,7 @@ from knorvia.api.routers import (
     unified_ws,
     video_studio,
     voice,
+    workspace_bundle,
 )
 from knorvia.api.routers import (
     tools as tools_router,
@@ -503,6 +504,12 @@ app.include_router(
 )
 app.include_router(
     personas.router, prefix="/api/v1/personas", tags=["personas"], dependencies=_auth
+)
+app.include_router(
+    workspace_bundle.router,
+    prefix="/api/v1/workspace",
+    tags=["workspace"],
+    dependencies=_auth,
 )
 app.include_router(tools_router.router, prefix="/api/v1/tools", tags=["tools"], dependencies=_auth)
 app.include_router(cron.router, prefix="/api/v1/cron", tags=["cron"], dependencies=_auth)

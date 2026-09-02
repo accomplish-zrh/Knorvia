@@ -25,6 +25,7 @@ import { listPersonas } from "@/lib/personas-api";
 import { listClassrooms } from "@/lib/classroom-api";
 import { listSkills } from "@/lib/skills-api";
 import { fetchAllProgress } from "@/lib/learning-api";
+import WorkspaceBundleCard from "@/components/space/WorkspaceBundleCard";
 
 /**
  * Learning Space dashboard — the hub of `/space`.
@@ -246,6 +247,10 @@ export default function SpaceDashboard() {
           })}
         </p>
       </header>
+
+      <div className="mb-8">
+        <WorkspaceBundleCard />
+      </div>
 
       <div className="space-y-9">
         {GROUPS.map((group) => (

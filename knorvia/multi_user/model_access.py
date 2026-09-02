@@ -282,7 +282,15 @@ def allowed_llm_options() -> dict[str, Any]:
         for item in redacted_model_access(user.id).get("llm", [])
         if item.get("available")
     ]
-    return {"active": None, "options": options}
+    # Loopback runtimes are machine-local, not grant-assigned. Merge them so a
+    # non-admin picker still matches what apply_llm_selection_to_catalog accepts.
+    from knorvia.services.model_selection.local_models import (
+        merge_local_options,
+        probe_loaded_local_models,
+    )
+
+    local = [{**item, "source": "local"} for item in probe_loaded_local_models()]
+    return {"active": None, "options": merge_local_options(options, local)}
 
 
 def has_capability_access(capability: str, user_id: str | None = None) -> bool:
@@ -308,6 +316,10 @@ def apply_allowed_llm_selection(selection: dict[str, Any] | None) -> dict[str, A
         return selection
     profile_id = str(selection.get("profile_id") or "")
     model_id = str(selection.get("model_id") or "")
+    from knorvia.services.model_selection.local_models import is_local_profile_id
+
+    if is_local_profile_id(profile_id) and model_id:
+        return selection
     for item in redacted_model_access(user.id).get("llm", []):
         if item.get("profile_id") == profile_id and item.get("model_id") == model_id:
             return selection

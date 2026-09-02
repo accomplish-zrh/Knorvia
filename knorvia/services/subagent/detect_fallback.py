@@ -17,32 +17,49 @@ from pathlib import Path
 from typing import Callable
 
 
+def _windows_shim_names(cli_command: str) -> list[str]:
+    """Windows npm/global shims: bare name, .cmd, .exe, .ps1 (CreateProcess needs one)."""
+    if os.name != "nt":
+        return [cli_command]
+    names = [cli_command]
+    for suffix in (".cmd", ".exe", ".ps1", ".bat"):
+        names.append(f"{cli_command}{suffix}")
+    return names
+
+
 def _candidate_paths(cli_command: str) -> list[Path]:
     """Documented per-user install locations for the known agent CLIs."""
     home = Path.home()
     appdata = os.environ.get("LOCALAPPDATA", "")
     appdata_roaming = os.environ.get("APPDATA", "")
-    ext = ".exe" if os.name == "nt" else ""
+    npm = Path(appdata_roaming) / "npm" if appdata_roaming else None
+
+    def npm_shims(name: str) -> list[Path]:
+        if npm is None:
+            return []
+        return [npm / shim for shim in _windows_shim_names(name)]
+
+    def bin_shims(root: Path, name: str) -> list[Path]:
+        if os.name == "nt":
+            return [root / shim for shim in _windows_shim_names(name)]
+        return [root / name]
+
     candidates: dict[str, list[Path]] = {
-        "claude": [home / ".local" / "bin" / f"claude{ext}"],
+        "claude": bin_shims(home / ".local" / "bin", "claude"),
         "codex": [
-            Path(appdata_roaming) / "npm" / f"codex{ext}" if appdata_roaming else None,
-            home / ".codex" / "bin" / f"codex{ext}",
+            *npm_shims("codex"),
+            *bin_shims(home / ".codex" / "bin", "codex"),
         ],
-        "gemini": [
-            Path(appdata_roaming) / "npm" / f"gemini{ext}" if appdata_roaming else None,
-        ],
-        "grok": [home / ".grok" / "bin" / f"grok{ext}"],
-        "kimi": [home / ".kimi" / "bin" / f"kimi{ext}"],
+        "gemini": npm_shims("gemini"),
+        "grok": bin_shims(home / ".grok" / "bin", "grok"),
+        "kimi": bin_shims(home / ".kimi" / "bin", "kimi"),
         "opencode": [
-            Path(appdata) / "opencode" / "bin" / f"opencode{ext}" if appdata else None,
-            home / ".opencode" / "bin" / f"opencode{ext}",
+            *(bin_shims(Path(appdata) / "opencode" / "bin", "opencode") if appdata else []),
+            *bin_shims(home / ".opencode" / "bin", "opencode"),
         ],
-        "mimo": [
-            Path(appdata_roaming) / "npm" / f"mimo{ext}" if appdata_roaming else None,
-        ],
+        "mimo": npm_shims("mimo"),
     }
-    return [p for p in candidates.get(cli_command, []) if p]
+    return list(candidates.get(cli_command, []))
 
 
 def find_cli_fallback(cli_command: str) -> str | None:
@@ -54,6 +71,28 @@ def find_cli_fallback(cli_command: str) -> str | None:
         except OSError:
             continue
     return None
+
+
+def resolve_cli_command(cli_command: str) -> str | None:
+    """Resolve a CLI name to something ``CreateProcess`` / exec can launch.
+
+    On Windows, bare names like ``codex`` often only exist as ``codex.cmd``
+    npm shims. ``asyncio.create_subprocess_exec('codex', …)`` does not apply
+    ``PATHEXT``, so detection and consult both fail unless we resolve first.
+    """
+    name = str(cli_command or "").strip()
+    if not name:
+        return None
+    # Absolute / relative path the caller already resolved.
+    path = Path(name)
+    if path.is_file():
+        return str(path)
+    import shutil
+
+    found = shutil.which(name)
+    if found:
+        return found
+    return find_cli_fallback(name)
 
 
 def enhanced_detail(

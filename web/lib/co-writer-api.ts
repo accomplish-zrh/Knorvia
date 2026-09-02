@@ -83,6 +83,44 @@ export async function updateCoWriterDocument(
   return jsonOrThrow<CoWriterDocument>(res);
 }
 
+export interface CoWriterCitation {
+  title: string;
+  source?: string;
+  content?: string;
+}
+
+export interface CoWriterChatMessage {
+  role: "user" | "assistant" | string;
+  content: string;
+  citations?: CoWriterCitation[];
+}
+
+export async function getCoWriterChat(
+  docId: string,
+): Promise<CoWriterChatMessage[]> {
+  const res = await apiFetch(
+    apiUrl(`${BASE}/documents/${encodeURIComponent(docId)}/chat`),
+    { cache: "no-store" },
+  );
+  const data = await jsonOrThrow<{ messages: CoWriterChatMessage[] }>(res);
+  return Array.isArray(data?.messages) ? data.messages : [];
+}
+
+export async function postCoWriterChat(
+  docId: string,
+  message: string,
+): Promise<{ message: CoWriterChatMessage; messages: CoWriterChatMessage[] }> {
+  const res = await apiFetch(
+    apiUrl(`${BASE}/documents/${encodeURIComponent(docId)}/chat`),
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ message }),
+    },
+  );
+  return jsonOrThrow(res);
+}
+
 export async function deleteCoWriterDocument(docId: string): Promise<boolean> {
   const res = await apiFetch(
     apiUrl(`${BASE}/documents/${encodeURIComponent(docId)}`),

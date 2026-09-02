@@ -70,6 +70,7 @@
   "Reload 3D Director Desk": "Reload White-model Previs",
   "Remove objects": "Remove",
   "Remove reference": "Remove",
+  "Restored conversations, notes, and outlines": "Restored {{conversations}} conversations, {{notes}} notes, {{outlines}} outlines",
   "Retry generation": "Retry",
   "Saving director desk…": "Saving white-model previs…",
   "Scene reference image": "Scene reference background",
@@ -355,5 +356,9 @@
   "user_note": "user note",
   "video_to_video": "Video to video",
   "{{count}} round_one": "{{count}} round",
-  "{{count}} round_other": "{{count}} rounds"
+  "{{count}} round_other": "{{count}} rounds",
+  "代码作业": "Coding homework",
+  "复习提纲": "Review outline",
+  "组会纪要": "Lab meeting notes",
+  "论文开题": "Thesis proposal"
 }

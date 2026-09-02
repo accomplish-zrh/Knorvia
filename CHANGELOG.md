@@ -7,7 +7,36 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+- **GitHub deployment (2026-09-02)**: repo gains a `origin` remote and is
+  published for auto-update pulls. Pre-publish gates all green (pytest
+  4552 passed / 43 skipped, ruff, eslint, i18n parity, tsc, route budgets,
+  architecture guard). Size-guard pins raised for turn_runtime (2350),
+  co-writer page (2580), home shell (2410). `scripts/_apply_v100_*`,
+  `scripts/_peek.py`, `scripts/_retry_nsis*` and `release-pack/` are now
+  gitignored (one-shot migration scripts / packaging scratch). Setup.exe +
+  portable.zip + SHA256SUMS ship as GitHub Release assets, rebuilt from the
+  tagged commit.
+
+### Fixed
+- `ShortcutCheatsheet` leaked a literal `Esc` into JSX (eslint
+  `i18n/no-literal-ui-text`); wrapped in `t()` (词条 both locales 已有)。
+- Import ordering in new v1.0.0 modules (ruff I001 ×20, auto-fixed).
+
 ### Added
+
+- **Hermes-style group rooms**: after you speak, a room runs up to three
+  serial rounds. @named members answer (everyone, when nobody is named);
+  a member may pass (`PASS` / `[SILENT]`) or pull a teammate with `@Name`.
+  `@user` raises a **Needs you** badge on the roster. Hard caps: 10 spoken
+  replies per send, 3 rounds. IM group channels can *observe* unmentioned
+  chatter without dispatching a turn (`observe_unmentioned_group_messages`
+  on Telegram/Discord); a `[SILENT]` final reply is kept off the wire.
+
+## [1.0.0] — glass mark, classroom, and stabilization
+
+### Added
+- **Local chat UX**: truncated replies offer 「继续写」 on the same assistant bubble; 502/timeout auto-retries twice before the existing Retry button; already-loaded Ollama (`:11434`) and LM Studio (`:1234`) models appear in the top-bar switcher (no download/store); `?` opens a shortcut cheatsheet, plus Ctrl+N new chat, Esc stop generation, and Ctrl+R retry (Ctrl+K unchanged).
 
 - **Library offline conversion toolbox (flyingmouse-format inspired)** —
   design ideas absorbed from LaoFeng's FlyingMouse Format (non-commercial
@@ -41,8 +70,6 @@ and versioning follows [Semantic Versioning](https://semver.org/).
   no repeat speakers, client-held state, abort-safe). Surfaces:
   `knorvia/services/classroom/`, `/api/v1/classroom`, 学习空间 → AI 课堂.
 
-## [1.9.0-dev] — stabilization
-
 ### Security
 
 - **Dependency security sweep**:
@@ -62,9 +89,24 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ### Changed
 
-- **Version discipline**: the tree moves to `1.9.0-dev` — the shipped 1.8.0
-  name is no longer used for interim builds; installers are only built from
-  clean commits (see `docs/MAINTENANCE.md`).
+- **App icon**: the book-and-K mark is replaced by a glass folded-K
+  squircle everywhere the product identity shows — desktop installer /
+  window / tray (`desktop/build/icon.ico`, `logo.png`), web logo and
+  favicons (`web/public/logo.png`, `logo_black.png`, `favicon-16x16.png`,
+  `favicon-32x32.png`, `favicon.ico`, `apple-touch-icon.png`, `banner.png`),
+  and the source brand set under `assets/figs/logo/`.
+- **Boot splash v4**: the entrance animation is restaged around the glass
+  mark — mint/lavender aura, squircle hairline, one diagonal sheen —
+  kept in lockstep between `web/components/common/BootSplash.tsx` and
+  the desktop loading page.
+- **UI chrome polish**: a shared `BrandMark` (hairline ring so the glass
+  plate reads on cream and dark rails) on the sidebar, mobile bar, empty
+  chat, session load, login and register; quieter mint/lavender auth
+  wash; command palette / confirm dialogs share the 20px card radius;
+  buttons gain a focus ring; selection tint follows the mark.
+- **Version discipline**: the tree ships as `1.0.0`. Interim work after
+  this cut uses `1.1.0-dev` so installers never reuse a shipped name
+  (see `docs/MAINTENANCE.md`).
 
 ### Added
 

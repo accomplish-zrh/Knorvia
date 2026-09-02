@@ -6,6 +6,12 @@ from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any
 
+from knorvia.services.model_selection.local_models import (
+    inject_local_selection_into_catalog,
+    is_local_profile_id,
+    merge_local_options,
+    probe_loaded_local_models,
+)
 from knorvia.services.provider_registry import find_by_name
 
 
@@ -103,6 +109,7 @@ def list_llm_options(catalog: dict[str, Any]) -> dict[str, Any]:
                 option["context_window"] = context_window
             options.append(option)
 
+    options = merge_local_options(options, probe_loaded_local_models())
     return {
         "active": {"profile_id": active_profile_id, "model_id": active_model_id}
         if active_profile_id and active_model_id
@@ -120,6 +127,11 @@ def apply_llm_selection_to_catalog(
     selected = deepcopy(catalog)
     if resolved is None:
         return selected
+
+    if is_local_profile_id(resolved.profile_id):
+        return inject_local_selection_into_catalog(
+            selected, resolved.profile_id, resolved.model_id
+        )
 
     service = _llm_service(selected)
     for profile in service.get("profiles", []) or []:

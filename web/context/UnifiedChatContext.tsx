@@ -39,6 +39,8 @@ import {
 } from "@/lib/stream";
 import { hasPendingAskUserInMessages } from "@/lib/ask-user-state";
 import { notify } from "@/lib/notifications";
+import { isContinueWritePrompt } from "@/lib/continue-write";
+import { reduceRetryBudget } from "@/lib/generation-retry";
 import i18n from "i18next";
 import {
   normalizeBookReferences,
@@ -220,7 +222,8 @@ type Action =
     }
   | { type: "POP_LAST_ASSISTANT"; key: string }
   | { type: "RESTORE_ASSISTANT"; key: string; message: MessageItem }
-  | { type: "STREAM_START"; key: string }
+  | { type: "STREAM_START"; key: string; continueExisting?: boolean }
+  | { type: "STREAM_CONTINUE"; key: string }
   | { type: "STREAM_EVENT"; key: string; event: StreamEvent }
   | {
       type: "STREAM_END";
@@ -454,10 +457,34 @@ function reducer(state: ProviderState, action: Action): ProviderState {
         },
       };
     }
+    case "STREAM_CONTINUE": {
+      const session =
+        state.sessions[action.key] ?? createSessionEntry(action.key);
+      const existing = session.messages ?? [];
+      const last = existing[existing.length - 1];
+      if (!last || last.role !== "assistant") {
+        return reducer(state, { type: "STREAM_START", key: action.key });
+      }
+      return {
+        ...state,
+        sessions: {
+          ...state.sessions,
+          [action.key]: {
+            ...session,
+            isStreaming: true,
+            status: "running",
+            updatedAt: Date.now(),
+          },
+        },
+      };
+    }
     case "STREAM_START": {
       const session =
         state.sessions[action.key] ?? createSessionEntry(action.key);
       const existing = session.messages ?? [];
+      const lastExisting = existing.length > 0 ? existing[existing.length - 1] : null;
+      const continueExisting =
+        Boolean(action.continueExisting) && lastExisting?.role === "assistant";
       // Chain the placeholder assistant onto whatever message currently
       // sits at the tip — this is normally the user row just added by
       // ADD_USER_MSG (possibly an optimistic negative id during an edit).
@@ -470,17 +497,19 @@ function reducer(state: ProviderState, action: Action): ProviderState {
             ...session,
             isStreaming: true,
             status: "running",
-            messages: [
-              ...existing,
-              {
-                id: nextOptimisticId(),
-                role: "assistant",
-                content: "",
-                events: [],
-                capability: session.activeCapability || "",
-                parentMessageId: tip?.id ?? null,
-              },
-            ],
+            messages: continueExisting
+              ? existing
+              : [
+                  ...existing,
+                  {
+                    id: nextOptimisticId(),
+                    role: "assistant",
+                    content: "",
+                    events: [],
+                    capability: session.activeCapability || "",
+                    parentMessageId: tip?.id ?? null,
+                  },
+                ],
             updatedAt: Date.now(),
           },
         },
@@ -855,6 +884,7 @@ interface ChatContextValue {
         },
   ) => void;
   regenerateLastMessage: () => void;
+  continueLastMessage: () => void;
   deleteTurn: (messageId: number) => Promise<void>;
   /** Re-send a user message under a new branch (sibling of the original).
    *  Uses the composer's current capability / refs — only the text is
@@ -1054,6 +1084,9 @@ export function UnifiedChatProvider({
   // assistant message if the server rejects the request (e.g. ``regenerate_busy``
   // or ``nothing_to_regenerate``). Keyed by session entry key.
   const pendingRegenerateRef = useRef<Map<string, MessageItem>>(new Map());
+  const extraRetriesRef = useRef<Map<string, number>>(new Map());
+  const regenerateLastMessageRef = useRef<((opts?: { preserveRetryBudget?: boolean }) => void) | null>(null);
+  const continueLastMessageRef = useRef<(() => void) | null>(null);
   // Forward-declared so ``handleRunnerEvent`` (created above
   // ``loadSession`` in source order) can trigger a server refresh after
   // a turn finishes without taking a stale closure of ``loadSession``.
@@ -1202,6 +1235,15 @@ export function UnifiedChatProvider({
         // (the previous approach) re-downloaded, re-normalized, and
         // re-rendered the entire transcript after every turn, freezing
         // the tab for seconds on long conversations.
+        const afterDone = reduceRetryBudget(
+          extraRetriesRef.current.get(effectiveKey) || 0,
+          { type: "done", status },
+        );
+        if (afterDone.used === 0) {
+          extraRetriesRef.current.delete(effectiveKey);
+        } else {
+          extraRetriesRef.current.set(effectiveKey, afterDone.used);
+        }
         if (status === "completed") {
           const doneMeta = event.metadata as {
             user_message_id?: number;
@@ -1268,6 +1310,22 @@ export function UnifiedChatProvider({
           status: status as SessionRuntimeStatus,
           turnId: event.turn_id || null,
         });
+        const afterError = reduceRetryBudget(
+          extraRetriesRef.current.get(effectiveKey) || 0,
+          {
+            type: "error",
+            content: event.content,
+            metadata:
+              (event.metadata as Record<string, unknown> | undefined) || null,
+          },
+        );
+        extraRetriesRef.current.set(effectiveKey, afterError.used);
+        if (afterError.shouldRetry) {
+          window.setTimeout(
+            () => regenerateLastMessageRef.current?.({ preserveRetryBudget: true }),
+            250,
+          );
+        }
       }
     },
     [moveRunner],
@@ -1330,7 +1388,10 @@ export function UnifiedChatProvider({
 
   const sendThroughRunner = useCallback(
     (key: string, msg: ChatMessage) => {
-      const startsTurn = msg.type === "start_turn" || msg.type === "regenerate";
+      const startsTurn =
+        msg.type === "start_turn" ||
+        msg.type === "regenerate" ||
+        msg.type === "continue";
       const releasePendingStart = () => {
         if (startsTurn) pendingStartTurnsRef.current.delete(key);
       };
@@ -1553,6 +1614,21 @@ export function UnifiedChatProvider({
           },
         });
         dispatch({ type: "STREAM_END", key, status: "failed" });
+        const afterIdle = reduceRetryBudget(
+          extraRetriesRef.current.get(key) || 0,
+          {
+            type: "error",
+            content: `Connection timed out — no response received for ${timeoutSeconds} seconds.`,
+            metadata: { turn_terminal: true, status: "failed" },
+          },
+        );
+        extraRetriesRef.current.set(key, afterIdle.used);
+        if (afterIdle.shouldRetry) {
+          window.setTimeout(
+            () => regenerateLastMessageRef.current?.({ preserveRetryBudget: true }),
+            250,
+          );
+        }
 
         const runner = runnersRef.current.get(key);
         if (runner) {
@@ -1607,6 +1683,17 @@ export function UnifiedChatProvider({
       }
       const session = currentState.sessions[key] ?? createSessionEntry(key);
       if (pendingStartTurnsRef.current.has(key)) return;
+      if (
+        isContinueWritePrompt(content) &&
+        !(attachments && attachments.length) &&
+        !options?.requestSnapshotOverride
+      ) {
+        const last = session.messages[session.messages.length - 1];
+        if (last?.role === "assistant" && session.sessionId) {
+          continueLastMessageRef.current?.();
+          return;
+        }
+      }
       const replaySnapshot = options?.requestSnapshotOverride;
       const effectiveCapability =
         replaySnapshot?.capability ?? session.activeCapability;
@@ -1846,13 +1933,16 @@ export function UnifiedChatProvider({
     [sendThroughRunner],
   );
 
-  const regenerateLastMessage = useCallback(() => {
+  const regenerateLastMessage = useCallback((opts?: { preserveRetryBudget?: boolean }) => {
     const currentState = stateRef.current;
     const key = currentState.selectedKey;
     if (!key) return;
     const session = currentState.sessions[key];
     if (!session || !session.sessionId) return;
     if (session.isStreaming || pendingStartTurnsRef.current.has(key)) return;
+    if (!opts?.preserveRetryBudget) {
+      extraRetriesRef.current.delete(key);
+    }
     const lastUser = [...session.messages]
       .reverse()
       .find((m) => m.role === "user");
@@ -1874,9 +1964,36 @@ export function UnifiedChatProvider({
       session_id: session.sessionId,
       overrides: {
         language: readStoredResponseLanguage(),
+        ...(session.llmSelection ? { llm_selection: session.llmSelection } : {}),
       },
     });
   }, [sendThroughRunner]);
+
+  const continueLastMessage = useCallback(() => {
+    const currentState = stateRef.current;
+    const key = currentState.selectedKey;
+    if (!key) return;
+    const session = currentState.sessions[key];
+    if (!session || !session.sessionId) return;
+    if (session.isStreaming || pendingStartTurnsRef.current.has(key)) return;
+    const last = session.messages[session.messages.length - 1];
+    if (!last || last.role !== "assistant") return;
+    extraRetriesRef.current.delete(key);
+    dispatch({ type: "STREAM_CONTINUE", key });
+    pendingStartTurnsRef.current.add(key);
+    sendThroughRunner(key, {
+      type: "continue",
+      session_id: session.sessionId,
+      overrides: {
+        language: readStoredResponseLanguage(),
+        ...(session.llmSelection ? { llm_selection: session.llmSelection } : {}),
+      },
+    });
+  }, [sendThroughRunner]);
+
+
+  continueLastMessageRef.current = continueLastMessage;
+  regenerateLastMessageRef.current = regenerateLastMessage;
 
   const derivedState = useMemo<ChatState>(() => {
     const current = ensureSelectedSession(state);
@@ -2108,6 +2225,7 @@ export function UnifiedChatProvider({
       cancelStreamingTurn,
       submitUserReply,
       regenerateLastMessage,
+      continueLastMessage,
       deleteTurn,
       editMessage,
       switchBranch,
@@ -2132,6 +2250,7 @@ export function UnifiedChatProvider({
       cancelStreamingTurn,
       submitUserReply,
       regenerateLastMessage,
+      continueLastMessage,
       deleteTurn,
       editMessage,
       switchBranch,

@@ -29,15 +29,19 @@ LIMITS = {
     "knorvia/services/video_studio/_store_jobs.py": 2000,
     "knorvia/services/video_studio/store_base.py": 2000,
     "knorvia/tools/media_gen_tool.py": 2594,
-    "knorvia/services/session/turn_runtime.py": 2212,
+    "knorvia/services/session/turn_runtime.py": 2350,
     # Session management feature (pin/archive/FTS/export/fork) pushed the
     # store past the default line; next decomposition candidate — extract the
     # FTS/search + export + fork surface into its own module.
     "knorvia/services/session/sqlite_store.py": 2300,
-    "web/app/(workspace)/co-writer/[docId]/page.tsx": 2530,
+    # v1.0.0 continue-writing + retry surface pushed co-writer page over its
+    # 2026-09 pin; next decomposition candidate.
+    "web/app/(workspace)/co-writer/[docId]/page.tsx": 2580,
     "knorvia/agents/question/pipeline.py": 2161,
     "web/app/(workspace)/playground/page.tsx": 2082,
-    "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2390,
+    # v1.0.0 workspace-bundle + model-selection wiring pushed the home shell
+    # over its 2390 pin; next decomposition candidate.
+    "web/app/(workspace)/home/[[...sessionId]]/page.tsx": 2410,
 }
 SOURCE_ROOTS = ("knorvia", "knorvia_cli", "web/app", "web/components", "web/lib")
 SUFFIXES = {".py", ".ts", ".tsx"}

@@ -44,12 +44,15 @@ test("Windows dark splash matches the loading-page canvas", () => {
   assert.equal(chrome.backgroundColor, OVERLAY.dark.color);
 });
 
-test("desktop loading page keeps BootSplash v3 markers", () => {
+test("desktop loading page keeps BootSplash v4 markers", () => {
   const src = readFileSync(path.join(desktopRoot, "main.js"), "utf8");
   assert.match(src, /class="aura"/);
   assert.match(src, /class="halo"/);
+  assert.match(src, /class="sheen"/);
+  assert.match(src, /class="mark"/);
   assert.match(src, /class="rule"/);
-  assert.match(src, /BootSplash v3/);
+  assert.match(src, /BootSplash v4/);
+  assert.match(src, /rx="28"/);
   assert.equal((src.match(/class="mote"/g) || []).length, 0);
   assert.doesNotMatch(src, /@keyframes breathe/);
 });

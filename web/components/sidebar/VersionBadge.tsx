@@ -17,7 +17,7 @@ export function VersionBadge({ collapsed = false }: VersionBadgeProps) {
   return (
     <span
       title={displayTag}
-      className="flex min-w-0 flex-1 items-center rounded-lg px-3 py-1.5 text-[11px] font-mono tabular-nums tracking-tight text-[var(--muted-foreground)]/55"
+      className="flex min-w-0 flex-1 items-center rounded-lg px-3 py-1.5 text-[11px] font-mono tabular-nums tracking-tight text-[var(--muted-foreground)]/75"
     >
       <span className="truncate leading-none">
         {displayTag}

@@ -20,7 +20,7 @@ Knorvia is maintained as an independent codebase. It contains no automatic
 upstream source synchronizer, Git remote, or desktop update feed; releases are
 adopted only through Knorvia's own review and distribution process.
 
-Knorvia versioning is independent (current release: **1.8.0**). The version
+Knorvia versioning is independent (current release: **1.0.0**). The version
 is defined once in `knorvia/__version__.py` and is followed by the Python
 package, the desktop shell, installer artifact names and the in-app version
 badge. DeepTutor remains a code reference only and does not decide Knorvia's

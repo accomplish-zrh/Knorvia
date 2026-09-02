@@ -42,7 +42,8 @@ export default function Button({
     <button
       className={`
         inline-flex items-center justify-center gap-2 font-medium rounded-lg transition-all
-        disabled:opacity-50 disabled:cursor-not-allowed
+        focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[var(--ring)]/45 focus-visible:ring-offset-2 focus-visible:ring-offset-[var(--background)]
+        active:scale-[0.98] disabled:opacity-50 disabled:cursor-not-allowed disabled:active:scale-100
         ${variantStyles[variant]}
         ${sizeStyles[size]}
         ${className}

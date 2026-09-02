@@ -155,11 +155,11 @@ export default function CommandPalette({ open, onClose }: { open: boolean; onClo
 
   return (
     <div
-      className="fixed inset-0 z-[120] flex items-start justify-center bg-black/40 p-4 pt-[12vh] backdrop-blur-[2px]"
+      className="animate-overlay-in fixed inset-0 z-[120] flex items-start justify-center bg-[var(--overlay)] p-4 pt-[12vh] backdrop-blur-[6px]"
       onClick={onClose}
     >
       <div
-        className="w-full max-w-xl overflow-hidden rounded-2xl border border-[var(--border)] bg-[var(--card)] shadow-2xl"
+        className="chrome-card w-full max-w-xl overflow-hidden border border-[var(--border)] bg-[var(--card)] shadow-[0_24px_60px_-20px_rgba(16,21,28,0.35)]"
         onClick={event => event.stopPropagation()}
       >
         <div className="flex items-center gap-2 border-b border-[var(--border)] px-4 py-3">

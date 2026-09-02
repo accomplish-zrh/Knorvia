@@ -141,16 +141,16 @@ function storedUiFrost() {
 function loadingPage(glass) {
   const logo = fs.readFileSync(path.join(__dirname, "build", "logo.png")).toString("base64");
   // Palette mirrors globals.css cream / warm dark. Choreography mirrors
-  // BootSplash v3 (web/components/common/BootSplash.tsx): aura bloom, logo
-  // focus, one hairline arc, tracking wordmark, centre-grown rule. No
-  // breathe, motes, or dual spinners. Frost keeps the canvas transparent
+  // BootSplash v4 (web/components/common/BootSplash.tsx): mint/lavender aura,
+  // squircle hairline, one glass sheen, tracking wordmark, centre-grown rule.
+  // No breathe, motes, or dual spinners. Frost keeps the canvas transparent
   // so DWM acrylic / macOS vibrancy show through. Restored windows clip
   // to 16px here too.
   const html = `<!doctype html><meta charset="utf-8"><title>Knorvia</title>
   <style>
-    :root { --bg:#fdfcf9; --fg:#1c1816; --muted:#6d645a; --accent:#b0501e; }
+    :root { --bg:#fdfcf9; --fg:#1c1816; --muted:#6d645a; --halo:#8bb8c4; }
     @media (prefers-color-scheme: dark) {
-      :root { --bg:#1a1918; --fg:#e8e4de; --muted:#9b9590; --accent:#d4734b; }
+      :root { --bg:#1a1918; --fg:#e8e4de; --muted:#9b9590; --halo:#a8c8d4; }
     }
     * { box-sizing:border-box; }
     html, body { border-radius:${WINDOW_CORNER_RADIUS}px; overflow:hidden; clip-path:inset(0 round ${WINDOW_CORNER_RADIUS}px); }
@@ -161,55 +161,63 @@ function loadingPage(glass) {
     .chrome .caption button { width:46px; height:100%; border:0; background:transparent; color:var(--fg); font-size:12px; }
     .chrome .caption button:hover { background:rgba(127,127,127,.18); }
     .chrome .caption button.close:hover { background:#e81123; color:#fff; }
-    .emblem { position:relative; width:128px; height:128px; display:grid; place-items:center; }
-    .aura { position:absolute; left:50%; top:50%; width:380px; height:250px; margin-left:-190px; margin-top:-125px;
-      border-radius:50%; pointer-events:none; filter:blur(14px);
-      background: radial-gradient(circle at 36% 40%, rgba(80,150,230,.22), transparent 46%),
-                  radial-gradient(circle at 66% 60%, rgba(236,154,82,.18), transparent 48%),
-                  radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 12%, transparent), transparent 58%);
-      animation:auraIn 1.35s cubic-bezier(.16,1,.3,1) both; }
+    .emblem { position:relative; width:136px; height:136px; display:grid; place-items:center; }
+    .aura { position:absolute; left:50%; top:50%; width:420px; height:280px; margin-left:-210px; margin-top:-140px;
+      border-radius:50%; pointer-events:none; filter:blur(16px);
+      background: radial-gradient(circle at 34% 38%, rgba(143,212,200,.34), transparent 48%),
+                  radial-gradient(circle at 68% 62%, rgba(183,182,227,.3), transparent 50%),
+                  radial-gradient(circle at 50% 50%, rgba(186,206,214,.16), transparent 58%);
+      animation:auraIn 1.4s cubic-bezier(.16,1,.3,1) both; }
     @media (prefers-color-scheme: dark) {
-      .aura { filter:blur(16px);
-              background: radial-gradient(circle at 36% 40%, rgba(80,150,230,.42), transparent 46%),
-                          radial-gradient(circle at 66% 60%, rgba(236,154,82,.36), transparent 48%),
-                          radial-gradient(circle at 50% 50%, color-mix(in srgb, var(--accent) 22%, transparent), transparent 60%); }
+      .aura { filter:blur(18px);
+              background: radial-gradient(circle at 34% 38%, rgba(143,212,200,.48), transparent 48%),
+                          radial-gradient(circle at 68% 62%, rgba(183,182,227,.44), transparent 50%),
+                          radial-gradient(circle at 50% 50%, rgba(186,206,214,.22), transparent 60%); }
     }
-    .halo { position:absolute; inset:0; width:128px; height:128px; color:var(--accent); pointer-events:none;
-            animation:drift 36s linear infinite; }
-    .halo circle { fill:none; stroke:currentColor; stroke-width:1; stroke-linecap:round; stroke-dasharray:168 386;
-                   opacity:.7; animation:draw 1.15s .22s cubic-bezier(.22,1,.36,1) both; }
-    .emblem img { width:78px; height:78px; object-fit:contain; position:relative; z-index:2;
-                  animation:arrive .95s .08s cubic-bezier(.16,1,.3,1) both; }
-    h1 { font-size:21px; font-weight:600; margin:32px 0 0; letter-spacing:.06em;
+    .halo { position:absolute; inset:0; width:136px; height:136px; color:var(--halo); pointer-events:none; }
+    .halo rect { fill:none; stroke:currentColor; stroke-width:1.15; stroke-linecap:round; stroke-dasharray:150 432;
+                 opacity:.7; animation:draw 1.15s .22s cubic-bezier(.22,1,.36,1) both, orbit 28s 1.4s linear infinite; }
+    .mark { position:relative; z-index:2; width:100px; height:100px; overflow:hidden; border-radius:22px; }
+    .mark img { width:100px; height:100px; object-fit:contain; display:block;
+                animation:arrive .95s .1s cubic-bezier(.16,1,.3,1) both; }
+    .sheen { position:absolute; inset:-30%; pointer-events:none;
+             background:linear-gradient(115deg, transparent 36%, rgba(255,255,255,.55) 50%, transparent 64%);
+             animation:sheen 1.15s .4s cubic-bezier(.22,1,.36,1) both; }
+    @media (prefers-color-scheme: dark) {
+      .sheen { background:linear-gradient(115deg, transparent 36%, rgba(255,255,255,.28) 50%, transparent 64%); }
+    }
+    h1 { font-size:21px; font-weight:600; margin:28px 0 0; letter-spacing:.06em;
          font-family:Georgia,'Times New Roman',serif;
-         animation:word .9s .34s cubic-bezier(.16,1,.3,1) both; }
+         animation:word .9s .48s cubic-bezier(.16,1,.3,1) both; }
     .muted { color:var(--muted); font-size:12px; line-height:1; margin:10px 0 0;
-             animation:statusIn .7s .5s cubic-bezier(.16,1,.3,1) both; }
-    .rule { margin-top:28px; width:52px; height:1px; overflow:hidden; }
+             animation:statusIn .7s .64s cubic-bezier(.16,1,.3,1) both; }
+    .rule { margin-top:28px; width:56px; height:1px; overflow:hidden; }
     .rule i { display:block; height:100%; width:100%; transform-origin:center;
-              background:color-mix(in srgb, var(--accent) 55%, transparent);
-              animation:ruleIn .85s .64s cubic-bezier(.22,1,.36,1) both; }
+              background:linear-gradient(90deg, #8fd4c8, #b7b6e3);
+              animation:ruleIn .85s .78s cubic-bezier(.22,1,.36,1) both; }
     @keyframes auraIn { from{opacity:0;transform:scale(.78)} to{opacity:1;transform:scale(1)} }
-    @keyframes arrive { from{opacity:0;transform:translateY(12px) scale(.96);filter:blur(7px)}
+    @keyframes arrive { from{opacity:0;transform:translateY(10px) scale(.94);filter:blur(8px)}
                         to{opacity:1;transform:none;filter:blur(0)} }
-    @keyframes draw { from{stroke-dashoffset:168;opacity:0} to{stroke-dashoffset:0;opacity:.7} }
-    @keyframes drift { to { transform:rotate(360deg) } }
+    @keyframes sheen { from{transform:translateX(-130%);opacity:0} 18%{opacity:1} to{transform:translateX(130%);opacity:0} }
+    @keyframes draw { from{stroke-dashoffset:150;opacity:0} to{stroke-dashoffset:0;opacity:.7} }
+    @keyframes orbit { to { stroke-dashoffset:-432 } }
     @keyframes word { from{opacity:0;transform:translateY(6px);letter-spacing:.2em}
                       to{opacity:1;transform:none;letter-spacing:.06em} }
     @keyframes statusIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
     @keyframes ruleIn { from{transform:scaleX(0);opacity:0} to{transform:scaleX(1);opacity:1} }
     @media (prefers-reduced-motion: reduce) {
-      .aura,.emblem img,.halo,.halo circle,h1,.muted,.rule i { animation:none !important; }
-      .emblem img,.halo circle,h1,.muted,.rule i { opacity:1 !important; transform:none !important; filter:none !important; }
+      .aura,.mark img,.sheen,.halo rect,h1,.muted,.rule i { animation:none !important; }
+      .mark img,.halo rect,h1,.muted,.rule i { opacity:1 !important; transform:none !important; filter:none !important; }
       .aura { opacity:1 !important; transform:none !important; }
-      .halo circle { stroke-dashoffset:0 !important; }
+      .sheen { opacity:0 !important; }
+      .halo rect { stroke-dashoffset:0 !important; }
     }
   </style>
   <div class="chrome"><div class="caption" id="caption"></div></div>
   <div class="emblem">
     <span class="aura"></span>
-    <svg class="halo" viewBox="0 0 128 128" fill="none"><g transform="rotate(-108 64 64)"><circle cx="64" cy="64" r="61.5"/></g></svg>
-    <img src="data:image/png;base64,${logo}" alt="">
+    <svg class="halo" viewBox="0 0 136 136" fill="none"><rect x="8" y="8" width="120" height="120" rx="28" ry="28"/></svg>
+    <div class="mark"><img src="data:image/png;base64,${logo}" alt=""><span class="sheen"></span></div>
   </div>
   <h1>Knorvia</h1>
   <div class="muted">正在启动桌面 AI 引擎…</div>

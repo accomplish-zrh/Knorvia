@@ -18,6 +18,7 @@ from knorvia.co_writer.edit_agent import (
     print_stats,
     tool_calls_dir,
 )
+from knorvia.co_writer.paper_chat import reply_about_paper
 from knorvia.co_writer.storage import (
     CoWriterDocument,
     CoWriterDocumentSummary,
@@ -611,6 +612,44 @@ async def update_document(doc_id: str, request: UpdateDocumentRequest) -> Docume
     except Exception as e:
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+
+class PaperChatRequest(BaseModel):
+    message: str = Field(..., min_length=1, max_length=8000)
+
+
+@router.get("/documents/{doc_id}/chat")
+async def get_document_chat(doc_id: str) -> dict[str, list[dict]]:
+    storage = get_co_writer_storage()
+    _validate_doc_id(doc_id)
+    if not storage.doc_exists(doc_id):
+        raise HTTPException(status_code=404, detail="Document not found")
+    return {"messages": storage.load_chat(doc_id)}
+
+
+@router.post("/documents/{doc_id}/chat")
+async def post_document_chat(doc_id: str, request: PaperChatRequest) -> dict:
+    storage = get_co_writer_storage()
+    _validate_doc_id(doc_id)
+    document = storage.load_document(doc_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+    history = storage.load_chat(doc_id)
+    user_msg = {"role": "user", "content": request.message.strip(), "citations": []}
+    result = await reply_about_paper(
+        title=document.title,
+        content=document.content,
+        history=history,
+        message=request.message,
+    )
+    assistant_msg = {
+        "role": "assistant",
+        "content": result["reply"],
+        "citations": result["citations"],
+    }
+    history = history + [user_msg, assistant_msg]
+    storage.save_chat(doc_id, history)
+    return {"message": assistant_msg, "messages": history}
 
 
 @router.delete("/documents/{doc_id}")

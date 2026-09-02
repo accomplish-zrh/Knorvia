@@ -231,6 +231,17 @@ export default function CoWriterHomePage() {
                       type="button"
                       onClick={(event) => {
                         event.stopPropagation();
+                        router.push("/?cowriter=" + encodeURIComponent(doc.id));
+                      }}
+                      title={t("Open beside chat")}
+                      className="shrink-0 rounded-md px-1.5 py-1 text-[11px] text-[var(--muted-foreground)] opacity-0 hover:bg-[var(--muted)] group-hover:opacity-100"
+                    >
+                      {t("Open beside chat")}
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(event) => {
+                        event.stopPropagation();
                         if (isPendingDelete) {
                           void handleDelete(doc.id);
                         } else {

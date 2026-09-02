@@ -9,6 +9,7 @@ to prove the streaming primitive surfaces stdout/stderr in order with an exit.
 
 from __future__ import annotations
 
+from pathlib import Path
 import sys
 
 import pytest
@@ -680,11 +681,44 @@ async def test_detect_all_excludes_partner_backend() -> None:
     detections = await detect_all()
     kinds = {d.kind for d in detections}
     assert "partner" not in kinds
-    assert kinds <= {"claude_code", "codex", "gemini", "kimi", "opencode", "mimo", "grok_build"}
+    # Always return the full local-CLI catalog (available or not) so the
+    # connect UI never drops Codex / Grok Build when a PATH probe misses.
+    assert kinds == {
+        "claude_code",
+        "codex",
+        "gemini",
+        "kimi",
+        "opencode",
+        "mimo",
+        "grok_build",
+    }
     home = default_subagent_cwd()
     for item in detections:
         if item.available and home:
             assert item.suggested_cwd == home
+
+
+def test_resolve_cli_command_uses_pathext_and_fallback(tmp_path, monkeypatch) -> None:
+    from knorvia.services.subagent import detect_fallback as df
+
+    shim = tmp_path / "codex.cmd"
+    shim.write_text("@echo off\r\n", encoding="utf-8")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    resolved = df.resolve_cli_command("codex")
+    assert resolved is not None
+    assert Path(resolved).resolve() == shim.resolve()
+
+    monkeypatch.setenv("PATH", str(tmp_path / "empty"))
+    npm = tmp_path / "npm"
+    npm.mkdir()
+    npm_shim = npm / "gemini.cmd"
+    npm_shim.write_text("@echo off\r\n", encoding="utf-8")
+    monkeypatch.setenv("APPDATA", str(tmp_path))
+    resolved_npm = df.resolve_cli_command("gemini")
+    assert resolved_npm is not None
+    assert Path(resolved_npm).resolve() == npm_shim.resolve()
+    assert df.resolve_cli_command("definitely-missing-cli-xyz") is None
 
 
 def test_validate_subagent_cwd_defaults_empty_to_home(tmp_path, monkeypatch) -> None:

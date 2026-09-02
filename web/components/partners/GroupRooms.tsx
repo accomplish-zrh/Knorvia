@@ -27,6 +27,7 @@ interface RoomSummary {
   message_count: number;
   last_message: string;
   last_timestamp: number;
+  needs_you?: boolean;
 }
 
 interface RoomTranscriptMessage {
@@ -290,7 +291,12 @@ export default function GroupRooms() {
                 <span className="truncate text-[13px] font-semibold text-[var(--foreground)]">
                   {room.name}
                 </span>
-                <span className="shrink-0 text-[11px] text-[var(--muted-foreground)]">
+                <span className="flex shrink-0 items-center gap-1.5 text-[11px] text-[var(--muted-foreground)]">
+                  {room.needs_you ? (
+                    <span className="rounded-full bg-[var(--primary)]/15 px-1.5 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--primary)]">
+                      {t("Needs you")}
+                    </span>
+                  ) : null}
                   {room.members.length} {t("members")}
                 </span>
               </div>
@@ -306,8 +312,13 @@ export default function GroupRooms() {
       {activeId && activeRoom && (
         <div className="flex min-h-[360px] flex-col rounded-2xl border border-[var(--border)] bg-[var(--card)]/60">
           <div className="flex items-center justify-between border-b border-[var(--border)] px-4 py-2">
-            <span className="text-[13px] font-semibold text-[var(--foreground)]">
+            <span className="flex items-center gap-2 text-[13px] font-semibold text-[var(--foreground)]">
               {activeRoom.name}
+              {activeRoom.needs_you ? (
+                <span className="rounded-full bg-[var(--primary)]/15 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-[var(--primary)]">
+                  {t("Needs you")}
+                </span>
+              ) : null}
             </span>
             <div className="flex items-center gap-1.5">
               <button
@@ -494,7 +505,7 @@ export default function GroupRooms() {
               placeholder={
                 members.length === 0
                   ? t("Add a member first")
-                  : t("Say something — use @ to address one partner")
+                  : t("Say something — @name a bot, or wait; they may @user you")
               }
               disabled={members.length === 0}
               className="flex-1 rounded-lg border border-[var(--border)] bg-[var(--background)] px-3 py-2 text-[12.5px] outline-none focus:border-[var(--primary)]/50 disabled:opacity-50"

@@ -14,6 +14,9 @@ Supported client message ``type`` values:
 - ``cancel_turn`` — cancel a running turn.
 - ``submit_user_reply`` — deliver the user's reply for an ``ask_user``
   paused turn so the agentic loop can resume on the same turn.
+- ``continue`` — append more tokens onto the trailing assistant message
+  in the given session (no extra user row). Used by truncated-reply
+  「继续写」. Errors: ``continue_busy`` and ``nothing_to_continue``.
 - ``regenerate`` — re-run the last user message in the given session as a
   brand-new turn. Replaces the trailing assistant message (if any) and
   reuses the session's stored capability/tools/preferences. Optional
@@ -257,6 +260,42 @@ async def unified_websocket(ws: WebSocket) -> None:
                             "content": (f"Turn {turn_id} is not awaiting a user reply."),
                         }
                     )
+                continue
+
+
+            if msg_type == "continue":
+                session_id = str(msg.get("session_id") or "").strip()
+                if not session_id:
+                    await safe_send({"type": "error", "content": "Missing session_id."})
+                    continue
+                from knorvia.services.session import get_turn_runtime_manager
+
+                runtime = get_turn_runtime_manager()
+                overrides = msg.get("overrides") if isinstance(msg.get("overrides"), dict) else None
+                try:
+                    _, turn = await runtime.continue_last_turn(
+                        session_id,
+                        overrides=overrides,
+                    )
+                except RuntimeError as exc:
+                    await safe_send(
+                        {
+                            "type": "error",
+                            "source": "unified_ws",
+                            "stage": "",
+                            "content": str(exc),
+                            "metadata": {
+                                "turn_terminal": True,
+                                "status": "rejected",
+                                "reason": str(exc),
+                            },
+                            "session_id": session_id,
+                            "turn_id": "",
+                            "seq": 0,
+                        }
+                    )
+                    continue
+                await subscribe_turn(turn["id"], after_seq=0)
                 continue
 
             if msg_type == "regenerate":

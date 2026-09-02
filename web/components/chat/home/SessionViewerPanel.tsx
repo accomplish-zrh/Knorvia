@@ -500,6 +500,7 @@ function SessionViewerPanelInner(
   return (
     <div
       role="dialog"
+      data-app-panel=""
       aria-hidden={!visible}
       className={`fixed right-0 top-0 z-[30] flex h-dvh flex-col border-l border-[var(--border)] bg-[var(--card)] transition-transform ease-out max-md:!w-full md:max-w-[92vw] ${
         // shadow-2xl only while visible — when closed, translate-x-full moves
@@ -537,7 +538,7 @@ function SessionViewerPanelInner(
         onCloseTab={closeTab}
         onClosePanel={onClose}
       />
-      <div className="relative flex-1 overflow-hidden bg-[var(--card)]">
+      <div data-app-panel-body="" className="relative flex-1 overflow-hidden bg-[var(--card)]">
         {activeTab?.kind === "file" ? (
           <FileTabBody source={activeTab.source} />
         ) : activeTab?.kind === "web" ? (
@@ -603,7 +604,7 @@ function TabBar({
 }) {
   const { t } = useTranslation();
   return (
-    <div className="flex shrink-0 items-end gap-2 bg-[color-mix(in_srgb,var(--muted)_40%,var(--background))] px-2 pt-2 pb-0">
+    <div data-app-panel-tabbar="" className="flex shrink-0 items-end gap-2 bg-[color-mix(in_srgb,var(--muted)_40%,var(--background))] px-2 pt-2 pb-0">
       <div className="flex min-w-0 flex-1 items-end gap-[2px] overflow-x-auto">
         {/* Persistent Activity home — always first, never closeable. It's the
             session-activity landing; opening a file/web tab focuses that tab
