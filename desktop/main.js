@@ -21,6 +21,7 @@ const {
 } = require("./window-chrome");
 const { applyWindowCornerRegion } = require("./win32-corners");
 const wallpaper = require("./wallpaper");
+const updateCheck = require("./update-check");
 
 let mainWindow;
 let engine;
@@ -306,6 +307,7 @@ function createWindow() {
 
   setupTray();
   setupGlobalHotkey();
+  scheduleUpdateChecks();
 }
 
 let tray = null;
@@ -324,6 +326,8 @@ function setupTray() {
           mainWindow.show(); mainWindow.focus();
         } },
       { type: "separator" },
+      { label: "检查更新…", click: () => { void runUpdateCheck(true); } },
+      { type: "separator" },
       { label: "Quit", click: () => app.quit() },
     ]));
     tray.on("click", () => {
@@ -334,6 +338,95 @@ function setupTray() {
   } catch (error) {
     console.warn("[desktop] tray unavailable:", error.message);
   }
+}
+
+// --- self-update check ------------------------------------------------------
+// Poll GitHub Releases (public repo, no token needed) at startup and every
+// 24h. Manual checks (tray / renderer) always report; automatic ones stay
+// silent on success-with-no-update and on every failure.
+
+let updateTimer = null;
+let updateChecking = false;
+
+function updateStatePath() {
+  return path.join(app.getPath("userData"), "update-state.json");
+}
+
+function readUpdateState() {
+  try {
+    return JSON.parse(fs.readFileSync(updateStatePath(), "utf8")) || {};
+  } catch {
+    return {};
+  }
+}
+
+function writeUpdateState(state) {
+  try {
+    fs.writeFileSync(updateStatePath(), JSON.stringify(state, null, 2));
+  } catch (error) {
+    console.warn("[desktop] update state write failed:", error.message);
+  }
+}
+
+function releaseNotesExcerpt(release) {
+  if (!release || !release.notes) return "";
+  const lines = release.notes.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  return lines.slice(0, 3).join("\n");
+}
+
+async function runUpdateCheck(manual) {
+  if (updateChecking) return { kind: "busy" };
+  updateChecking = true;
+  try {
+    const state = readUpdateState();
+    const release = await updateCheck.fetchLatestRelease({
+      token: process.env.KNORVIA_GITHUB_TOKEN || "",
+    });
+    if (!release) return { kind: "error", message: "release payload invalid" };
+    const decision = updateCheck.decideUpdate({
+      currentVersion: app.getVersion(),
+      latest: { tag_name: release.version, html_url: release.url, body: release.notes, assets: release.assets },
+      suppressed: updateCheck.isSuppressed(state.suppressed, release.version) ? release.version : "",
+    });
+    writeUpdateState({ ...state, lastCheck: new Date().toISOString(), lastVersion: release.version });
+    if (decision.kind === "available" && manual) promptUpdate(decision);
+    return decision;
+  } catch (error) {
+    console.warn("[desktop] update check failed:", error.message);
+    return { kind: "error", message: error.message };
+  } finally {
+    updateChecking = false;
+  }
+}
+
+function promptUpdate(decision) {
+  const { release, installer } = decision;
+  const detail = releaseNotesExcerpt(release);
+  const buttons = ["现在更新", "稍后提醒", "跳过此版本"];
+  dialog.showMessageBox(mainWindow, {
+    type: "info",
+    title: `发现新版本 Knorvia ${release.version}`,
+    message: `当前版本 ${app.getVersion()} → 新版本 ${release.version}`,
+    detail: detail || "前往发布页下载安装包。",
+    buttons,
+    defaultId: 0,
+    cancelId: 1,
+    noLink: true,
+  }).then(({ response }) => {
+    if (response === 2) {
+      writeUpdateState({ ...readUpdateState(), suppressed: updateCheck.suppressionFor(release.version) });
+      return;
+    }
+    if (response === 1) return;
+    const url = installer?.url || release.url;
+    if (url) void shell.openExternal(url);
+  }).catch((error) => console.warn("[desktop] update dialog failed:", error.message));
+}
+
+function scheduleUpdateChecks() {
+  setTimeout(() => { void runUpdateCheck(false); }, 30 * 1000);
+  updateTimer = setInterval(() => { void runUpdateCheck(false); }, updateCheck.CHECK_INTERVAL_MS);
+  updateTimer.unref?.();
 }
 
 function setupGlobalHotkey() {
@@ -505,6 +598,7 @@ function installIpcHandlers() {
     if (!fromMainWindow(event, mainWindow)) return { id: "none", src: null, builtins: [] };
     return wallpaper.clear();
   });
+  ipcMain.handle("knorvia:update-check", () => runUpdateCheck(true));
   ipcMain.handle("knorvia:fetch", (event, request) => {
     if (!trusted(event)) return encodedHttpError(403, "请求来源不受信任");
     if (typeof request?.path !== "string" || !request.path.startsWith("/api/"))

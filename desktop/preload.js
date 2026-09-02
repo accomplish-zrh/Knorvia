@@ -44,4 +44,7 @@ contextBridge.exposeInMainWorld("knorviaDesktop", {
     importCustom: () => ipcRenderer.invoke("knorvia:wallpaper-import"),
     clear: () => ipcRenderer.invoke("knorvia:wallpaper-clear"),
   },
+  update: {
+    check: () => ipcRenderer.invoke("knorvia:update-check"),
+  },
 });

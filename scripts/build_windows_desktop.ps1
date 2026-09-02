@@ -141,7 +141,7 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Desktop main-process syntax check failed" }
     node --check protocol-stream.js
     if ($LASTEXITCODE -ne 0) { throw "Desktop stream-bridge syntax check failed" }
-    foreach ($JsFile in @("preload.js", "frontend-host.js", "window-chrome.js", "win32-corners.js", "wallpaper.js")) {
+    foreach ($JsFile in @("preload.js", "frontend-host.js", "window-chrome.js", "win32-corners.js", "wallpaper.js", "update-check.js")) {
         node --check $JsFile
         if ($LASTEXITCODE -ne 0) { throw "Desktop $JsFile syntax check failed" }
     }

@@ -7,6 +7,16 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **Desktop self-update check**: the Electron shell now polls
+  `releases/latest` on the public GitHub repo (start + every 24 h, plus a
+  manual 「检查更新…」 tray item and `knorviaDesktop.update.check()` IPC).
+  Semver compare → native dialog offers 现在更新 / 稍后提醒 / 跳过此版本
+  (skips are suppressed for 7 days in `update-state.json`). Pure logic in
+  `desktop/update-check.js` with 10 unit tests; automatic checks never
+  nag on network errors. Release line bumped to `1.1.0-dev` so the next
+  build can't collide with the shipped `v1.0.0` assets.
+
 ### Changed
 - **GitHub deployment (2026-09-02)**: repo gains a `origin` remote and is
   published for auto-update pulls. Pre-publish gates all green (pytest
