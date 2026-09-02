@@ -389,14 +389,26 @@ async function runUpdateCheck(manual) {
       suppressed: updateCheck.isSuppressed(state.suppressed, release.version) ? release.version : "",
     });
     writeUpdateState({ ...state, lastCheck: new Date().toISOString(), lastVersion: release.version });
-    if (decision.kind === "available" && manual) promptUpdate(decision);
+    if (manual) {
+      if (decision.kind === "available") promptUpdate(decision);
+      else reportUpdateOutcome(decision.kind === "up-to-date", release);
+    }
     return decision;
   } catch (error) {
     console.warn("[desktop] update check failed:", error.message);
+    if (manual) reportUpdateOutcome(false, null, error.message);
     return { kind: "error", message: error.message };
   } finally {
     updateChecking = false;
   }
+}
+
+function reportUpdateOutcome(success, release, errorMessage) {
+  const options = success
+    ? { type: "info", title: "检查更新", message: "已是最新版本", detail: `当前 ${app.getVersion()} 已是最新（最新正式版本 ${release ? release.version : "-"}）。` }
+    : { type: "warning", title: "检查更新", message: "检查更新失败", detail: errorMessage || "暂时无法连接 GitHub，请稍后再试。" };
+  dialog.showMessageBox(mainWindow, options)
+    .catch((error) => console.warn("[desktop] update result dialog failed:", error.message));
 }
 
 function promptUpdate(decision) {
