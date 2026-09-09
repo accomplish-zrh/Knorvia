@@ -1,0 +1,15 @@
+{
+  "name": "knorvia-product-site",
+  "version": "1.0.0",
+  "private": true,
+  "description": "The static product website at knorvia.xyz",
+  "scripts": {
+    "build": "node scripts/build.cjs",
+    "preview": "node scripts/serve.cjs",
+    "check": "node scripts/check.cjs"
+  },
+  "dependencies": {
+    "gsap": "3.13.0",
+    "three": "0.160.0"
+  }
+}

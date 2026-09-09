@@ -1187,7 +1187,6 @@ async def _partner_chat_stream(
     partner_id: str,
     payload: ChatMessageRequest,
 ) -> AsyncGenerator[str, None]:
-    from knorvia.core.stream import StreamEventType
 
     mgr = get_partner_manager()
     content = payload.content.strip()
@@ -1203,7 +1202,7 @@ async def _partner_chat_stream(
     holder: dict[str, Any] = {}
 
     async def on_event(event: Any) -> None:
-        if event.type == StreamEventType.THINKING and event.content:
+        if event.type == "thinking" and event.content:
             await queue.put({"event": "thinking", "payload": {"content": event.content}})
 
     async def run() -> None:

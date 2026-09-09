@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-from knorvia.core.stream import StreamEvent, StreamEventType
 from knorvia.services.path_service import get_path_service
 
 logger = logging.getLogger(__name__)
@@ -51,17 +50,17 @@ _PREVIEW_TEXT_EXTENSIONS = frozenset({".pptx", ".ppt", ".doc", ".xls"})
 _PREVIEW_TEXT_MAX_CHARS = 20_000
 
 
-def artifact_attachments(event: StreamEvent) -> list[dict[str, Any]]:
+def artifact_attachments(event: Any) -> list[dict[str, Any]]:
     """Return the attachment records for the artifacts *event* carries."""
     metadata = event.metadata or {}
     raw: list[Any] = []
-    if event.type == StreamEventType.SOURCES:
+    if event.type == "sources":
         raw = [
             entry
             for entry in metadata.get("sources") or []
             if isinstance(entry, dict) and entry.get("type") == "artifact"
         ]
-    elif event.type == StreamEventType.TOOL_RESULT:
+    elif event.type == "tool_result":
         tool_meta = metadata.get("tool_metadata")
         if isinstance(tool_meta, dict):
             raw = [e for e in tool_meta.get("artifacts") or [] if isinstance(e, dict)]

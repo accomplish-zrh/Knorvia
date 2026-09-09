@@ -19,6 +19,7 @@ from typing import Any
 from knorvia.services.classroom import prompts
 from knorvia.services.classroom.models import (
     ACTION_QUIZ,
+    MAX_INTERACTIVE_SCENES,
     AgentProfile,
     ClassroomDocument,
     QuizQuestion,
@@ -28,6 +29,13 @@ from knorvia.services.classroom.models import (
     make_action,
     new_classroom_id,
     teacher,
+)
+from knorvia.services.classroom.sanitize import sanitize_widget_html
+from knorvia.services.classroom.styles import get_style
+from knorvia.services.classroom.styles.verify import (
+    check_outline,
+    describe_constraints,
+    repair,
 )
 
 logger = logging.getLogger(__name__)
@@ -60,6 +68,62 @@ async def _complete_json(system: str, user: str) -> Any:
             last_error = exc
             logger.warning("Classroom stage call failed: %s", exc)
     raise RuntimeError(f"Classroom generation stage failed: {last_error}")
+
+
+def _parse_outlines(payload: dict[str, Any], cap: int = 9) -> list[SceneOutline]:
+    """Validate + clamp the model's outline list (global resource discipline)."""
+    raw_outlines = payload.get("outlines") or []
+    if not isinstance(raw_outlines, list) or not raw_outlines:
+        raise RuntimeError("Model produced no scene outlines")
+    outlines = [
+        SceneOutline.from_dict({**item, "order": index})
+        for index, item in enumerate(raw_outlines[:cap])
+        if isinstance(item, dict)
+    ]
+    _enforce_outline_budget(outlines)
+    if not outlines:
+        raise RuntimeError("Model produced no valid scene outlines")
+    return outlines
+
+
+async def _enforce_style_constraints(
+    doc: ClassroomDocument,
+    system: str,
+    user: str,
+    style: Any,
+    progress: ProgressCb,
+) -> None:
+    """One diagnostic re-plan, then a deterministic repair — never a failure.
+
+    The re-plan feeds the violated diagnostics back into the outline prompt;
+    if the outline still violates the style contract, ``repair`` fixes what
+    is deterministically fixable and the leftover diagnostics ride along in
+    an ``outline_repaired`` event (informational, not an error).
+    """
+    diagnostics = check_outline(doc.outlines, style.constraints)
+    if not diagnostics:
+        return
+    replan_user = (
+        user
+        + "\nYour previous outline violated these hard constraints:\n"
+        + "\n".join(f"- {item}" for item in diagnostics)
+        + "\nRegenerate the COMPLETE outline obeying every constraint above. "
+        "Return ONLY the JSON object."
+    )
+    try:
+        payload = await _complete_json(system, replan_user)
+        replanned = _parse_outlines(payload, cap=style.constraints.scene_count_max)
+        doc.title = str(payload.get("title") or doc.title)[:80]
+        doc.outlines = replanned
+    except Exception as exc:  # noqa: BLE001 - keep attempt 1, repair below
+        logger.warning("Classroom style re-plan failed: %s", exc)
+    diagnostics = check_outline(doc.outlines, style.constraints)
+    if diagnostics:
+        doc.outlines = repair(doc.outlines, style.constraints)
+        remaining = check_outline(doc.outlines, style.constraints)
+        await progress(
+            "outline_repaired", diagnostics=diagnostics, remaining=remaining
+        )
 
 
 def _agent_profiles(
@@ -101,6 +165,7 @@ async def generate_classroom(
     on_progress: ProgressCb | None = None,
     kb_context: str = "",
     persona_specs: list[dict[str, str]] | None = None,
+    style_id: str = "",
 ) -> ClassroomDocument:
     """Run the full pipeline and return the assembled document.
 
@@ -109,9 +174,14 @@ async def generate_classroom(
     — saved Persona profiles reused as classmate identities (organic
     tie-in: the classroom wears the user's own personas); the teacher stays
     the built-in one and unfilled seats fall back to the builtin archetypes.
+    *style_id* — teaching-style skill pack; when set, its pedagogy text is
+    injected into the outline prompt and the produced outline is checked
+    against the style's hard constraints (one re-plan, then a deterministic
+    repair — never a hard failure). Empty keeps the default behavior.
     """
     minutes = max(4, min(45, int(minutes or 12)))
     doc_language = "zh" if str(language).startswith("zh") else "en"
+    style = get_style(style_id)
     doc = ClassroomDocument(
         id=new_classroom_id(topic),
         title="",
@@ -119,6 +189,7 @@ async def generate_classroom(
         language=doc_language,
         created_at=time.time(),
         agent_profiles=_agent_profiles(doc_language, persona_specs=persona_specs),
+        style_id=style.id if style else "",
     )
 
     async def progress(step: str, **payload: Any) -> None:
@@ -129,20 +200,23 @@ async def generate_classroom(
 
     # Stage 1 — outlines (the reviewable intermediate product).
     await progress("generating_outlines", message="")
-    system, user = prompts.outlines_prompt(topic, minutes, doc_language, grounding=kb_context)
+    style_directive = ""
+    if style is not None:
+        style_directive = (
+            f"{style.prompt_text}\n"
+            "硬约束（生成结果会被确定性校验器逐条核对，违例会被退回重写）：\n"
+            f"- {describe_constraints(style.constraints)}"
+        )
+    system, user = prompts.outlines_prompt(
+        topic, minutes, doc_language, grounding=kb_context, style_directive=style_directive
+    )
+    outline_cap = style.constraints.scene_count_max if style else 9
     payload = await _complete_json(system, user)
     doc.title = str(payload.get("title") or topic)[:80]
-    raw_outlines = payload.get("outlines") or []
-    if not isinstance(raw_outlines, list) or not raw_outlines:
-        raise RuntimeError("Model produced no scene outlines")
-    doc.outlines = [
-        SceneOutline.from_dict({**item, "order": index})
-        for index, item in enumerate(raw_outlines[:9])
-        if isinstance(item, dict)
-    ]
-    _enforce_outline_budget(doc.outlines)
-    if not doc.outlines:
-        raise RuntimeError("Model produced no valid scene outlines")
+    doc.outlines = _parse_outlines(payload, cap=outline_cap)
+
+    if style is not None:
+        await _enforce_style_constraints(doc, system, user, style, progress)
 
     # Stage 2 — one call per scene (content + actions together), sequential so
     # each scene's speech can stay coherent with the roster; per-scene failure
@@ -168,16 +242,27 @@ async def generate_classroom(
                 exc,
             )
             payload = {}
-        doc.scenes.append(_assemble_scene(outline, payload, doc))
+        scene, degraded_reason = _assemble_scene(outline, payload, doc)
+        doc.scenes.append(scene)
+        if degraded_reason:
+            # Safety gate hit a document-tier risk — the widget is dropped,
+            # the lesson continues as a plain card (never a hard failure).
+            await progress(
+                "scene_degraded",
+                scene_id=scene.id,
+                scene_title=scene.title,
+                reason=degraded_reason,
+            )
 
     await progress("completed", scenes_generated=len(doc.scenes), total_scenes=total)
     return doc
 
 
 def _enforce_outline_budget(outlines: list[SceneOutline]) -> None:
-    """Clamp quiz/discussion counts to the OpenMAIC resource discipline."""
+    """Clamp quiz/discussion/interactive counts to the resource discipline."""
     quiz_seen = 0
     discussion_seen = 0
+    interactive_seen = 0
     from knorvia.services.classroom.models import MAX_DISCUSSION_SCENES, MAX_QUIZ_SCENES
 
     for outline in outlines:
@@ -189,12 +274,20 @@ def _enforce_outline_budget(outlines: list[SceneOutline]) -> None:
             discussion_seen += 1
             if discussion_seen > MAX_DISCUSSION_SCENES:
                 outline.type = "slide"
+        elif outline.type == "interactive":
+            interactive_seen += 1
+            if interactive_seen > MAX_INTERACTIVE_SCENES:
+                outline.type = "slide"
 
 
 def _assemble_scene(
     outline: SceneOutline, payload: dict[str, Any], doc: ClassroomDocument
-) -> Scene:
-    """Deterministic assembly: validated content + a rebuilt action timeline."""
+) -> tuple[Scene, str]:
+    """Deterministic assembly: validated content + a rebuilt action timeline.
+
+    Returns ``(scene, degraded_reason)`` — *degraded_reason* is non-empty
+    when the safety gate downgraded an interactive scene to a slide.
+    """
     scene = Scene(
         id=outline.id,
         order=outline.order,
@@ -203,35 +296,66 @@ def _assemble_scene(
         key_points=[str(k) for k in (payload.get("key_points") or outline.key_points)][:6],
         objective=str(payload.get("objective") or outline.objective),
     )
+    degraded_reason = ""
+    if outline.type == "interactive":
+        scene.widget = outline.widget
+        scene.narration = [
+            str(n).strip()
+            for n in (payload.get("narration") or [])
+            if str(n).strip()
+        ][:6]
+        result = sanitize_widget_html(str(payload.get("html") or ""))
+        if (
+            result.degrade
+            or scene.widget is None
+            or scene.widget.validate()
+        ):
+            # Safety hard line: a document-tier risk (or a missing/invalid
+            # widget) drops the whole widget; the card survives as a slide.
+            scene.type = "slide"
+            scene.widget = None
+            scene.html = ""
+            scene.narration = []
+            degraded_reason = "; ".join(result.hits) or "widget missing or invalid"
+        else:
+            scene.html = result.html
+
     speaker_ids = {profile.id for profile in doc.agent_profiles}
     lead = teacher(doc)
     actions: list[dict[str, Any]] = []
-    for raw in payload.get("actions") or []:
-        if not isinstance(raw, dict):
-            continue
-        kind = str(raw.get("type") or "")
-        if kind == "speech":
-            speaker = str(raw.get("agent_id") or "")
-            text = str(raw.get("text") or "").strip()
-            if not text:
-                continue
-            if speaker not in speaker_ids:
-                speaker = lead.id if lead else speaker
-            if speaker != (lead.id if lead else "") and speaker in {
-                profile.id for profile in classmates(doc)
-            }:
-                profile = next(p for p in classmates(doc) if p.id == speaker)
-                if len(text) > 220:
-                    # Classmates are students: cap their interjections.
-                    text = text[:217] + "…"
-                _ = profile
-            actions.append(make_action("speech", agent_id=speaker, text=text))
-        elif kind == ACTION_QUIZ and outline.type == "quiz":
-            actions.append(make_action(ACTION_QUIZ))
-        elif kind == "discussion" and outline.type == "discussion":
+    if scene.type == "interactive" and scene.narration:
+        # Narration lines are the teacher's spoken timeline for the widget.
+        for line in scene.narration:
             actions.append(
-                make_action("discussion", prompt=str(raw.get("prompt") or outline.objective))
+                make_action("speech", agent_id=lead.id if lead else "teacher", text=line)
             )
+    else:
+        for raw in payload.get("actions") or []:
+            if not isinstance(raw, dict):
+                continue
+            kind = str(raw.get("type") or "")
+            if kind == "speech":
+                speaker = str(raw.get("agent_id") or "")
+                text = str(raw.get("text") or "").strip()
+                if not text:
+                    continue
+                if speaker not in speaker_ids:
+                    speaker = lead.id if lead else speaker
+                if speaker != (lead.id if lead else "") and speaker in {
+                    profile.id for profile in classmates(doc)
+                }:
+                    profile = next(p for p in classmates(doc) if p.id == speaker)
+                    if len(text) > 220:
+                        # Classmates are students: cap their interjections.
+                        text = text[:217] + "…"
+                    _ = profile
+                actions.append(make_action("speech", agent_id=speaker, text=text))
+            elif kind == ACTION_QUIZ and outline.type == "quiz":
+                actions.append(make_action(ACTION_QUIZ))
+            elif kind == "discussion" and outline.type == "discussion":
+                actions.append(
+                    make_action("discussion", prompt=str(raw.get("prompt") or outline.objective))
+                )
 
     if outline.type == "quiz":
         questions = [
@@ -261,7 +385,7 @@ def _assemble_scene(
             ),
         )
     scene.actions = actions
-    return scene
+    return scene, degraded_reason
 
 
 __all__ = ["generate_classroom"]

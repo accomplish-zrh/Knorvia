@@ -32,7 +32,6 @@ from typing import Any, AsyncIterator, Awaitable, Callable
 import uuid
 
 from knorvia.core.context import Attachment, UnifiedContext
-from knorvia.core.stream import StreamEvent, StreamEventType
 from knorvia.multi_user.paths import user_context
 from knorvia.partners.bus.events import InboundMessage, OutboundMessage
 from knorvia.partners.bus.queue import MessageBus
@@ -44,7 +43,7 @@ from knorvia.services.partners.workspace import ensure_partner_workspace, read_s
 
 logger = logging.getLogger(__name__)
 
-EventCallback = Callable[[StreamEvent], Awaitable[None]]
+EventCallback = Callable[[Any], Awaitable[None]]
 
 _MAX_IMAGE_BYTES = 8 * 1024 * 1024
 _MAX_MEDIA_BYTES = 10 * 1024 * 1024
@@ -353,7 +352,7 @@ class PartnerRunner:
         becomes the reply (the final outbound is then marked ``_streamed``
         so the channel doesn't send it twice).
         """
-        from knorvia.runtime.orchestrator import ChatOrchestrator
+        from knorvia.runtime.kernel_client import stream_as_stream_events
         from knorvia.services.model_selection.runtime import (
             activate_llm_selection,
             reset_llm_selection,
@@ -399,9 +398,8 @@ class PartnerRunner:
             # are suppressed on partner turns, so no admin memory override is
             # needed here (and the partner can never write the owner's memory).
             with user_context(partner_user(self.partner_id, name=self.config.name)):
-                orchestrator = ChatOrchestrator()
                 final_text, errors, turn_events, cost_summary = await self._consume_turn_events(
-                    orchestrator.handle(context),
+                    stream_as_stream_events(str(getattr(context, "user_message", "") or "")),
                     msg=msg,
                     turn_id=turn_id,
                     on_event=on_event,
@@ -489,7 +487,7 @@ class PartnerRunner:
 
     async def _consume_turn_events(
         self,
-        events: AsyncIterator[StreamEvent],
+        events: AsyncIterator[Any],
         *,
         msg: InboundMessage,
         turn_id: str,
@@ -524,10 +522,10 @@ class PartnerRunner:
 
             # Capture the trace for rehydration — mirror product chat's
             # persisted ``assistant_events`` (everything but done/session).
-            if event.type not in (StreamEventType.DONE, StreamEventType.SESSION):
+            if event.type not in ("done", "session"):
                 turn_events.append(event.to_dict())
 
-            if event.type == StreamEventType.CONTENT:
+            if event.type == "content":
                 call_id = str(meta.get("call_id") or "")
                 round_buffers.setdefault(call_id, []).append(event.content or "")
                 if meta.get("call_kind") == "llm_final_response":
@@ -536,12 +534,12 @@ class PartnerRunner:
                     streamed_rounds[call_id] = streamed_rounds.get(call_id, "") + event.content
                     await self._publish_stream_delta(msg, turn_id, call_id, event.content)
 
-            elif event.type == StreamEventType.TOOL_CALL:
+            elif event.type == "tool_call":
                 if is_im and send_tool_hints and event.content:
                     hint = _format_tool_hint(event.content, meta.get("args"))
                     await self._publish_hint(msg, hint, tool_hint=True)
 
-            elif event.type == StreamEventType.PROGRESS:
+            elif event.type == "progress":
                 if (
                     meta.get("trace_kind") == "call_status"
                     and meta.get("call_state") == "complete"
@@ -564,13 +562,13 @@ class PartnerRunner:
                     elif is_im and send_progress and text:
                         await self._publish_hint(msg, text, tool_hint=False)
 
-            elif event.type == StreamEventType.RESULT and event.source == "chat":
+            elif event.type == "result" and event.source == "chat":
                 final_text = str(meta.get("response") or "")
                 inner = meta.get("metadata")
                 if isinstance(inner, dict) and isinstance(inner.get("cost_summary"), dict):
                     cost_summary = dict(inner["cost_summary"])
 
-            elif event.type == StreamEventType.ERROR and event.content:
+            elif event.type == "error" and event.content:
                 errors.append(event.content)
 
         if not final_text.strip():

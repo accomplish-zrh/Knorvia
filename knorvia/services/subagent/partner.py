@@ -20,7 +20,7 @@ first consult's question.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
+from typing import Any
 import uuid
 
 from knorvia.services.subagent.base import OnEvent, SubagentBackend
@@ -35,9 +35,6 @@ from knorvia.services.subagent.types import (
     DetectResult,
     SubagentEvent,
 )
-
-if TYPE_CHECKING:  # avoid importing the core/partner packages at module load
-    from knorvia.core.stream import StreamEvent
 
 logger = logging.getLogger(__name__)
 
@@ -119,7 +116,7 @@ class PartnerBackend(SubagentBackend):
             "pending_tools": {},
         }
 
-        async def relay(event: "StreamEvent") -> None:
+        async def relay(event: Any) -> None:
             nonlocal events
             for out in _to_subagent_events(event, state):
                 events += 1
@@ -156,7 +153,7 @@ class PartnerBackend(SubagentBackend):
 
 
 def _to_subagent_events(
-    event: "StreamEvent",
+    event: Any,
     state: dict[str, dict[str, str]],
 ) -> list[SubagentEvent]:
     """Map a partner chat-loop ``StreamEvent`` to zero or more subagent events.
@@ -177,27 +174,25 @@ def _to_subagent_events(
     * Pure status/bookkeeping (``PROGRESS`` call-status, ``RESULT`` marker,
       ``DONE``/``SESSION*``) carries no trace value and is dropped.
     """
-    from knorvia.core.stream import StreamEventType
-
     meta = event.metadata or {}
     call_id = str(meta.get("call_id") or "")
     text = event.content or ""
     etype = event.type
     pending = state["pending_tools"]
 
-    if etype == StreamEventType.CONTENT:
+    if etype == "content":
         if not text:
             return []
         running = state["text"][call_id] = state["text"].get(call_id, "") + text
         merge = {"merge_id": f"text:{call_id}"} if call_id else {}
         return [SubagentEvent(EVENT_TEXT, running, meta=merge)]
-    if etype == StreamEventType.THINKING:
+    if etype == "thinking":
         if not text.strip():
             return []
         running = state["reason"][call_id] = state["reason"].get(call_id, "") + text
         merge = {"merge_id": f"reason:{call_id}"} if call_id else {}
         return [SubagentEvent(EVENT_REASONING, running, meta=merge)]
-    if etype == StreamEventType.TOOL_CALL:
+    if etype == "tool_call":
         name = text.strip() or str(meta.get("tool_name") or "tool")
         args = _compact(meta.get("args"))
         label = f"{name} {args}" if args else name
@@ -206,13 +201,13 @@ def _to_subagent_events(
             pending[call_id] = label
             return []
         return [SubagentEvent(EVENT_TOOL, label)]
-    if etype == StreamEventType.TOOL_RESULT:
+    if etype == "tool_result":
         out = _flush_pending_call(pending, call_id)
         body = text.strip()
         if body:
             out.append(SubagentEvent(EVENT_TOOL_RESULT, _truncate(body)))
         return out
-    if etype == StreamEventType.ERROR:
+    if etype == "error":
         # An error can close out a pending tool call — surface the call first.
         out = _flush_pending_call(pending, call_id)
         if text.strip():

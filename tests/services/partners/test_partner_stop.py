@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 
 import pytest
 
@@ -19,19 +20,23 @@ def _msg(content: str = "hello", channel: str = "telegram") -> InboundMessage:
     return InboundMessage(channel=channel, sender_id="42", chat_id="42", content=content)
 
 
-class _SlowOrchestrator:
-    """A turn that hangs until cancelled, then reports it was interrupted."""
+@pytest.fixture
+def slow_orchestrator(monkeypatch):
+    """A Kernel stream turn that hangs until cancelled.
 
-    finished_cleanly = True
+    Replaces the old ``_SlowOrchestrator`` double: the partner LLM path
+    consumes the daemon stream from kernel_client, so the hang lives in the
+    scripted ``stream_as_stream_events`` patch.
+    """
+    from knorvia.services.model_selection import runtime as selection_runtime
 
-    def __init__(self) -> None:
-        pass
+    state = SimpleNamespace(finished_cleanly=True)
 
-    async def handle(self, context):
+    async def fake_stream(_content: str, **_kwargs):
         try:
             await asyncio.sleep(30)
         except asyncio.CancelledError:
-            type(self).finished_cleanly = False
+            state.finished_cleanly = False
             raise
         yield StreamEvent(
             type=StreamEventType.RESULT,
@@ -40,17 +45,12 @@ class _SlowOrchestrator:
         )
         yield StreamEvent(type=StreamEventType.DONE)
 
-
-@pytest.fixture
-def slow_orchestrator(monkeypatch):
-    import knorvia.runtime.orchestrator as orch_mod
-    from knorvia.services.model_selection import runtime as selection_runtime
-
-    _SlowOrchestrator.finished_cleanly = True
-    monkeypatch.setattr(orch_mod, "ChatOrchestrator", _SlowOrchestrator)
+    monkeypatch.setattr(
+        "knorvia.runtime.kernel_client.stream_as_stream_events", fake_stream
+    )
     monkeypatch.setattr(selection_runtime, "activate_llm_selection", lambda selection: (None, None))
     monkeypatch.setattr(selection_runtime, "reset_llm_selection", lambda token: None)
-    return _SlowOrchestrator
+    return state
 
 
 def _runner(partners_root) -> PartnerRunner:

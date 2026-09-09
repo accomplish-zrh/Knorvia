@@ -1,8 +1,12 @@
 """Classroom document store — one JSON file per lesson.
 
 ``data/classrooms/{id}.json``, anchored to the admin workspace root (same
-convention as the partners tree). Lessons are immutable once generated in
-v1: create / read / list / delete only.
+convention as the partners tree). Lessons were immutable in v1; the
+editable surface (T4) adds :meth:`ClassroomStore.save_edit` — a locked
+read-modify-write transaction so concurrent edits can never clobber each
+other, with the atomic tmp+replace write discipline unchanged. The
+``_jobs`` subdirectory (generation jobs) is intentionally invisible here:
+``list()`` only globs ``*.json`` at the root level.
 """
 
 from __future__ import annotations
@@ -12,7 +16,7 @@ import logging
 from pathlib import Path
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 
 from knorvia.multi_user.paths import get_admin_path_service
 from knorvia.services.classroom.models import ClassroomDocument
@@ -35,9 +39,31 @@ class ClassroomStore:
         payload = json.dumps(document.to_dict(), ensure_ascii=False, indent=2)
         path = self._path(document.id)
         with self._lock:
-            temporary = path.with_suffix(f".{threading.get_ident()}.tmp")
-            temporary.write_text(payload, encoding="utf-8")
-            temporary.replace(path)
+            self._atomic_write(path, payload)
+
+    def save_edit(
+        self, classroom_id: str, mutate: Callable[[ClassroomDocument], ClassroomDocument]
+    ) -> ClassroomDocument | None:
+        """Locked read-modify-write: *mutate* runs, then one atomic write.
+
+        If *mutate* raises, nothing is written — the disk keeps its previous
+        bytes (failure leaves no trace).
+        """
+        path = self._path(classroom_id)
+        with self._lock:
+            if not path.exists():
+                return None
+            data = json.loads(path.read_text(encoding="utf-8"))
+            document = ClassroomDocument.from_dict(data)
+            document = mutate(document)
+            payload = json.dumps(document.to_dict(), ensure_ascii=False, indent=2)
+            self._atomic_write(path, payload)
+            return document
+
+    def _atomic_write(self, path: Path, payload: str) -> None:
+        temporary = path.with_suffix(f".{threading.get_ident()}.tmp")
+        temporary.write_text(payload, encoding="utf-8")
+        temporary.replace(path)
 
     def get(self, classroom_id: str) -> ClassroomDocument | None:
         path = self._path(classroom_id)

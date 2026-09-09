@@ -18,7 +18,7 @@ import knorvia.agents.visualize.pipeline as visualize_pipeline
 from knorvia.capabilities.solve.capability import DeepSolveCapability
 from knorvia.core.context import Attachment, UnifiedContext
 from knorvia.core.stream import StreamEvent, StreamEventType
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 from knorvia.runtime.bootstrap.builtin_capabilities import BUILTIN_CAPABILITY_CLASSES
 
 
@@ -79,37 +79,30 @@ def test_builtin_capability_registry_covers_documented_capabilities() -> None:
 
 
 @pytest.mark.asyncio
-async def test_chat_capability_streams_content_and_geogebra_context(
+async def test_chat_capability_streams_daemon_events(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
 
-    class FakePipeline:
-        def __init__(self, language: str = "en") -> None:
-            captured["pipeline_init"] = {"language": language}
+    async def fake_stream(content: str, **kwargs: Any):
+        captured["content"] = content
+        captured["kwargs"] = kwargs
+        yield StreamEvent(
+            type=StreamEventType.CONTENT,
+            source="knorvia-daemon",
+            content="assistant output",
+            metadata={"runtime": "knorvia-daemon"},
+        )
+        yield StreamEvent(
+            type=StreamEventType.DONE,
+            source="knorvia-daemon",
+            metadata={"status": "completed", "runtime": "knorvia-daemon"},
+        )
 
-        async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
-            captured["process"] = {
-                "message": f"{context.user_message}\nGGB commands",
-                "enabled_tools": list(context.enabled_tools or []),
-            }
-            await stream.tool_call(
-                "geogebra_analysis",
-                {"image_name": "img.png"},
-                source="chat",
-                stage="acting",
-            )
-            await stream.sources(
-                [
-                    {"type": "rag", "kb_name": "demo-kb", "content": "grounding"},
-                    {"type": "web", "url": "https://example.com", "title": "Example"},
-                ],
-                source="chat",
-                stage="responding",
-            )
-            await stream.content("assistant output", source="chat", stage="responding")
-
-    monkeypatch.setattr("knorvia.agents.chat.capability.AgenticChatPipeline", FakePipeline)
+    monkeypatch.setattr(
+        "knorvia.runtime.kernel_client.stream_as_stream_events",
+        fake_stream,
+    )
 
     context = UnifiedContext(
         user_message="analyze triangle",
@@ -122,52 +115,65 @@ async def test_chat_capability_streams_content_and_geogebra_context(
     capability = ChatCapability()
     events = await _collect_events(lambda bus: capability.run(context, bus))
 
-    assert any(event.type == StreamEventType.TOOL_CALL for event in events)
-    assert any(event.type == StreamEventType.SOURCES for event in events)
+    assert captured["content"] == "analyze triangle"
     assert any(
         event.type == StreamEventType.CONTENT and "assistant output" in event.content
         for event in events
     )
-    assert "GGB commands" in captured["process"]["message"]
+    assert any(event.metadata.get("runtime") == "knorvia-daemon" for event in events)
 
 
 @pytest.mark.asyncio
-async def test_deep_solve_capability_runs_chat_loop_in_solve_mode(
+async def test_deep_solve_capability_streams_kernel_turn(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The deep_solve capability is a thin shim: it marks the turn
-    ``solve_mode`` and resolves a session id, then runs the standard agentic
-    chat pipeline. The solve loop capability supplies the tools + playbook."""
+    """The deep_solve capability marks the turn ``solve_mode``, resolves a
+    session id, and streams the daemon turn (the Kernel agent loop is the
+    solver). The solve loop capability remains the home of the playbook +
+    session state for the pack migration."""
     captured: dict[str, Any] = {}
 
-    class FakePipeline:
-        def __init__(self, *, language: str = "en", **_kwargs: Any) -> None:
-            captured["language"] = language
+    async def fake_stream(content: str, **kwargs: Any):
+        captured["content"] = content
+        yield StreamEvent(
+            type=StreamEventType.CONTENT,
+            source="knorvia-daemon",
+            content="kernel solution",
+            metadata={"runtime": "knorvia-daemon"},
+        )
+        yield StreamEvent(
+            type=StreamEventType.DONE,
+            source="knorvia-daemon",
+            metadata={"status": "completed", "runtime": "knorvia-daemon"},
+        )
 
-        async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
-            captured["solve_mode"] = context.metadata.get("solve_mode")
-            captured["solve_session_id"] = context.metadata.get("solve_session_id")
-            captured["attachments"] = list(context.attachments or [])
-            await stream.content("final solution", source="chat", stage="responding")
-
-    monkeypatch.setattr("knorvia.capabilities.solve.capability.AgenticChatPipeline", FakePipeline)
+    monkeypatch.setattr(
+        "knorvia.runtime.kernel_client.stream_as_stream_events",
+        fake_stream,
+    )
 
     context = UnifiedContext(
         user_message="solve x^2=4",
         language="en",
         metadata={"turn_id": "turn-xyz"},
-        attachments=[Attachment(type="image", base64="ZmFrZQ==", filename="graph.png")],
     )
+    assert DeepSolveCapability is not None
+    from knorvia.capabilities.solve.capability import (
+        resolve_solve_session_id,
+    )
+
+    assert resolve_solve_session_id(context) == "turn-xyz"
     capability = DeepSolveCapability()
     events = await _collect_events(lambda bus: capability.run(context, bus))
 
-    assert captured["solve_mode"] is True
-    assert captured["solve_session_id"] == "turn-xyz"
-    # Attachments flow through unmodified for the loop's multimodal handling.
-    assert captured["attachments"][0].filename == "graph.png"
+    assert context.metadata.get("solve_mode") is True
+    assert context.metadata.get("solve_session_id") == "turn-xyz"
     assert any(
-        event.type == StreamEventType.CONTENT and "final solution" in event.content
+        event.type == StreamEventType.CONTENT and "kernel solution" in event.content
         for event in events
+    )
+    assert any(
+        event.metadata.get("runtime") == "knorvia-daemon" for event in events
     )
 
 
@@ -180,61 +186,28 @@ async def test_deep_solve_capability_runs_chat_loop_in_solve_mode(
 
 
 @pytest.mark.asyncio
-async def test_deep_question_capability_uses_single_call_followup_agent(
+async def test_deep_question_capability_invokes_learning_pack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
 
-    class FakeCoordinator:
-        def __init__(self, **_kwargs: Any) -> None:
-            raise AssertionError("Coordinator should not be constructed for follow-up mode")
+    async def fake_emit(stream, *, source: str, pack_id: str, user_message: str, extra=None):
+        captured.update(
+            {
+                "source": source,
+                "pack_id": pack_id,
+                "user_message": user_message,
+                "extra": extra or {},
+            }
+        )
+        await stream.content(f"{pack_id} succeeded", source=source)
+        await stream.result(
+            {"response": f"{pack_id} succeeded", "pack": {"packId": pack_id, "status": "succeeded"}},
+            source=source,
+        )
+        return {"packId": pack_id, "status": "succeeded"}
 
-    class FakeFollowupAgent:
-        def __init__(self, **kwargs: Any) -> None:
-            captured["init"] = kwargs
-            self._trace_callback = None
-
-        def set_trace_callback(self, callback) -> None:
-            self._trace_callback = callback
-
-        async def process(self, **kwargs: Any) -> str:
-            captured["process"] = kwargs
-            assert self._trace_callback is not None
-            await self._trace_callback(
-                {
-                    "event": "llm_call",
-                    "state": "running",
-                    "label": "Answer follow-up for Question 3",
-                    "phase": "generation",
-                    "call_id": "quiz-followup-q_3",
-                }
-            )
-            await self._trace_callback(
-                {
-                    "event": "llm_call",
-                    "state": "complete",
-                    "response": "You missed the key distinction between density and coverage.",
-                    "phase": "generation",
-                    "call_id": "quiz-followup-q_3",
-                }
-            )
-            return "You missed the key distinction between density and coverage."
-
-    _install_module(
-        monkeypatch,
-        "knorvia.agents.question.coordinator",
-        AgentCoordinator=FakeCoordinator,
-    )
-    _install_module(
-        monkeypatch,
-        "knorvia.agents.question.agents.followup_agent",
-        FollowupAgent=FakeFollowupAgent,
-    )
-    _install_module(
-        monkeypatch,
-        "knorvia.services.llm.config",
-        get_llm_config=lambda: SimpleNamespace(api_key="k", base_url="u", api_version="v1"),
-    )
+    monkeypatch.setattr("knorvia.runtime.kernel_client.emit_pack_on_stream", fake_emit)
 
     context = UnifiedContext(
         user_message="Why was my answer wrong?",
@@ -244,74 +217,47 @@ async def test_deep_question_capability_uses_single_call_followup_agent(
             "question_followup_context": {
                 "question_id": "q_3",
                 "question": "What does density mean in win-rate comparison?",
-                "question_type": "written",
-                "user_answer": "coverage",
-                "correct_answer": "relevant information without redundancy",
-                "is_correct": False,
-                "explanation": "Density is about relevant content without redundancy.",
             },
         },
     )
     capability = DeepQuestionCapability()
     events = await _collect_events(lambda bus: capability.run(context, bus))
 
-    assert captured["process"]["user_message"] == "Why was my answer wrong?"
-    assert (
-        captured["process"]["history_context"] == "User previously asked for a simpler explanation."
-    )
-    assert captured["process"]["question_context"]["question_id"] == "q_3"
+    assert captured["pack_id"] == "learning.mastery"
+    assert captured["source"] == "deep_question"
+    assert captured["user_message"] == "Why was my answer wrong?"
+    assert captured["extra"]["followup"]["question_id"] == "q_3"
     assert any(
-        event.type == StreamEventType.CONTENT
-        and "key distinction between density and coverage" in event.content
+        event.type == StreamEventType.CONTENT and "learning.mastery" in event.content
         for event in events
     )
     result_event = next(event for event in events if event.type == StreamEventType.RESULT)
-    assert result_event.metadata["mode"] == "followup"
-    assert result_event.metadata["question_id"] == "q_3"
+    assert result_event.metadata["pack"]["packId"] == "learning.mastery"
 
 
 @pytest.mark.asyncio
-async def test_deep_research_capability_delegates_to_pipeline(
+async def test_deep_research_capability_invokes_research_pack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The capability shim validates the request config, normalises
-    KB-without-KB, builds a runtime config, and hands the heavy lifting
-    to :class:`ResearchPipeline`. We mock the pipeline at its import site
-    in the capability module so we can assert what it was called with
-    without spinning up real LLM I/O.
-    """
-    import knorvia.agents.research.capability as deep_research_mod
-    import knorvia.agents.research.request_config
-
     captured: dict[str, Any] = {}
 
-    class FakeResearchPipeline:
-        def __init__(self, **kwargs: Any) -> None:
-            captured["pipeline_init"] = kwargs
-
-        async def run(self, **kwargs: Any) -> dict[str, Any]:
-            captured["pipeline_run"] = kwargs
-            return {
-                "response": f"Report about {kwargs['topic']}",
-                "metadata": {"mode": "agentic_research", "block_count": 2},
+    async def fake_emit(stream, *, source: str, pack_id: str, user_message: str, extra=None):
+        captured.update(
+            {
+                "source": source,
+                "pack_id": pack_id,
+                "user_message": user_message,
+                "extra": extra or {},
             }
+        )
+        await stream.content(f"{pack_id} succeeded", source=source)
+        await stream.result(
+            {"response": f"{pack_id} succeeded", "pack": {"packId": pack_id, "status": "succeeded"}},
+            source=source,
+        )
+        return {"packId": pack_id, "status": "succeeded"}
 
-    def fake_load_config_with_main(_: str) -> dict[str, Any]:
-        return {
-            "capabilities": {
-                "research": {
-                    "researching": {
-                        "note_agent_mode": "auto",
-                        "tool_timeout": 60,
-                        "tool_max_retries": 2,
-                        "paper_search_years_limit": 3,
-                    },
-                }
-            },
-        }
-
-    monkeypatch.setattr(deep_research_mod, "ResearchPipeline", FakeResearchPipeline)
-    monkeypatch.setattr(deep_research_mod, "load_config_with_main", fake_load_config_with_main)
+    monkeypatch.setattr("knorvia.runtime.kernel_client.emit_pack_on_stream", fake_emit)
 
     context = UnifiedContext(
         user_message="agent-native tutoring",
@@ -321,9 +267,6 @@ async def test_deep_research_capability_delegates_to_pipeline(
         config_overrides={
             "mode": "report",
             "depth": "standard",
-            # Provide a confirmed outline so the capability skips the
-            # outline-preview short-circuit and drives the full
-            # research + reporting flow on the pipeline.
             "confirmed_outline": [
                 {"title": "Background", "overview": "Why this topic matters"},
                 {"title": "Approaches", "overview": "How to do it"},
@@ -332,82 +275,49 @@ async def test_deep_research_capability_delegates_to_pipeline(
         language="en",
     )
     capability = DeepResearchCapability()
-    await _collect_events(lambda bus: capability.run(context, bus))
+    events = await _collect_events(lambda bus: capability.run(context, bus))
 
-    init_kwargs = captured["pipeline_init"]
-    runtime_cfg = init_kwargs["runtime_config"]
-    assert init_kwargs["kb_name"] == "research-kb"
-    assert init_kwargs["language"] == "en"
-    # ``enabled_tools`` is the user's composer toggles forwarded
-    # unchanged. The pipeline's per-block ``compose_enabled_tools`` call
-    # is what decides what the block loop actually exposes.
-    assert init_kwargs["enabled_tools"] == ["rag", "web_search", "paper_search"]
-    # Runtime config carries the structured policy sub-dicts the
-    # pipeline reads at init time. We only assert the keys the runtime
-    # config builder is contractually responsible for producing.
-    assert "planning" in runtime_cfg
-    assert "researching" in runtime_cfg
-    assert "reporting" in runtime_cfg
-    # Source-derived enable_* flags were removed; the block loop now
-    # composes tools the same way chat does (user toggles + auto-mounts).
-    assert "enable_rag" not in runtime_cfg["researching"]
-    assert "enable_web_search" not in runtime_cfg["researching"]
-    assert "enable_paper_search" not in runtime_cfg["researching"]
-    assert "enable_run_code" not in runtime_cfg["researching"]
-
-    run_kwargs = captured["pipeline_run"]
-    assert run_kwargs["topic"] == "agent-native tutoring"
-    assert run_kwargs["confirmed_outline"] is not None
-    assert [item.title for item in run_kwargs["confirmed_outline"]] == [
-        "Background",
-        "Approaches",
-    ]
-    # Attachments are forwarded verbatim so the rephrase / decompose
-    # prompts can see image evidence.
-    assert run_kwargs["attachments"][0].filename == "brief.png"
+    assert captured["pack_id"] == "research.knowledge"
+    assert captured["source"] == "deep_research"
+    assert captured["user_message"] == "agent-native tutoring"
+    assert captured["extra"]["kb_name"] == "research-kb"
+    assert captured["extra"]["enabled_tools"] == ["rag", "web_search", "paper_search"]
+    assert captured["extra"]["confirmed_outline"][0]["title"] == "Background"
+    assert any(
+        event.type == StreamEventType.CONTENT and "research.knowledge" in event.content
+        for event in events
+    )
 
 
 @pytest.mark.asyncio
-async def test_visualize_capability_passes_attachments_to_analysis_agent(
+async def test_visualize_capability_invokes_media_visualize_pack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    """The visualize capability forwards render params to the media pack."""
     captured: dict[str, Any] = {}
 
-    class FakeAnalysis:
-        render_type = "svg"
-        description = "A diagram"
-        data_description = "diagram data"
-
-        def model_dump(self) -> dict[str, Any]:
-            return {
-                "render_type": self.render_type,
-                "description": self.description,
-                "data_description": self.data_description,
+    async def fake_emit(stream, *, source: str, pack_id: str, user_message: str, extra=None):
+        captured.update(
+            {
+                "source": source,
+                "pack_id": pack_id,
+                "user_message": user_message,
+                "extra": extra or {},
             }
-
-    class FakeVisualizePipeline:
-        def __init__(self, **kwargs: Any) -> None:
-            captured["init"] = kwargs
-
-        async def run_analysis(self, **kwargs: Any) -> FakeAnalysis:
-            captured["analysis"] = kwargs
-            return FakeAnalysis()
-
-        async def run_code_generation(self, **kwargs: Any) -> str:
-            captured["code_generation"] = kwargs
-            # Valid per validate_visualization (well-formed XML + camelCase
-            # viewBox), so the capability takes the no-repair path.
-            return '<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 10 10"></svg>'
+        )
+        await stream.content("media.visualize succeeded", source=source)
+        await stream.result(
+            {
+                "response": "media.visualize done",
+                "render_type": "svg",
+                "pack": {"packId": pack_id, "status": "succeeded"},
+            },
+            source=source,
+        )
+        return {"packId": pack_id, "status": "succeeded"}
 
     monkeypatch.setattr(
-        visualize_pipeline,
-        "VisualizePipeline",
-        FakeVisualizePipeline,
-    )
-    _install_module(
-        monkeypatch,
-        "knorvia.services.llm.config",
-        get_llm_config=lambda: SimpleNamespace(api_key="k", base_url="u", api_version="v1"),
+        "knorvia.runtime.kernel_client.emit_pack_on_stream", fake_emit
     )
 
     context = UnifiedContext(
@@ -415,12 +325,20 @@ async def test_visualize_capability_passes_attachments_to_analysis_agent(
         active_capability="visualize",
         config_overrides={"render_mode": "svg"},
         language="en",
-        attachments=[Attachment(type="image", base64="ZmFrZQ==", filename="figure.png")],
+        metadata={"conversation_context_text": "prior exchange"},
     )
 
     capability = VisualizeCapability()
     events = await _collect_events(lambda bus: capability.run(context, bus))
 
-    assert captured["analysis"]["attachments"][0].filename == "figure.png"
+    assert captured["pack_id"] == "media.visualize"
+    assert captured["source"] == "visualize"
+    assert captured["user_message"] == "make a figure"
+    assert captured["extra"]["render_mode"] == "svg"
+    assert captured["extra"]["language"] == "en"
+    assert any(
+        event.type == StreamEventType.CONTENT and "media.visualize" in event.content
+        for event in events
+    )
     result_event = next(event for event in events if event.type == StreamEventType.RESULT)
     assert result_event.metadata["render_type"] == "svg"

@@ -1,0 +1,70 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const path = require('node:path');
+const { once } = require('node:events');
+const { execFileSync } = require('node:child_process');
+const { setTimeout: delay } = require('node:timers/promises');
+const moduleRoot = process.env.KNORVIA_TEST_DESKTOP_ROOT || path.resolve(__dirname, '..');
+const { createMediaStudio } = require(path.join(moduleRoot, 'media-studio'));
+const { createPersonalLibrary } = require(path.join(moduleRoot, 'personal-library'));
+const { startKnorviaDaemon, initializeRequest } = require(path.join(moduleRoot, 'knorvia-protocol-client'));
+const { composition, segments } = require(path.join(moduleRoot, 'article-video-worker'));
+const { run } = require(path.join(moduleRoot, 'media-composition-worker'));
+const { resolveBinaries } = require(path.join(moduleRoot, 'media-frame-worker'));
+const { toSrt } = require(path.join(moduleRoot, 'studio-subtitles'));
+const base = path.resolve(__dirname, '../..');
+const daemonBin = process.env.KNORVIA_DAEMON_BIN;
+test('article composition escapes input and uses measured audio timing', () => {
+  assert.throws(() => segments(''), /空行/);
+  const html = composition({ title: '<script>', aspect: '16:9', scenes: [{ heading: '<img onerror=alert(1)>', detail: 'Example' }], audio: { frames: 91, captions: [{ startFrame: 0, endFrame: 91, text: '</div>' }] } });
+  assert.ok(html.includes('data-duration="3.033333333333333"'));
+  assert.ok(html.includes('&lt;img onerror=alert(1)&gt;'));
+  assert.ok(!html.includes('<img onerror='));
+});
+test('real Rust and local speech: revisions, audio timing, HyperFrames render, cancellation and recovery', { timeout: 300000, skip: !daemonBin }, async () => {
+  const evidence = process.env.KNORVIA_ARTICLE_EVIDENCE || path.join(base, 'docs/engineering/article-video/2026-09-08/acceptance');
+  fs.mkdirSync(evidence, { recursive: true });
+  const home = fs.mkdtempSync(path.join(evidence, 'home-'));
+  let session, studio;
+  try {
+    session = startKnorviaDaemon({ daemonBin, home, env: { ...process.env, KNORVIA_TEST_DISABLE_PLUGIN_SYNC: '1' }, requestTimeoutMs: 30000 });
+    let counter = 0;
+    const rpc = async (method, params = {}) => { const r = await session.request({ jsonrpc: '2.0', id: `article-${++counter}`, method, params }); if (r.error) throw Object.assign(new Error(r.error.message), { rpc: r.error }); return r.result; };
+    const init = await session.request(initializeRequest('article_test', '1')); assert.ok(!init.error, JSON.stringify(init)); session.notify({ jsonrpc: '2.0', method: 'initialized' });
+    const library = createPersonalLibrary({ home, rpc }); studio = createMediaStudio({ home, rpc, library }); await studio.initialize();
+    const invoke = (a, p = {}) => studio.handlers[`studio/article/${a}`](p);
+    let p = await invoke('create', { title: '文章转视频实测', article: 'Start with a clear idea. Let the voice guide the scene.', idempotencyKey: 'article-test' });
+    const id = p.id;
+    await assert.rejects(invoke('create', { title: 'different', article: 'different', idempotencyKey: 'article-test' }), /不同内容/);
+    p = await invoke('save', { id, revision: p.revision, narration: 'Start with a clear idea.\n\nLet the voice guide the scene.' });
+    await assert.rejects(invoke('save', { id, revision: 1, narration: 'stale' }), /其他窗口/);
+    const wait = async () => { for (let i = 0; i < 2400; i++) { const r = await invoke('read', { id }); if (!r.busy) { assert.ok(!r.error, r.error); return r; } await delay(100); } throw new Error('timeout'); };
+    await invoke('voice', { id, revision: p.revision, voice: 'Microsoft Zira Desktop', sample: true }); p = await wait(); assert.ok(p.sample);
+    await invoke('voice', { id, revision: p.revision, voice: 'Microsoft Zira Desktop' }); p = await wait();
+    assert.equal(p.audio.captions.length, 2); assert.equal(p.audio.timing, 'measured-local-speech-segments'); assert.equal(p.audio.captions[1].startFrame, p.audio.captions[0].endFrame);
+    const audio = await invoke('playback', { id, kind: 'audio' }); assert.equal((await fetch(audio.url)).headers.get('content-type'), 'audio/wav');
+    const imported = await library.put(path.join(studio.root, 'article-video', id, `v${p.audio.revision}`, 'voice', 'final.wav'), 'voice.wav');
+    await invoke('import-audio', { id, revision: p.revision, reference: { id: imported.id, version: imported.sha256 }, srt: toSrt(p.audio.captions) }); p = await wait(); assert.equal(p.audio.timing, 'imported-audio-srt');
+    const image = path.join(home, 'reference.png'); await run(resolveBinaries().ffmpeg, ['-v', 'error', '-f', 'lavfi', '-i', 'color=c=teal:s=320x180:d=0.1', '-frames:v', '1', image]);
+    const ref = await library.put(image, 'reference.png');
+    p = await invoke('save', { id, revision: p.revision, scenes: [{ heading: 'Start with an idea', detail: 'A clear message comes first.', reference: { id: ref.id, version: ref.sha256 } }, { heading: 'Follow the voice', detail: 'Let real audio guide every scene.' }] });
+    await invoke('config/save', { node: process.execPath, runtime: process.env.KNORVIA_HYPERFRAMES_ROOT });
+    await invoke('build', { id, revision: p.revision }); p = await wait(); assert.ok(fs.existsSync(path.join(p.built.directory, 'index.html')));
+    if (process.env.KNORVIA_ARTICLE_RENDER === '1') {
+      await invoke('render', { id, revision: p.revision, preview: true }); p = await wait(); assert.ok(p.preview.duration > 1);
+      await invoke('render', { id, revision: p.revision, preview: false }); p = await wait(); assert.ok(p.output.libraryId);
+      const pixel = execFileSync(resolveBinaries().ffmpeg, ['-v', 'error', '-ss', '1', '-i', p.output.file, '-vf', 'crop=2:2:10:10,format=rgb24', '-frames:v', '1', '-f', 'rawvideo', 'pipe:1'], { windowsHide: true });
+      assert.ok(pixel[0] > 210 && pixel[1] > 210 && pixel[2] > 210, 'The composition has an opaque light background, not black transparency');
+      const video = await invoke('playback', { id, kind: 'output' }); assert.equal((await fetch(video.url, { headers: { range: 'bytes=0-63' } })).status, 206);
+    }
+    const audioOld = p.audio;
+    p = await invoke('save', { id, revision: p.revision, narration: 'Changed narration.' }); assert.equal(p.audio, null); assert.equal(p.preview, null); assert.equal(p.built, null);
+    await invoke('voice', { id, revision: p.revision, voice: 'Microsoft Zira Desktop' });
+    await invoke('cancel', { id }); p = await invoke('read', { id }); assert.ok(!p.busy);
+    await studio.close(); studio = createMediaStudio({ home, rpc, library }); await studio.initialize();
+    p = await invoke('read', { id }); assert.equal(p.narration, 'Changed narration.');
+    fs.writeFileSync(path.join(evidence, 'result.json'), JSON.stringify({ home, id, measuredAudio: audioOld, finalState: p, paidCalls: 0 }, null, 2));
+  } finally { if (studio) await studio.close(); if (session?.child.exitCode === null) { session.child.stdin.end(); await Promise.race([once(session.child, 'close'), delay(5000).then(() => { if (session.child.exitCode === null) session.child.kill(); })]); } }
+});

@@ -42,39 +42,42 @@ function decodeUtf8(bytes: Uint8Array): string {
 }
 
 async function inflateRaw(data: Uint8Array, maxOutputBytes: number): Promise<Uint8Array> {
-  if (typeof DecompressionStream !== "undefined") {
-    const copy = new ArrayBuffer(data.byteLength);
-    new Uint8Array(copy).set(data);
-    const stream = new Blob([copy])
-      .stream()
-      .pipeThrough(new DecompressionStream("deflate-raw"));
-    const reader = stream.getReader();
-    const chunks: Uint8Array[] = [];
-    let total = 0;
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
-        total += chunk.byteLength;
-        if (total > maxOutputBytes) {
-          throw new Error("PPTX XML entry is too large to preview");
-        }
-        chunks.push(chunk);
-      }
-    } finally {
-      reader.releaseLock();
-    }
-    const output = new Uint8Array(total);
-    let offset = 0;
-    for (const chunk of chunks) {
-      output.set(chunk, offset);
-      offset += chunk.byteLength;
-    }
-    return output;
+  // This module is imported by a client previewer. Do not add a Node `zlib`
+  // fallback here: even a conditional `node:` import is resolved while Next
+  // creates the browser bundle. Browsers without this platform API fall back
+  // to the normal file preview instead of loading an unbounded JS inflater.
+  if (typeof DecompressionStream === "undefined") {
+    throw new Error("This browser cannot decompress PPTX preview data");
   }
-  const zlib = await import("node:zlib");
-  return new Uint8Array(zlib.inflateRawSync(data, { maxOutputLength: maxOutputBytes }));
+  const copy = new ArrayBuffer(data.byteLength);
+  new Uint8Array(copy).set(data);
+  const stream = new Blob([copy])
+    .stream()
+    .pipeThrough(new DecompressionStream("deflate-raw"));
+  const reader = stream.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      const chunk = value instanceof Uint8Array ? value : new Uint8Array(value);
+      total += chunk.byteLength;
+      if (total > maxOutputBytes) {
+        throw new Error("PPTX XML entry is too large to preview");
+      }
+      chunks.push(chunk);
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  const output = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    output.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return output;
 }
 
 function findEocd(buffer: ArrayBuffer): number {

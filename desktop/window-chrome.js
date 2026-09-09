@@ -16,11 +16,13 @@
 
 const TITLEBAR_HEIGHT = 36;
 const WINDOW_CORNER_RADIUS = 16;
+const PALETTES = require("./window-appearance").palettes;
+const paletteFor = (theme, dark = false) => PALETTES[Object.hasOwn(PALETTES, theme) ? theme : dark ? "dark" : "snow"];
 
 const OVERLAY = {
-  light: { color: "#faf7ef", symbolColor: "#1c1816" },
-  dark: { color: "#191411", symbolColor: "#f3ede4" },
-  glass: { color: "#00000000", symbolColor: "#10151c" },
+  light: { color: PALETTES.snow.colors.bg, symbolColor: PALETTES.snow.colors.ink },
+  dark: { color: PALETTES.dark.colors.bg, symbolColor: PALETTES.dark.colors.ink },
+  glass: { color: "#00000000", symbolColor: PALETTES.glass.colors.ink },
 };
 
 const MATERIALS = new Set(["none", "mica", "acrylic", "tabbed", "auto"]);
@@ -31,26 +33,14 @@ function overlayForColorScheme(dark) {
 }
 
 function overlayForTheme(theme, dark, frost = false) {
-  let overlay;
-  if (theme === "dark" || (theme !== "snow" && theme !== "light" && theme !== "glass" && dark)) {
-    overlay = overlayForColorScheme(true);
-  } else if (theme === "snow") {
-    overlay = { color: "#ffffff", symbolColor: "#0d0d0d", height: TITLEBAR_HEIGHT };
-  } else if (theme === "glass") {
-    overlay = { color: "#eaf2f8", symbolColor: OVERLAY.glass.symbolColor, height: TITLEBAR_HEIGHT };
-  } else {
-    overlay = overlayForColorScheme(false);
-  }
+  const colors = paletteFor(theme, dark).colors;
+  const overlay = { color: colors.bg, symbolColor: colors.ink, height: TITLEBAR_HEIGHT };
   if (frost) return { color: "#00000000", symbolColor: overlay.symbolColor, height: TITLEBAR_HEIGHT };
   return overlay;
 }
 
 function opaqueBackgroundForTheme(theme, dark) {
-  if (theme === "dark") return OVERLAY.dark.color;
-  if (theme === "snow") return "#ffffff";
-  if (theme === "glass") return "#eaf2f8";
-  if (theme === "light") return OVERLAY.light.color;
-  return dark ? OVERLAY.dark.color : OVERLAY.light.color;
+  return paletteFor(theme, dark).colors.bg;
 }
 
 function windowMaterialForFrost(frost, theme, platform) {
@@ -61,7 +51,7 @@ function windowMaterialForFrost(frost, theme, platform) {
     if (platform === "darwin") {
       return { material: "none", backgroundColor: "#00000000", vibrancy: "under-window" };
     }
-    return { material: "none", backgroundColor: opaqueBackgroundForTheme("light", false), vibrancy: null };
+    return { material: "none", backgroundColor: opaqueBackgroundForTheme(theme, false), vibrancy: null };
   }
   return {
     material: "none",
@@ -75,7 +65,7 @@ function windowMaterialForTheme(theme, platform, frost = false) {
 }
 
 function browserWindowChrome(platform, { dark = false, glass = false, frost = false, theme = null } = {}) {
-  const resolvedTheme = theme || (glass ? "glass" : (dark ? "dark" : "light"));
+  const resolvedTheme = theme || (glass ? "glass" : (dark ? "dark" : "snow"));
   const useFrost = Boolean(frost || glass);
   const material = windowMaterialForFrost(useFrost, resolvedTheme, platform);
   if (platform === "darwin") {

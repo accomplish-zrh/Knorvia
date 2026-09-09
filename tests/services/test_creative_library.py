@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import hashlib
 from io import BytesIO
 import json
+import os
 
 from PIL import Image
 import pytest
@@ -202,3 +204,56 @@ def test_conversation_messages(tmp_path) -> None:
     assert len(messages) == 2
     assert messages[1]["job"]["job_id"] == "job_1"
     assert "user_prompt" in messages[1]["brief"]
+
+
+def _workbook(marker: str) -> bytes:
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Sales"
+    sheet["A1"] = marker
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def test_replace_entry_bytes_cas_refuses_a_stale_expectation(tmp_path) -> None:
+    store = CreativeLibraryStore(tmp_path)
+    first, second = _workbook("first"), _workbook("second")
+    entry_id = store.upload_entry(first, "book.xlsx", title="Book")["id"]
+
+    refused = store.replace_entry_bytes(
+        entry_id, second, expect_sha256=hashlib.sha256(b"someone else's bytes").hexdigest()
+    )
+
+    assert refused is None
+    assert store.entry_bytes(entry_id)[0] == first
+    assert store.get_entry(entry_id)["sha256"] == hashlib.sha256(first).hexdigest()
+
+    committed = store.replace_entry_bytes(
+        entry_id, second, expect_sha256=hashlib.sha256(first).hexdigest()
+    )
+    assert committed is not None
+    assert committed["sha256"] == hashlib.sha256(second).hexdigest()
+    assert store.entry_bytes(entry_id)[0] == second
+
+
+def test_replace_entry_bytes_keeps_previous_bytes_when_the_publish_fails(
+    tmp_path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An atomic publish, so a failed write cannot leave a half-written workbook."""
+    store = CreativeLibraryStore(tmp_path)
+    first, second = _workbook("first"), _workbook("second")
+    entry_id = store.upload_entry(first, "book.xlsx", title="Book")["id"]
+
+    def refuse_rename(src, dst) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(os, "replace", refuse_rename)
+    with pytest.raises(OSError):
+        store.replace_entry_bytes(entry_id, second, expect_sha256=hashlib.sha256(first).hexdigest())
+
+    assert store.entry_bytes(entry_id)[0] == first
+    assert store.get_entry(entry_id)["sha256"] == hashlib.sha256(first).hexdigest()
+    assert not list((tmp_path / "files").glob("*.tmp"))

@@ -16,7 +16,7 @@ import pytest
 
 from knorvia.agents.research.pipeline import ResearchedBlock, ResearchPipeline, SubTopicItem
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 pytestmark = pytest.mark.asyncio
 

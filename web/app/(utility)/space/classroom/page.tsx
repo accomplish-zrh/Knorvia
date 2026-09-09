@@ -13,13 +13,20 @@ import { Loader2, Plus, Sparkles, Trash2 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import {
   deleteClassroom,
-  generateClassroom,
+  fetchClassroomStyles,
+  followClassroomJob,
+  getClassroomJob,
   listClassrooms,
+  startClassroomGeneration,
   type ClassroomCard,
+  type ClassroomStyle,
   type GenerationProgress,
 } from "@/lib/classroom-api";
 import { listKnowledgeBases } from "@/lib/knowledge-api";
 import { listPersonas } from "@/lib/personas-api";
+
+/** Unfinished generation jobs survive refreshes via this localStorage key. */
+const ACTIVE_JOB_KEY = "knorvia.classroom.activeJobId";
 
 export default function ClassroomPage() {
   const { t, i18n } = useTranslation();
@@ -39,6 +46,11 @@ export default function ClassroomPage() {
     [],
   );
   const [selectedPersonas, setSelectedPersonas] = useState<string[]>([]);
+  // Teaching-style skill packs (OpenMAIC parity); "" = default behavior.
+  const [styles, setStyles] = useState<ClassroomStyle[]>([]);
+  const [styleId, setStyleId] = useState("");
+  // Unfinished generation job from a previous visit (recovery bar).
+  const [resumableJob, setResumableJob] = useState("");
 
   const refresh = useCallback(() => {
     void listClassrooms()
@@ -50,6 +62,20 @@ export default function ClassroomPage() {
   useEffect(refresh, [refresh]);
 
   useEffect(() => {
+    const jobId = window.localStorage.getItem(ACTIVE_JOB_KEY);
+    if (!jobId) return;
+    void getClassroomJob(jobId)
+      .then((snapshot) => {
+        if (snapshot.status === "pending" || snapshot.status === "running") {
+          setResumableJob(jobId);
+        } else {
+          window.localStorage.removeItem(ACTIVE_JOB_KEY);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  useEffect(() => {
     void listKnowledgeBases()
       .then((items) => setKbList(items.map((item) => ({ name: item.name }))))
       .catch(() => {});
@@ -59,6 +85,9 @@ export default function ClassroomPage() {
           items.map((item) => ({ name: item.name, description: item.description })),
         ),
       )
+      .catch(() => {});
+    void fetchClassroomStyles()
+      .then(setStyles)
       .catch(() => {});
   }, []);
 
@@ -77,17 +106,41 @@ export default function ClassroomPage() {
     setGenerating(true);
     setError("");
     setProgress(null);
-    void generateClassroom(
-      {
-        topic: topic.trim(),
-        minutes,
-        language: i18n.language?.startsWith("zh") ? "zh" : "en",
-        kb_name: kbName,
-        persona_names: selectedPersonas,
-      },
-      setProgress,
-    )
+    void startClassroomGeneration({
+      topic: topic.trim(),
+      minutes,
+      language: i18n.language?.startsWith("zh") ? "zh" : "en",
+      kb_name: kbName,
+      persona_names: selectedPersonas,
+      style_id: styleId,
+    })
+      .then(({ job_id }) => {
+        window.localStorage.setItem(ACTIVE_JOB_KEY, job_id);
+        setResumableJob(job_id);
+        return followClassroomJob(job_id, setProgress);
+      })
       .then((result) => {
+        window.localStorage.removeItem(ACTIVE_JOB_KEY);
+        setResumableJob("");
+        router.push(`/space/classroom/${encodeURIComponent(result.id)}`);
+      })
+      .catch((e: unknown) => {
+        setError(e instanceof Error ? e.message : t("Generation failed"));
+        setGenerating(false);
+      });
+  };
+
+  /** Resume tracking an unfinished job after a refresh (恢复条 → 点击查看). */
+  const resumeJob = (jobId: string) => {
+    if (generating) return;
+    setGenerating(true);
+    setShowForm(true);
+    setError("");
+    setProgress(null);
+    void followClassroomJob(jobId, setProgress)
+      .then((result) => {
+        window.localStorage.removeItem(ACTIVE_JOB_KEY);
+        setResumableJob("");
         router.push(`/space/classroom/${encodeURIComponent(result.id)}`);
       })
       .catch((e: unknown) => {
@@ -104,6 +157,10 @@ export default function ClassroomPage() {
       });
     }
     if (p.step === "generating_outlines") return t("Drafting the lesson outline…");
+    if (p.step === "outline_repaired")
+      return t("Outline auto-repaired to fit the selected style");
+    if (p.step === "scene_degraded")
+      return t("An interactive scene failed the safety scan and became a card");
     if (p.step === "completed") return t("Lesson ready");
     return t("Preparing…");
   };
@@ -188,6 +245,58 @@ export default function ClassroomPage() {
               {t("Generate class")}
             </button>
           </div>
+          {styles.length > 0 && (
+            <div className="mt-3">
+              <p className="mb-1.5 text-[11.5px] text-[var(--muted-foreground)]">
+                {t("Teaching style")}
+              </p>
+              <div data-classroom-style-picker="" className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+                <button
+                  type="button"
+                  onClick={() => setStyleId("")}
+                  disabled={generating}
+                  title={t("Let the generator pick a balanced structure")}
+                  className={`rounded-xl border px-2.5 py-2 text-left transition-colors ${
+                    styleId === ""
+                      ? "border-[var(--ring)] bg-[var(--accent)]"
+                      : "border-[var(--border)] hover:border-[var(--ring)]"
+                  }`}
+                >
+                  <span className="block text-[12.5px] font-medium text-[var(--foreground)]">
+                    {t("Default (auto)")}
+                  </span>
+                </button>
+                {styles.map((style) => {
+                  const zh = i18n.language?.startsWith("zh");
+                  const title = zh ? style.title : style.title_en || style.title;
+                  const description = zh
+                    ? style.description
+                    : style.description_en || style.description;
+                  return (
+                    <button
+                      key={style.id}
+                      type="button"
+                      onClick={() => setStyleId(style.id)}
+                      disabled={generating}
+                      title={description}
+                      className={`rounded-xl border px-2.5 py-2 text-left transition-colors ${
+                        styleId === style.id
+                          ? "border-[var(--ring)] bg-[var(--accent)]"
+                          : "border-[var(--border)] hover:border-[var(--ring)]"
+                      }`}
+                    >
+                      <span className="block text-[12.5px] font-medium text-[var(--foreground)]">
+                        {title}
+                      </span>
+                      <span className="mt-0.5 line-clamp-2 block text-[10.5px] leading-snug text-[var(--muted-foreground)]">
+                        {description}
+                      </span>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
           {personas.length > 0 && (
             <div className="mt-3">
               <p className="mb-1.5 text-[11.5px] text-[var(--muted-foreground)]">
@@ -227,6 +336,18 @@ export default function ClassroomPage() {
           )}
           {error && <p className="mt-2 text-[12.5px] text-red-500">{error}</p>}
         </div>
+      )}
+
+      {resumableJob && (
+        <button
+          type="button"
+          data-classroom-job-resume=""
+          onClick={() => resumeJob(resumableJob)}
+          className="mt-4 flex w-full items-center gap-2 rounded-xl border border-[var(--ring)] bg-[var(--accent)]/60 px-4 py-2.5 text-left text-[13px] text-[var(--foreground)]"
+        >
+          <Loader2 className="h-4 w-4 animate-spin text-[var(--primary)]" />
+          {t("A lesson is generating… click to resume tracking")}
+        </button>
       )}
 
       <div className="mt-5 space-y-2.5">

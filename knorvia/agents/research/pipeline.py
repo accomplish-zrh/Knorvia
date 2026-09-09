@@ -72,7 +72,6 @@ from knorvia.core.agentic.tool_dispatch import (
     MAX_PARALLEL_TOOL_CALLS,
 )
 from knorvia.core.context import Attachment, UnifiedContext
-from knorvia.core.stream_bus import StreamBus
 from knorvia.core.trace import (
     build_trace_metadata,
     derive_trace_metadata,
@@ -447,7 +446,7 @@ class ResearchPipeline:
         topic: str,
         confirmed_outline: list[SubTopicItem] | None = None,
         attachments: list[Attachment] | None = None,
-        stream: StreamBus,
+        stream: Any,
     ) -> dict[str, Any]:
         """Drive the four phases.
 
@@ -483,7 +482,7 @@ class ResearchPipeline:
         topic: str,
         image_attachments: list[Attachment],
         confirmed_outline: list[SubTopicItem] | None,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> dict[str, Any]:
         logger.info(
@@ -629,7 +628,7 @@ class ResearchPipeline:
         await emit_capability_result(stream, result_payload, source=SOURCE, usage=self.usage)
         return result_payload
 
-    async def _emit_visible_failure(self, stream: StreamBus, exc: BaseException) -> None:
+    async def _emit_visible_failure(self, stream: Any, exc: BaseException) -> None:
         """Surface a runtime exception as a labelled error trace card so the
         user sees what went wrong instead of an empty assistant message."""
         call_id = new_call_id("research-failure")
@@ -666,7 +665,7 @@ class ResearchPipeline:
         topic: str,
         context: UnifiedContext,
         image_attachments: list[Attachment] | None = None,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> str:
         """Mini agentic loop over ``THINK / TOOL / FINISH`` with only
@@ -752,7 +751,7 @@ class ResearchPipeline:
         topic: str,
         context: UnifiedContext,
         image_attachments: list[Attachment] | None = None,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> list[SubTopicItem]:
         """One-shot ``OUTLINE`` labeled step.
@@ -832,7 +831,7 @@ class ResearchPipeline:
         citations: CitationManager,
         topic: str,
         context: UnifiedContext,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> ResearchedBlock:
         """Run one block of the dynamic research queue through an agentic
@@ -930,7 +929,7 @@ class ResearchPipeline:
         *,
         client: Any,
         messages: list[dict[str, Any]],
-        stream: StreamBus,
+        stream: Any,
         start_iteration: int,
         block: TopicBlock,
     ) -> tuple[str, bool, int]:
@@ -1031,7 +1030,7 @@ class ResearchPipeline:
         topic: str,
         context: UnifiedContext,
         image_attachments: list[Attachment] | None,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> list[ResearchedBlock]:
         researched_by_id: dict[str, ResearchedBlock] = {}
@@ -1147,7 +1146,7 @@ class ResearchPipeline:
         topic: str,
         blocks: list[ResearchedBlock],
         citations: CitationManager,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> str:
         outline = await self._gen_report_outline(
@@ -1368,7 +1367,7 @@ class ResearchPipeline:
             parts.append(f"note: {html.escape(summary[:180])}")
         return " — ".join(parts)
 
-    async def _stream_report_separator(self, stream: StreamBus) -> None:
+    async def _stream_report_separator(self, stream: Any) -> None:
         await stream.content("\n\n", source=SOURCE, stage="reporting")
 
     def _render_report_title_block(self, title: str) -> str:
@@ -1388,7 +1387,7 @@ class ResearchPipeline:
         topic: str,
         blocks: list[ResearchedBlock],
         citations: CitationManager,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> ReportOutline:
         """One ``OUTLINE`` labeled step that proposes the report sections.
@@ -1560,7 +1559,7 @@ class ResearchPipeline:
         *,
         topic: str,
         outline: ReportOutline,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> str:
         system_prompt = self._t("report.intro.system", section_number=1)
@@ -1599,7 +1598,7 @@ class ResearchPipeline:
         outline: ReportOutline,
         blocks: list[ResearchedBlock],
         citations: CitationManager,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> str:
         evidence = self._render_section_evidence(
@@ -1641,7 +1640,7 @@ class ResearchPipeline:
         outline: ReportOutline,
         section_bodies: list[str],
         section_number: int,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> str:
         # Recap: first paragraph of each rendered sub-topic section so the
@@ -1681,7 +1680,7 @@ class ResearchPipeline:
         system_prompt: str,
         user_prompt: str,
         protocol: LabelProtocol,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
         label: str,
         call_id_root: str,
@@ -1936,7 +1935,7 @@ class ResearchPipeline:
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]] | None,
         protocol: LabelProtocol,
-        stream: StreamBus,
+        stream: Any,
         stage: str,
         iter_meta: dict[str, Any],
         max_tokens: int = DEFAULT_BLOCK_MAX_TOKENS,
@@ -2304,7 +2303,7 @@ class _BlockLoopHost:
         queue: DynamicTopicQueue,
         citations: CitationManager,
         topic: str,
-        stream: StreamBus,
+        stream: Any,
         context: UnifiedContext,
         client: Any,
     ) -> None:
@@ -2650,7 +2649,7 @@ class _RephraseLoopHost:
         self,
         *,
         pipeline: "ResearchPipeline",
-        stream: StreamBus,
+        stream: Any,
         context: UnifiedContext,
         client: Any,
         max_rounds: int,

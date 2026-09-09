@@ -16,7 +16,7 @@ that: a partner's ``routing`` config picks who answers its turns —
 
 Router failures never strand a chat: the runner falls back to the LLM path
 and the error is reported in-band. The turn is emitted as the same
-StreamEvent shapes the product chat pipeline produces, so the runner's
+stream-event shapes the product chat pipeline produces, so the runner's
 existing handling — IM stream deltas, tool hints, trace capture, RESULT
 extraction — works unchanged over a routed turn.
 """
@@ -26,15 +26,54 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass, field
 import logging
+import time
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
-from knorvia.core.stream import StreamEvent, StreamEventType
 from knorvia.services.subagent.types import (
     EVENT_ERROR,
     EVENT_TEXT,
     EVENT_TOOL,
     SubagentEvent,
 )
+
+
+def _event(**kwargs: Any) -> Any:
+    """Duck-typed stream event with the StreamEvent attribute + to_dict surface.
+
+    The routed turn emits the same shapes the product chat pipeline produces
+    (string type values — StreamEventType is a str,Enum) so the runner's
+    existing handling works unchanged over a routed turn.
+    """
+    base: dict[str, Any] = {
+        "type": "",
+        "source": "",
+        "stage": "",
+        "content": "",
+        "metadata": {},
+        "session_id": "",
+        "turn_id": "",
+        "seq": 0,
+        "timestamp": time.time(),
+    }
+    base.update(kwargs)
+    event = SimpleNamespace(**base)
+
+    def to_dict() -> dict[str, Any]:
+        return {
+            "type": event.type,
+            "source": event.source,
+            "stage": event.stage,
+            "content": event.content,
+            "metadata": event.metadata,
+            "session_id": event.session_id,
+            "turn_id": event.turn_id,
+            "seq": event.seq,
+            "timestamp": event.timestamp,
+        }
+
+    event.to_dict = to_dict  # type: ignore[method-assign]
+    return event
 
 logger = logging.getLogger(__name__)
 
@@ -173,28 +212,28 @@ def _clone_config_with_prompt(config: Any, system_prompt: str) -> Any:
     return clone
 
 
-def _map_subagent_event(event: SubagentEvent, call_id: str) -> StreamEvent | None:
-    """SubagentEvent → the StreamEvent the runner already understands."""
+def _map_subagent_event(event: SubagentEvent, call_id: str) -> Any | None:
+    """SubagentEvent → the stream event the runner already understands."""
     text = str(event.text or "")
     if not text:
         return None
     if event.kind == EVENT_TEXT:
-        return StreamEvent(
-            type=StreamEventType.CONTENT,
+        return _event(
+            type="content",
             source="chat",
             content=text,
             metadata={"call_id": call_id, "trace_kind": "routed_delta"},
         )
     if event.kind == EVENT_TOOL:
-        return StreamEvent(
-            type=StreamEventType.TOOL_CALL,
+        return _event(
+            type="tool_call",
             source="chat",
             content=text,
             metadata={"call_id": call_id, "args": {}},
         )
     if event.kind == EVENT_ERROR:
-        return StreamEvent(
-            type=StreamEventType.ERROR,
+        return _event(
+            type="error",
             source="cli",
             content=text,
             metadata={"call_id": call_id},
@@ -202,8 +241,8 @@ def _map_subagent_event(event: SubagentEvent, call_id: str) -> StreamEvent | Non
     # reasoning / tool_result / log: trace-only progress. The runner publishes
     # neither (its PROGRESS handler only freezes narration rounds) but captures
     # them into the persisted turn trace for web rehydration.
-    return StreamEvent(
-        type=StreamEventType.PROGRESS,
+    return _event(
+        type="progress",
         source="cli",
         stage="routed",
         content=text,
@@ -223,7 +262,7 @@ async def execute_routed_turn(
     media: list[str] | None = None,
     routing: dict[str, str] | None = None,
     meta: RoutedTurnMeta,
-) -> AsyncIterator[StreamEvent]:
+) -> AsyncIterator[Any]:
     """Run one partner turn through the routed CLI backend, as StreamEvents.
 
     *meta* is mutated in place with the backend actually used, the CLI session
@@ -275,7 +314,7 @@ async def execute_routed_turn(
         if image_paths and not backend_config.forward_images:
             image_paths = []
 
-        queue: asyncio.Queue[StreamEvent] = asyncio.Queue()
+        queue: asyncio.Queue[Any] = asyncio.Queue()
 
         async def on_event(event: SubagentEvent) -> None:
             nonlocal log_emitted
@@ -310,7 +349,7 @@ async def execute_routed_turn(
                 event = await queue.get()
                 if event is _SENTINEL:
                     break
-                if event.type == StreamEventType.CONTENT:
+                if event.type == "content":
                     accumulated.append(event.content or "")
                 yield event
 
@@ -333,8 +372,8 @@ async def execute_routed_turn(
             if not final_text:
                 raise RuntimeError(f"Routing backend {kind!r} returned no answer.")
 
-            yield StreamEvent(
-                type=StreamEventType.RESULT,
+            yield _event(
+                type="result",
                 source="chat",
                 metadata={
                     "response": final_text,
@@ -351,8 +390,8 @@ async def execute_routed_turn(
         logger.warning(
             "Partner %s routed turn via %s failed: %s", partner_id, kind, exc, exc_info=True
         )
-        yield StreamEvent(
-            type=StreamEventType.ERROR,
+        yield _event(
+            type="error",
             source="router",
             content=str(exc),
             metadata={"call_id": call_id, "turn_terminal": True, "status": "failed"},

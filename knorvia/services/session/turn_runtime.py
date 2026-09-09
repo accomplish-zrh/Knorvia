@@ -11,9 +11,10 @@ from contextvars import Token
 from dataclasses import dataclass, field
 import json
 import logging
+import time
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any, Literal
 
-from knorvia.core.stream import StreamEvent, StreamEventType
 from knorvia.services.llm.utils import clean_thinking_tags
 from knorvia.services.path_service import get_path_service
 from knorvia.services.session.artifact_attachments import (
@@ -38,8 +39,61 @@ _ANSWER_CONTENT_CALL_KINDS = frozenset({"llm_final_response", "agent_loop_round"
 _FINAL_TURN_STATUSES = frozenset({"completed", "failed", "cancelled", "rejected"})
 
 
-def _should_capture_assistant_content(event: StreamEvent) -> bool:
-    if event.type != StreamEventType.CONTENT:
+def _event(**kwargs: Any) -> Any:
+    """Duck-typed stream event with the StreamEvent attribute + to_dict surface.
+
+    The session projection consumes kernel-turn events (via the
+    LegacyViewAdapter) and persists their dicts; the attribute surface matches
+    the legacy event dataclass so consumers and mutation sites work unchanged.
+    """
+    base: dict[str, Any] = {
+        "type": "",
+        "source": "",
+        "stage": "",
+        "content": "",
+        "metadata": {},
+        "session_id": "",
+        "turn_id": "",
+        "seq": 0,
+        "timestamp": time.time(),
+    }
+    base.update(kwargs)
+    event = SimpleNamespace(**base)
+
+    def to_dict() -> dict[str, Any]:
+        return {
+            "type": event.type,
+            "source": event.source,
+            "stage": event.stage,
+            "content": event.content,
+            "metadata": event.metadata,
+            "session_id": event.session_id,
+            "turn_id": event.turn_id,
+            "seq": event.seq,
+            "timestamp": event.timestamp,
+        }
+
+    event.to_dict = to_dict  # type: ignore[method-assign]
+    return event
+
+
+async def _events_from_kernel(kernel_result: dict[str, Any]) -> AsyncIterator[Any]:
+    from knorvia.runtime.kernel_client import iter_legacy_events
+
+    for raw in iter_legacy_events(kernel_result):
+        yield _event(
+            type=str(raw.get("type") or "content"),
+            source=str(raw.get("source") or "knorvia-daemon"),
+            content=str(raw.get("content") or ""),
+            metadata=dict(raw.get("metadata") or {}),
+            session_id=str(raw.get("session_id") or ""),
+            turn_id=str(raw.get("turn_id") or ""),
+            seq=int(raw.get("seq") or 0),
+        )
+
+
+def _should_capture_assistant_content(event: Any) -> bool:
+    if event.type != "content":
         return False
     metadata = event.metadata or {}
     call_id = metadata.get("call_id")
@@ -50,22 +104,34 @@ def _should_capture_assistant_content(event: StreamEvent) -> bool:
 
 def _resolve_turn_outcome(
     assistant_events: Sequence[dict[str, Any]],
-    done_event: StreamEvent | None,
+    done_event: Any | None,
 ) -> tuple[str, str]:
     """Resolve the persisted turn status and error from the terminal protocol."""
     done_metadata = (done_event.metadata or {}) if done_event is not None else {}
-    status = str(done_metadata.get("status") or "completed")
-    if status not in _FINAL_TURN_STATUSES:
-        status = "completed"
+    raw_status = done_metadata.get("status")
+    status = str(raw_status or "completed")
+    # The legacy session schema has no `interrupted` state. Preserve the
+    # daemon's authoritative value as `remoteStatus` on the event, but store a
+    # compatible failure rather than silently reporting a successful turn.
+    if status == "interrupted":
+        status = "failed"
+    elif status not in _FINAL_TURN_STATUSES:
+        status = "failed" if raw_status else "completed"
 
     error = ""
     for event in reversed(assistant_events):
         metadata = event.get("metadata")
         metadata = metadata if isinstance(metadata, dict) else {}
-        if event.get("type") != StreamEventType.ERROR.value or not metadata.get("turn_terminal"):
+        if event.get("type") != "error" or not metadata.get("turn_terminal"):
             continue
         terminal_status = str(metadata.get("status") or "failed")
-        status = terminal_status if terminal_status in _FINAL_TURN_STATUSES else "failed"
+        status = (
+            "failed"
+            if terminal_status == "interrupted"
+            else terminal_status
+            if terminal_status in _FINAL_TURN_STATUSES
+            else "failed"
+        )
         if status == "completed":
             status = "failed"
         error = str(event.get("content") or "")
@@ -74,7 +140,7 @@ def _resolve_turn_outcome(
     return status, error
 
 
-def _narration_marker_call_id(event: StreamEvent) -> str | None:
+def _narration_marker_call_id(event: Any) -> str | None:
     """call_id of a chat-loop round that resolved as narration (a short
     preamble streamed alongside a tool call). Its text belongs to the trace,
     not the persisted answer, so it is excluded when assembling content.
@@ -197,6 +263,12 @@ def _string_list(value: Any) -> list[str]:
 def _mastery_path_id(value: Any) -> str:
     """Normalize the optional session-to-mastery-path association."""
     return str(value or "").strip()
+
+
+def _office_selection_dict(value: Any) -> dict[str, Any]:
+    from knorvia.services.office_artifacts.contracts import normalize_client_selection
+
+    return normalize_client_selection(value)
 
 
 def _llm_selection_dict(value: Any) -> dict[str, str] | None:
@@ -894,8 +966,8 @@ class TurnRuntimeManager:
             session_metadata["regenerate"] = True
         await self._publish_live_event(
             execution,
-            StreamEvent(
-                type=StreamEventType.SESSION,
+            _event(
+                type="session",
                 source="turn_runtime",
                 metadata=session_metadata,
             ),
@@ -1386,7 +1458,7 @@ class TurnRuntimeManager:
             from knorvia.agents.notebook import NotebookAnalysisAgent
             from knorvia.book.context import build_book_context
             from knorvia.core.context import Attachment, UnifiedContext
-            from knorvia.runtime.orchestrator import ChatOrchestrator
+            from knorvia.runtime.kernel_client import start_turn_async
             from knorvia.services.memory import get_memory_store
             from knorvia.services.model_selection.runtime import (
                 activate_llm_selection,
@@ -1540,7 +1612,7 @@ class TurnRuntimeManager:
             llm_config, llm_scope_token = activate_llm_selection(payload.get("llm_selection"))
             builder = ContextBuilder(self.store)
 
-            async def _emit_context_event(event: StreamEvent) -> None:
+            async def _emit_context_event(event: Any) -> None:
                 if event.source in {"context", "context_builder"}:
                     return
                 await self._publish_live_event(execution, event)
@@ -1826,6 +1898,9 @@ class TurnRuntimeManager:
                     "history_budget": history_result.budget,
                     "turn_id": turn_id,
                     "question_followup_context": followup_question_context or {},
+                    # Spreadsheet selection frozen at send time; the agentic
+                    # pipeline forwards it to office tools server-side only.
+                    "office_selection": _office_selection_dict(payload.get("office_selection")),
                     "notebook_references": notebook_references,
                     "history_references": history_references,
                     "question_notebook_references": question_notebook_references,
@@ -1854,12 +1929,12 @@ class TurnRuntimeManager:
                 },
             )
 
-            orch = ChatOrchestrator()
-            pending_done_event: StreamEvent | None = None
-            async for event in orch.handle(context):
-                if event.type == StreamEventType.SESSION:
+            kernel_result = await start_turn_async(str(context.user_message or ""))
+            pending_done_event: Any | None = None
+            async for event in _events_from_kernel(kernel_result):
+                if event.type == "session":
                     continue
-                if event.type == StreamEventType.DONE:
+                if event.type == "done":
                     pending_done_event = event
                     continue
                 payload_event = await self._publish_live_event(execution, event)
@@ -1937,8 +2012,8 @@ class TurnRuntimeManager:
             )
             await self.store.update_turn_status(turn_id, turn_status, turn_error)
             if pending_done_event is None:
-                pending_done_event = StreamEvent(
-                    type=StreamEventType.DONE,
+                pending_done_event = _event(
+                    type="done",
                     source=capability_name,
                     metadata={"status": turn_status},
                 )
@@ -1987,8 +2062,8 @@ class TurnRuntimeManager:
             if not stream_done_sent:
                 await self._publish_live_event(
                     execution,
-                    StreamEvent(
-                        type=StreamEventType.ERROR,
+                    _event(
+                        type="error",
                         source=capability_name,
                         content="Turn cancelled",
                         metadata={"turn_terminal": True, "status": "cancelled"},
@@ -1996,8 +2071,8 @@ class TurnRuntimeManager:
                 )
                 await self._publish_live_event(
                     execution,
-                    StreamEvent(
-                        type=StreamEventType.DONE,
+                    _event(
+                        type="done",
                         source=capability_name,
                         metadata={"status": "cancelled"},
                     ),
@@ -2046,8 +2121,8 @@ class TurnRuntimeManager:
                 logger.error("Turn %s failed: %s", turn_id, exc, exc_info=True)
                 await self._publish_live_event(
                     execution,
-                    StreamEvent(
-                        type=StreamEventType.ERROR,
+                    _event(
+                        type="error",
                         source=capability_name,
                         content=str(exc),
                         metadata={"turn_terminal": True, "status": "failed"},
@@ -2055,8 +2130,8 @@ class TurnRuntimeManager:
                 )
                 await self._publish_live_event(
                     execution,
-                    StreamEvent(
-                        type=StreamEventType.DONE,
+                    _event(
+                        type="done",
                         source=capability_name,
                         metadata={"status": "failed"},
                     ),
@@ -2089,9 +2164,9 @@ class TurnRuntimeManager:
     async def _publish_live_event(
         self,
         execution: _TurnExecution,
-        event: StreamEvent,
+        event: Any,
     ) -> dict[str, Any]:
-        if event.type == StreamEventType.DONE and not event.metadata.get("status"):
+        if event.type == "done" and not event.metadata.get("status"):
             event.metadata = {**event.metadata, "status": "completed"}
         event.session_id = execution.session_id
         event.turn_id = execution.turn_id
@@ -2223,8 +2298,8 @@ class TurnRuntimeManager:
 
         await self._publish_live_event(
             execution,
-            StreamEvent(
-                type=StreamEventType.SESSION_META,
+            _event(
+                type="session_meta",
                 source="turn_runtime",
                 stage="title",
                 content=title,

@@ -1,0 +1,3 @@
+User-agent: *
+Allow: /
+Sitemap: https://knorvia.xyz/sitemap.xml

@@ -33,7 +33,6 @@ from knorvia.core.agentic.labels import LABEL_UNKNOWN, find_inline_labels
 from knorvia.core.agentic.messages import assistant_message_with_tool_calls
 from knorvia.core.agentic.tool_dispatch import DispatchOutcome
 from knorvia.core.agentic.usage import UsageTracker
-from knorvia.core.stream_bus import StreamBus
 
 
 @dataclass(frozen=True)
@@ -191,7 +190,7 @@ async def run_agentic_loop(
     completion_kwargs: dict[str, Any],
     binding: str | None,
     tool_schemas: list[dict[str, Any]] | None,
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
     max_iterations: int,
@@ -462,7 +461,7 @@ def _protocol_violation(
 
 async def _emit_retry_notice(
     *,
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
     host: LoopHost,

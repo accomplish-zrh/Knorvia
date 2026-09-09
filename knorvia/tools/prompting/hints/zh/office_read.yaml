@@ -1,0 +1,10 @@
+short_description: "只读检查草稿制品：概览、区域读取、查找、语义差异、修订历史。"
+when_to_use: "每次 office_apply 之前必须调用，以获取最新单元格内容和 base_revision。也用于查看修订间的变化或了解文件内容。"
+input_format: |
+  {"action": "overview", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "range", "draft_id": "abcd1234", "artifact_id": "art_1", "sheet": "Data", "range": "A1:C10"}
+  {"action": "find", "draft_id": "abcd1234", "artifact_id": "art_1", "query": "合计", "scope": "Data!A1:F200"}
+  {"action": "features", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "diff", "draft_id": "abcd1234", "artifact_id": "art_1", "from_revision": 2}
+  {"action": "history", "draft_id": "abcd1234", "artifact_id": "art_1"}
+guideline: "overview 会列出导入文件支持/不支持的特性与允许的操作，处理导入文件时先读它。区域读取返回值 + 公式 + 缓存值 + 样式 + 合并信息。diff 默认比较最新修订与其父修订。不要猜测单元格内容：先读，再基于读到的修订提交。"

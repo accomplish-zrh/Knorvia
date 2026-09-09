@@ -1,5 +1,65 @@
 # Knorvia — Agent-Native Architecture
 
+> **Public source snapshot (2026-09-09):** The current custom Rust runtime is
+> checked in at `native/knorvia-rs`. `native/README.md` pins the unchanged
+> upstream App Server source. This makes the public repository reproducible;
+> build caches and local runtime homes stay outside source control. A separate
+> existing engine checkout may still be used for execution and build caches,
+> but new custom runtime changes must be kept consistent with the checked-in
+> source rather than silently diverging between two copies.
+
+> **Browser preference (user, 2026-09-06):** Use the installed Google Chrome
+> for debugging and browser acceptance by default. Prefer the installed Chrome
+> control extension through the trusted Node REPL browser runtime. Use dedicated
+> task tabs and isolated product test data. Report an unavailable extension
+> connection accurately; do not inherit a Tabbit-only workflow.
+
+> **CURRENT (2026-09-05): General Agent Workbench.** The current product decision
+> is `docs/architecture/KN-ADR-002-general-agent-workbench.md`, which supersedes
+> earlier fixed navigation, learning/creative feature parity, and implementation
+> ordering. The user explicitly authorized this change of standard.
+>
+> The default product lives at `web/app/workbench` and `web/components/native`.
+> Its project/task/history/output/extension flows use Knorvia JSON-RPC through
+> the desktop preload or the loopback development gateway. Durable Thread,
+> Turn, Item, Approval and Artifact state belongs to the Rust control/store;
+> the full Codex-derived Kernel is the sole task execution owner. Streaming
+> text is provisional; only durable snapshots can declare task completion.
+>
+> Learning and creation are optional domain capabilities, not mandatory root
+> providers, navigation, or startup services. Legacy routes and user data remain
+> migration sources. Do not reconnect the default workbench to the Python loop
+> or expand the legacy bridge to implement new task features. Retain explicit
+> opt-in compatibility switches where needed.
+>
+> Validate native changes against the actual daemon and Kernel with an isolated
+> local Responses fixture as well as scoped tests and browser interactions.
+> Report this accurately as local fixture coverage, not live-provider or packaged
+> cross-platform release coverage. Preserve unrelated user changes.
+
+> **FROZEN (GOV-002, 2026-09-04).** The body of this file still describes the
+> **legacy** Python Agent Runtime (`ChatOrchestrator`, `StreamBus`, Python
+> Agent Loop, FastAPI/WebSocket public control plane). That description is
+> **historical inventory**, not the long-term center.
+>
+> Accepted architecture: `docs/architecture/KN-ADR-001-codex-kernel-cutover.md`
+> and Goal `docs/architecture/KN-GOAL-SUPER-WORKBENCH-001.md`. Progress:
+> `docs/migration/MIGRATION_LEDGER.md`.
+>
+> **Do not expand** ChatOrchestrator, StreamBus/`StreamEvent` as a public
+> fact protocol, the Python Agent Loop, duplicate Session/Provider agent
+> control, or FastAPI as the public Thread/Turn control plane. New work
+> belongs on the in-tree Rust Knorvia Kernel (full-history fork of
+> `openai/codex`), `knorvia` CLI, `knorvia-daemon`, Knorvia Protocol, and
+> Pack / Tool / Worker / Artifact / Job. The old runtime may be an oracle
+> or temporary adapter during migration only; dual-track is not the end
+> state.
+>
+> Worktree protection, tests, and code-quality rules below remain in force.
+> Uncommitted Office Artifact / Creative Library files listed in the
+> ledger must not be reset, cleaned, overwritten, or stashed without
+> explicit owner handoff.
+
 ## Overview
 
 Knorvia is an **agent-native** intelligent learning companion organized
@@ -102,7 +162,7 @@ knorvia start                   # backend + frontend together
 
 | Path                                       | Purpose                              |
 | ------------------------------------------ | ------------------------------------ |
-| `knorvia/runtime/orchestrator.py`        | `ChatOrchestrator` — unified entry   |
+| `knorvia/runtime/kernel_client.py`       | Python adapter to `knorvia-daemon`   |
 | `knorvia/runtime/launcher.py`            | Backend + frontend lifecycle / port discovery |
 | `knorvia/runtime/registry/`              | Tool + Capability registries         |
 | `knorvia/runtime/bootstrap/builtin_capabilities.py` | Built-in capability class paths |
@@ -117,7 +177,7 @@ knorvia start                   # backend + frontend together
 | `knorvia/capabilities/`                  | Built-in capability implementations  |
 | `knorvia/app.py`                         | `KnorviaApp` — Python SDK facade    |
 | `knorvia_cli/main.py`                    | Typer CLI entry point                |
-| `knorvia/api/routers/unified_ws.py`      | Unified WebSocket endpoint           |
+| `desktop/kernel-engine.js`               | Desktop Agent Runtime: knorvia-daemon |
 
 ## Dependency Layers
 

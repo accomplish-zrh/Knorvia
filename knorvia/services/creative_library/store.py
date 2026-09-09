@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 import hashlib
 import json
+import os
 from pathlib import Path
 import sqlite3
 import threading
@@ -1123,15 +1124,16 @@ class CreativeLibraryStore:
             if len(body) > MAX_ENTRY_TEXT:
                 raise ValueError("Document exceeds the size limit")
             data = encode_library_office(current["kind"], body)
-            relative = relative or f"files/{entry_id}{office_ext(current['kind'])}"
-            target = (self.root / relative).resolve()
-            if self.root not in target.parents:
-                raise ValueError("Unsafe library path")
-            target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(data)
-            content = ""
-            size_bytes = len(data)
-            digest = hashlib.sha256(data).hexdigest()
+            replaced = self._replace_office_entry_bytes(
+                entry_id,
+                data,
+                expect_sha256=str(current.get("sha256") or ""),
+                title=title if "title" in patch else None,
+                fallback_ext=office_ext(current["kind"]),
+            )
+            if replaced is None:
+                raise ValueError("Library entry changed while it was being edited")
+            return replaced
         with self._lock, self._connect() as db:
             db.execute(
                 """UPDATE entries SET title=?, content=?, relative_path=?, size_bytes=?, sha256=?, updated_at=?
@@ -1148,18 +1150,43 @@ class CreativeLibraryStore:
             )
         return self.get_entry(entry_id) or {}
 
-    def replace_entry_bytes(self, entry_id: str, data: bytes) -> dict[str, Any]:
+    def replace_entry_bytes(
+        self,
+        entry_id: str,
+        data: bytes,
+        *,
+        expect_sha256: str | None = None,
+    ) -> dict[str, Any] | None:
         """Replace an Excel library file without the text-encode round-trip.
 
         Agent ``PATCH content`` still goes through ``encode_library_office``.
         The grid editor writes workbook bytes here so other sheets, formulas,
-        and formatting survive.
+        and formatting survive. When ``expect_sha256`` is supplied, checking
+        the old bytes, publishing the new immutable version and moving the
+        database pointer are one serialized transaction.
         """
         current = self._get_entry_row(entry_id)
         if not current:
             raise KeyError(entry_id)
         if current["kind"] != "excel":
             raise ValueError("Only Excel workbooks can be replaced as a spreadsheet")
+        return self._replace_office_entry_bytes(
+            entry_id,
+            data,
+            expect_sha256=expect_sha256,
+            fallback_ext=".xlsx",
+        )
+
+    def _replace_office_entry_bytes(
+        self,
+        entry_id: str,
+        data: bytes,
+        *,
+        expect_sha256: str | None,
+        title: str | None = None,
+        fallback_ext: str,
+    ) -> dict[str, Any] | None:
+        """Publish an Office entry through an immutable file + SQLite CAS."""
         if not data:
             raise ValueError("Workbook is empty")
         if len(data) > MAX_FILE_BYTES:
@@ -1168,30 +1195,85 @@ class CreativeLibraryStore:
             raise ValueError("Not a valid Excel workbook")
         from knorvia.services.creative_library.office import office_ext, office_mime
 
-        relative = (
-            str(current.get("relative_path") or "") or f"files/{entry_id}{office_ext('excel')}"
-        )
-        target = (self.root / relative).resolve()
-        if self.root not in target.parents:
-            raise ValueError("Unsafe library path")
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_bytes(data)
         digest = hashlib.sha256(data).hexdigest()
-        with self._lock, self._connect() as db:
-            db.execute(
-                """UPDATE entries SET relative_path=?, size_bytes=?, sha256=?, mime=?, content=?, updated_at=?
-                   WHERE id=? AND deleted_at IS NULL""",
-                (
-                    relative,
-                    len(data),
-                    digest,
-                    office_mime("excel"),
-                    "",
-                    time.time(),
-                    entry_id,
-                ),
-            )
+        published: Path | None = None
+        created = False
+        try:
+            with self._lock, self._connect() as db:
+                db.execute("BEGIN IMMEDIATE")
+                row = db.execute(
+                    "SELECT * FROM entries WHERE id=? AND deleted_at IS NULL",
+                    (entry_id,),
+                ).fetchone()
+                if row is None:
+                    raise KeyError(entry_id)
+                current = dict(row)
+                kind = str(current.get("kind") or "")
+                if kind not in OFFICE_ENTRY_KINDS:
+                    raise ValueError("Only Office entries can store Office package bytes")
+                old_relative = str(current.get("relative_path") or "")
+                old_path = (self.root / old_relative).resolve() if old_relative else None
+                if old_path is None or self.root not in old_path.parents or not old_path.is_file():
+                    raise ValueError("Library entry has no readable Office file")
+                old_digest = hashlib.sha256(old_path.read_bytes()).hexdigest()
+                if expect_sha256 is not None and old_digest != expect_sha256:
+                    return None
+
+                ext = office_ext(kind) if kind in OFFICE_ENTRY_KINDS else fallback_ext
+                relative = Path("files") / f"{entry_id}-{digest}{ext or fallback_ext}"
+                published = (self.root / relative).resolve()
+                if self.root not in published.parents:
+                    raise ValueError("Unsafe library path")
+                published.parent.mkdir(parents=True, exist_ok=True)
+                if published.is_file():
+                    if hashlib.sha256(published.read_bytes()).hexdigest() != digest:
+                        raise ValueError("Stored library version does not match its content hash")
+                else:
+                    created = True
+                    self._publish_library_version(published, data)
+                safe_title = (
+                    str(title).strip()[:MAX_TITLE] or str(current["title"])
+                    if title is not None
+                    else str(current["title"])
+                )
+                db.execute(
+                    """UPDATE entries SET title=?, relative_path=?, size_bytes=?, sha256=?, mime=?, content=?, updated_at=?
+                       WHERE id=? AND deleted_at IS NULL""",
+                    (
+                        safe_title,
+                        relative.as_posix(),
+                        len(data),
+                        digest,
+                        office_mime(kind),
+                        "",
+                        time.time(),
+                        entry_id,
+                    ),
+                )
+        except Exception:
+            if created and published is not None:
+                try:
+                    published.unlink(missing_ok=True)
+                except OSError:
+                    pass
+            raise
         return self.get_entry(entry_id) or {}
+
+    @staticmethod
+    def _publish_library_version(target: Path, data: bytes) -> None:
+        """Fsync and atomically expose one immutable content version."""
+        tmp = target.parent / f".{uuid4().hex}.tmp"
+        try:
+            with open(tmp, "wb") as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, target)
+        finally:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def move_entry(self, entry_id: str, parent_id: str | None) -> dict[str, Any]:
         current = self._get_entry_row(entry_id)

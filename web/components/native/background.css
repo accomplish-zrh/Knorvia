@@ -1,0 +1,46 @@
+/* One stationary image layer. Scrolling moves content, never the photograph. */
+.nw-background-host { position: relative; isolation: isolate; min-height: 100dvh; }
+.nw-background-canvas { position: fixed; inset: 0; z-index: -1; pointer-events: none; overflow: clip; contain: strict; }
+.nw-background-photo { position: absolute; inset: -30px; width: calc(100% + 60px); height: calc(100% + 60px); max-width: none; object-fit: var(--nw-photo-fit, cover); filter: blur(var(--nw-photo-blur, 6px)); }
+.nw-background-photo[data-fit="contain"] { inset: 0; width: 100%; height: 100%; }
+.nw-background-host[data-background="true"] .nw-root {
+  --nw-canvas: color-mix(in srgb, var(--nw-bg) 36%, transparent);
+  --nw-sidebar-surface: color-mix(in srgb, var(--nw-sidebar) 56%, transparent);
+  --nw-reading: color-mix(in srgb, var(--nw-bg) 94%, transparent);
+  --nw-popover: color-mix(in srgb, var(--nw-bg) 98%, transparent);
+  --nw-surface: var(--nw-reading);
+  background: transparent;
+}
+html[data-window-frost] .nw-background-host[data-background="true"] .nw-root {
+  --nw-canvas: color-mix(in srgb, var(--nw-bg) var(--frost-canvas, 45%), transparent);
+  --nw-sidebar-surface: color-mix(in srgb, var(--nw-sidebar) var(--frost-sidebar, 43%), transparent);
+  --nw-reading: color-mix(in srgb, var(--nw-bg) var(--frost-plate, 91%), transparent);
+}
+.nw-background-host[data-background="true"] .nw-root :is(.nw-main, .nw-settings-main) { background: var(--nw-canvas); }
+.nw-root .nw-background-card { border: 1px solid var(--nw-line); border-radius: 18px; background: var(--nw-reading); overflow: hidden; transition: border-color 130ms, box-shadow 180ms; }
+.nw-root .nw-background-card.is-dragging { border-color: var(--nw-action); box-shadow: 0 0 0 3px color-mix(in srgb, var(--nw-action) 12%, transparent); }
+.nw-background-overview { padding: 22px; display: flex; align-items: center; gap: 20px; min-width: 0; }
+.nw-root .nw-background-thumbnail { display: grid; place-items: center; position: relative; width: 152px; height: 100px; flex-shrink: 0; padding: 0; border: 1px solid var(--nw-line); border-radius: 12px; background: var(--nw-soft); color: var(--nw-muted); overflow: hidden; }
+.nw-background-thumbnail > img { width: 100%; height: 100%; object-fit: cover; }
+.nw-background-thumbnail-action { position: absolute; inset: 0; display: grid; place-items: center; color: white; background: #0005; opacity: 0; transition: opacity 160ms; }
+.nw-background-thumbnail:is(:hover, :focus-visible) .nw-background-thumbnail-action { opacity: 1; }
+.nw-background-description { flex: 1; min-width: 0; }
+.nw-background-description > strong { display: block; font-size: 14px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.nw-background-description > p { font-size: 12px; color: var(--nw-muted); line-height: 1.6; margin-top: 6px; }
+.nw-background-actions { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+.nw-background-controls { margin: 0; min-width: 0; padding: 22px; border: 0; border-top: 1px solid var(--nw-line); display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+.nw-background-fit { grid-column: 1 / -1; display: flex; align-items: center; gap: 14px; font-size: 12px; }
+.nw-background-fit > .nw-icon { margin-left: auto; }
+.nw-root .nw-background-fit .nw-segmented { width: auto; min-width: 0; }
+.nw-root .nw-background-fit .nw-segmented button { width: auto; min-width: 56px; padding-inline: 12px; white-space: nowrap; }
+.nw-background-footnote { padding: 13px 22px; display: flex; flex-wrap: wrap; justify-content: space-between; gap: 6px 16px; border-top: 1px solid var(--nw-line); color: var(--nw-muted); font-size: 11px; line-height: 1.6; }
+.nw-background-error { font-size: 12px; color: var(--nw-error); margin-top: 12px; }
+@media (max-width: 650px) {
+  .nw-background-overview { flex-wrap: wrap; padding: 16px; gap: 14px; }
+  .nw-root .nw-background-thumbnail { width: 100%; height: 148px; }
+  .nw-background-controls { padding: 18px 16px; grid-template-columns: 1fr; gap: 22px; }
+  .nw-background-fit { gap: 8px; flex-wrap: wrap; }
+  .nw-background-footnote { padding: 12px 16px; }
+  .nw-background-host[data-background="true"] .nw-root :is(.nw-sidebar, .nw-settings-sidebar) { background: var(--nw-popover); }
+}
+@media (forced-colors: active) { .nw-background-canvas { display: none; } .nw-background-host[data-background="true"] .nw-root { --nw-canvas: Canvas; --nw-sidebar-surface: Canvas; --nw-reading: Canvas; background: Canvas; } }

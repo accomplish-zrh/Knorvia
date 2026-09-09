@@ -1,3 +1,21 @@
+## Native execution engine and product website (2026-09-09)
+
+- The native workbench uses the OpenAI Codex App Server from
+  https://github.com/openai/codex at commit
+  `8e6a44b428e31f91b21edc97904fcdf4f0931ade`, Apache-2.0. Its full upstream
+  notices must accompany a distributed runtime. No upstream `codex-rs`
+  behavior patch is included in this source snapshot. See `native/README.md`.
+- The product website vendors Three.js 0.160.0 and its RoomEnvironment helper
+  under MIT; original license: `product-site/assets/THREE-LICENSE.txt`.
+- GSAP / ScrollTrigger 3.13.0 retain their distributed notices and standard
+  license reference in `product-site/assets/GSAP-NOTICE.txt`.
+- Lucide icons retain `product-site/assets/LUCIDE-LICENSE.txt`.
+- Geist fonts retain `product-site/assets/GEIST-LICENSE.txt` (SIL OFL 1.1).
+- ThreeUI Sylva and its public Community gallery were visual references for
+  material, layering and motion. No ThreeUI Pro code, paid asset or reference
+  photography is incorporated. The website's 3D ribbon and lighting scenes
+  are original code; product screenshots use isolated local demonstration data.
+
 ## FlyingMouse Format (design reference; no incorporated code)
 
 - Project: [LaoFeng-mouse/flyingmouse-format](https://github.com/LaoFeng-mouse/flyingmouse-format) — 飞鼠格式, an offline Windows file converter by 牢蜂 (LaoFeng)

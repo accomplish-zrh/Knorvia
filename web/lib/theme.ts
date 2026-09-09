@@ -3,7 +3,16 @@
  * Handles light/dark theme with localStorage fallback and system preference detection
  */
 
-export type Theme = "light" | "dark" | "glass" | "snow";
+import palettes from "./appearance-palettes.json";
+
+// The renderer, first paint, native caption and loading window share one palette.
+export const THEME_PALETTES = palettes;
+export type Theme = keyof typeof THEME_PALETTES;
+export const THEMES = Object.keys(THEME_PALETTES) as Theme[];
+export function isTheme(value: unknown): value is Theme {
+  return typeof value === "string" && Object.hasOwn(THEME_PALETTES, value);
+}
+export function isDarkTheme(theme: Theme): boolean { return THEME_PALETTES[theme].dark; }
 
 export const THEME_STORAGE_KEY = "knorvia-theme";
 
@@ -35,12 +44,7 @@ export function getStoredTheme(): Theme | null {
 
   try {
     const stored = localStorage.getItem(THEME_STORAGE_KEY);
-    if (
-      stored === "light" ||
-      stored === "dark" ||
-      stored === "glass" ||
-      stored === "snow"
-    ) {
+    if (isTheme(stored)) {
       return stored;
     }
   } catch (e) {
@@ -85,10 +89,16 @@ export function applyThemeToDocument(theme: Theme): void {
   if (typeof document === "undefined") return;
 
   const html = document.documentElement;
+  const palette = THEME_PALETTES[theme];
+  html.dataset.theme = theme;
+  html.style.colorScheme = palette.dark ? "dark" : "light";
+  for (const [token, color] of Object.entries(palette.colors)) {
+    html.style.setProperty(`--kn-theme-${token}`, color);
+  }
 
   html.classList.remove("dark", "theme-glass", "theme-snow");
 
-  if (theme === "dark") {
+  if (palette.dark) {
     html.classList.add("dark");
   } else if (theme === "glass") {
     html.classList.add("theme-glass");
@@ -120,6 +130,15 @@ export function initializeTheme(): Theme {
  * Set theme and persist it
  */
 export function setTheme(theme: Theme): void {
+  // The old Glass theme implicitly enabled frost. Preserve that only during
+  // migration; choosing a colour must never switch the window effect on/off.
+  if (typeof window !== "undefined") {
+    try {
+      if (localStorage.getItem("knorvia-window-frost") === null) {
+        localStorage.setItem("knorvia-window-frost", String(getStoredTheme() === "glass"));
+      }
+    } catch { /* storage is optional */ }
+  }
   applyThemeToDocument(theme);
   saveThemeToStorage(theme);
   notifyThemeChange(theme);

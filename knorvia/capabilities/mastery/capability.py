@@ -1,11 +1,11 @@
-"""Mastery Path capability — mastery-based tutoring driven by the chat loop.
+"""Mastery Path capability — mastery-based tutoring on the Knorvia Kernel.
 
-There is no bespoke state machine here anymore. The chat agent loop IS the
-tutor: this capability only marks the turn as mastery mode and resolves the
-active path id, then runs the standard agentic chat pipeline. The pipeline
-mounts the mastery tools (``mastery_status`` / ``mastery_quiz`` /
-``mastery_grade`` / ``mastery_assess`` / ``mastery_build``) and injects the
-tutor playbook; the pure engine in :mod:`knorvia.learning` owns the hard,
+There is no bespoke state machine here anymore. The Kernel agent loop IS the
+tutor: this capability only marks the turn as mastery mode, resolves the
+active path id, and streams the turn through ``knorvia-daemon``. The mastery
+tools (``mastery_status`` / ``mastery_quiz`` / ``mastery_grade`` /
+``mastery_assess`` / ``mastery_build``) move to the learning pack with the
+pack migration; the pure engine in :mod:`knorvia.learning` owns the hard,
 per-type mastery gate and the spaced-repetition arithmetic.
 
 Design axiom (shared with chat): the intelligence lives at the loop's exit —
@@ -17,11 +17,8 @@ from __future__ import annotations
 
 import re
 
-from knorvia.agents.chat.agentic_pipeline import AgenticChatPipeline
-from knorvia.capabilities.mastery.tools import MASTERY_TOOL_NAMES
 from knorvia.core.capability_protocol import BaseCapability, CapabilityManifest
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
 
 _UNSAFE_ID_CHARS = re.compile(r"[^A-Za-z0-9_-]")
 
@@ -58,19 +55,24 @@ class MasteryPathCapability(BaseCapability):
     manifest = CapabilityManifest(
         name="mastery_path",
         description=(
-            "Mastery-based tutoring: the chat agent loop drives an adaptive "
+            "Mastery-based tutoring: the Kernel agent loop drives an adaptive "
             "mastery path with a hard, per-type mastery gate and spaced review."
         ),
         stages=["responding"],
-        tools_used=[*MASTERY_TOOL_NAMES, "rag", "read_source", "ask_user"],
+        tools_used=["rag", "read_source", "ask_user"],
         cli_aliases=["mastery"],
     )
 
-    async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
+    async def run(self, context: UnifiedContext, stream: object) -> None:
+        # Lazy import: tests patch the daemon stream at its home module.
+        from knorvia.runtime.kernel_client import stream_as_stream_events
+
         context.metadata["mastery_mode"] = True
         context.metadata["mastery_path_id"] = resolve_mastery_path_id(context)
-        pipeline = AgenticChatPipeline(language=context.language)
-        await pipeline.run(context, stream)
+        emit = getattr(stream, "emit", None)
+        async for event in stream_as_stream_events(str(context.user_message or "")):
+            if callable(emit):
+                await emit(event)
 
 
 __all__ = ["MasteryPathCapability", "resolve_mastery_path_id"]

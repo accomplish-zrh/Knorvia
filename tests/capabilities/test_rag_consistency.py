@@ -20,28 +20,20 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
 
 from knorvia.agents.chat.agentic_pipeline import AgenticChatPipeline
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream import StreamEvent, StreamEventType
-from knorvia.core.stream_bus import StreamBus
+from knorvia.core.stream import StreamEvent
+from tests._harness.stream_bus import StreamBus
 
 
 async def _drain(bus: StreamBus, task) -> list[StreamEvent]:
     await task
     await bus.close()
     return [event async for event in bus.subscribe()]
-
-
-def _fake_llm_config() -> MagicMock:
-    cfg = MagicMock()
-    cfg.api_key = "sk-test"
-    cfg.base_url = None
-    cfg.api_version = None
-    return cfg
 
 
 # ---------------------------------------------------------------------------
@@ -105,26 +97,23 @@ def test_deep_solve_mounts_rag_when_knowledge_base_attached(
 
 @pytest.mark.asyncio
 async def test_deep_research_forwards_enabled_tools_and_kb_unchanged() -> None:
-    """The capability passes the user's composer toggles (``enabled_tools``)
-    and the attached KB (``kb_name``) through to the pipeline as-is. There
-    is no per-source gating: ``compose_enabled_tools`` (run inside the
-    pipeline) is the single arbiter of what the block loop sees."""
+    """Production research turns invoke ``research.knowledge`` and forward
+    composer toggles plus the attached KB in the pack extra payload."""
     from knorvia.agents.research.capability import DeepResearchCapability
 
-    captured_kwargs: dict[str, Any] = {}
+    captured: dict[str, Any] = {}
 
-    class _FakePipeline:
-        def __init__(self, **kwargs: Any) -> None:
-            captured_kwargs.update(kwargs)
-
-        async def run(self, *, stream: StreamBus, **_kwargs: Any) -> dict[str, Any]:
-            return {
-                "response": "",
-                "output_dir": "",
-                "outline_preview": True,
-                "topic": "topic",
-                "sub_topics": [{"title": "Subtopic 1", "overview": "Overview 1"}],
+    async def fake_emit(stream, *, source: str, pack_id: str, user_message: str, extra=None):
+        captured.update(
+            {
+                "source": source,
+                "pack_id": pack_id,
+                "user_message": user_message,
+                "extra": extra or {},
             }
+        )
+        await stream.content(f"{pack_id} succeeded", source=source)
+        return {"packId": pack_id, "status": "succeeded"}
 
     capability = DeepResearchCapability()
     bus = StreamBus()
@@ -140,30 +129,11 @@ async def test_deep_research_forwards_enabled_tools_and_kb_unchanged() -> None:
         language="en",
     )
 
-    with (
-        patch(
-            "knorvia.agents.research.capability.ResearchPipeline",
-            new=_FakePipeline,
-        ),
-        patch(
-            "knorvia.services.llm.config.get_llm_config",
-            return_value=_fake_llm_config(),
-        ),
-        patch(
-            "knorvia.agents.research.capability.load_config_with_main",
-            return_value={},
-        ),
-    ):
+    with patch("knorvia.runtime.kernel_client.emit_pack_on_stream", new=fake_emit):
         await _drain(bus, capability.run(context, bus))
 
-    assert captured_kwargs["enabled_tools"] == ["web_search", "paper_search"]
-    assert captured_kwargs["kb_name"] == "my-kb"
-    runtime_config = captured_kwargs.get("runtime_config") or {}
-    researching = runtime_config.get("researching", {})
-    # The legacy per-source enable_* flags must not appear in the
-    # runtime config — composition is the pipeline's job.
-    assert "enable_rag" not in researching
-    assert "enable_web_search" not in researching
-    assert "enable_paper_search" not in researching
-    assert "enable_run_code" not in researching
-    assert "sources" not in runtime_config.get("intent", {})
+    assert captured["pack_id"] == "research.knowledge"
+    assert captured["extra"]["enabled_tools"] == ["web_search", "paper_search"]
+    assert captured["extra"]["kb_name"] == "my-kb"
+    assert "enable_rag" not in captured["extra"]
+    assert "sources" not in captured["extra"]

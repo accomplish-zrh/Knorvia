@@ -1,0 +1,136 @@
+/* Retain native form, keyboard and accessibility behavior while styling the
+   entire picker in Chrome and the bundled Electron runtime. Older browsers
+   keep the existing native select as a progressive fallback. */
+@supports (appearance: base-select) {
+  :is(.nw-root, .nw-modal) select:not([multiple]):not([size]),
+  :is(.nw-root, .nw-modal) select:not([multiple]):not([size])::picker(select) {
+    appearance: base-select;
+  }
+
+  :is(.nw-root, .nw-modal) select:not([multiple]):not([size]) {
+    align-items: center;
+    gap: 10px;
+    min-height: 32px;
+    max-inline-size: 100%;
+    padding: 7px 10px;
+    border: 1px solid var(--nw-line);
+    border-radius: 9px;
+    background: var(--nw-reading);
+    color: var(--nw-ink);
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.4;
+    text-align: start;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+  }
+
+  :is(.nw-root, .nw-modal) select:not(:disabled):hover,
+  :is(.nw-root, .nw-modal) select:open {
+    background: var(--nw-soft);
+    border-color: color-mix(in srgb, var(--nw-ink) 22%, var(--nw-line));
+  }
+
+  :is(.nw-root, .nw-modal) select:focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--nw-action) 55%, transparent);
+    outline-offset: 2px;
+  }
+
+  :is(.nw-root, .nw-modal) select:focus:not(:focus-visible) { outline: none; }
+  :is(.nw-root, .nw-modal) select:disabled { opacity: .45; cursor: not-allowed; }
+
+  :is(.nw-root, .nw-modal) select::picker-icon {
+    color: var(--nw-muted);
+    font-size: 10px;
+    margin-inline-start: auto;
+    transition: rotate .15s;
+  }
+  :is(.nw-root, .nw-modal) select:open::picker-icon { rotate: 180deg; }
+
+  :is(.nw-root, .nw-modal) select::picker(select) {
+    min-inline-size: max(anchor-size(self-inline), 180px);
+    max-inline-size: min(420px, calc(100vw - 24px));
+    max-block-size: min(340px, 55dvh);
+    margin-block: 6px;
+    padding: 6px;
+    overflow: auto;
+    border: 1px solid var(--nw-line);
+    border-radius: 12px;
+    background: var(--nw-popover);
+    color: var(--nw-ink);
+    box-shadow: 0 12px 36px #0000001a, 0 2px 8px #0000000a;
+    font-family: inherit;
+    font-size: 13px;
+    line-height: 1.5;
+    scrollbar-width: thin;
+    scrollbar-color: var(--nw-line) transparent;
+  }
+
+  :is(.nw-root, .nw-modal) select option,
+  html[data-window-frost] :is(.nw-root, .nw-modal) select option {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-height: 34px;
+    padding: 7px 10px;
+    border: 0;
+    border-radius: 7px;
+    background: transparent;
+    color: var(--nw-ink);
+    white-space: normal;
+    overflow-wrap: anywhere;
+    cursor: pointer;
+  }
+  :is(.nw-root, .nw-modal) select option:checked,
+  html[data-window-frost] :is(.nw-root, .nw-modal) select option:checked {
+    background: var(--nw-soft);
+    font-weight: 500;
+  }
+  :is(.nw-root, .nw-modal) select option:is(:hover, :focus),
+  html[data-window-frost] :is(.nw-root, .nw-modal) select option:is(:hover, :focus) {
+    background: var(--nw-hover);
+    outline: none;
+  }
+  :is(.nw-root, .nw-modal) select option:disabled { opacity: .45; cursor: not-allowed; }
+  :is(.nw-root, .nw-modal) select option::checkmark {
+    order: 1;
+    margin-inline-start: auto;
+    padding-inline-start: 16px;
+    color: var(--nw-muted);
+    font-size: 12px;
+  }
+  html[data-window-frost] :is(.nw-root, .nw-modal) select::picker(select) {
+    backdrop-filter: blur(24px) saturate(1.15);
+  }
+
+  /* The composer formerly hid a system select over a duplicate label. Let the
+     actual control own its text, arrow, focus and clickable area instead. */
+  .nw-root .nw-select-label:has(select) { gap: 2px; padding: 0; border: 0; border-radius: 9px; }
+  .nw-root .nw-select-label:focus-within { outline: none; }
+  .nw-root .nw-select-label:has(select) > span,
+  .nw-root .nw-select-label:has(select) > .lucide-chevron-down { display: none; }
+  .nw-root .nw-select-label select {
+    position: static;
+    inset: auto;
+    width: auto;
+    min-width: 0;
+    max-width: 100%;
+    opacity: 1;
+    border-color: transparent;
+    background: transparent;
+    padding: 7px 8px;
+    box-shadow: none;
+  }
+  .nw-root .nw-select-label select::picker(select) { color: var(--nw-ink); }
+  .nw-root .nw-permission-select > svg, .nw-root .nw-project-select > svg { margin-inline-start: 6px; flex-shrink: 0; }
+  .nw-root .nw-permission-select select { color: inherit; }
+  .nw-root .ns-parameters select { min-height: 28px; padding: 4px 7px; font-size: 12px; }
+  .nw-root :is(.nw-composer, .ns-composer-tools) select:not([multiple]):not([size]) { border-color: transparent; background: transparent; }
+  .nw-root :is(.nw-composer, .ns-composer-tools) select:not(:disabled):hover,
+  .nw-root :is(.nw-composer, .ns-composer-tools) select:open { background: var(--nw-soft); }
+
+  @media (prefers-reduced-motion: reduce) {
+    :is(.nw-root, .nw-modal) select,
+    :is(.nw-root, .nw-modal) select::picker-icon { transition: none; }
+  }
+}

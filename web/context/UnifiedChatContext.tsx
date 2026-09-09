@@ -20,6 +20,7 @@ import {
 } from "@/context/app-shell-storage";
 import type { StreamEvent, ChatMessage, LLMSelection } from "@/lib/unified-ws";
 import { UnifiedWSClient } from "@/lib/unified-ws";
+import { takePendingOfficeSelection } from "@/lib/office-selection";
 import {
   getSession,
   deleteMessage,
@@ -1848,6 +1849,22 @@ export function UnifiedChatProvider({
         ...(effectiveLLMSelection
           ? { llm_selection: effectiveLLMSelection }
           : {}),
+        ...(() => {
+          const selection = takePendingOfficeSelection(
+            session.sessionId || undefined,
+          );
+          return selection
+            ? {
+                office_selection: {
+                  draft_id: selection.draftId,
+                  artifact_id: selection.artifactId,
+                  sheet: selection.sheet,
+                  range: selection.range,
+                  revision: selection.revision,
+                },
+              }
+            : {};
+        })(),
         ...(effectiveTurnConfig && Object.keys(effectiveTurnConfig).length > 0
           ? { config: effectiveTurnConfig }
           : {}),
@@ -1992,8 +2009,10 @@ export function UnifiedChatProvider({
   }, [sendThroughRunner]);
 
 
-  continueLastMessageRef.current = continueLastMessage;
-  regenerateLastMessageRef.current = regenerateLastMessage;
+  useEffect(() => {
+    continueLastMessageRef.current = continueLastMessage;
+    regenerateLastMessageRef.current = regenerateLastMessage;
+  });
 
   const derivedState = useMemo<ChatState>(() => {
     const current = ensureSelectedSession(state);

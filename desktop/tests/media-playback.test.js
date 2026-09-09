@@ -1,0 +1,25 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
+const crypto = require('node:crypto');
+const { createMediaPlayback } = require('../media-playback');
+test('capability playback serves bounded ranges, validates ownership and closes with studio', async t => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kn-media-range-'));
+  const file = path.join(root, '长视频.mp4'), bytes = crypto.randomBytes(1024 * 1024);
+  fs.writeFileSync(file, bytes);
+  const service = createMediaPlayback({ root }); t.after(() => service.close());
+  const media = await service.issue({ file, mime: 'video/mp4', sha256: crypto.createHash('sha256').update(bytes).digest('hex') });
+  assert.match(media.url, /^http:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{64}$/);
+  const head = await fetch(media.url, { method: 'HEAD' }); assert.equal(head.status, 200); assert.equal(head.headers.get('content-length'), String(bytes.length));
+  const range = await fetch(media.url, { headers: { Range: 'bytes=1000-1499' } }); assert.equal(range.status, 206); assert.equal(range.headers.get('content-range'), `bytes 1000-1499/${bytes.length}`); assert.deepEqual(Buffer.from(await range.arrayBuffer()), bytes.subarray(1000, 1500));
+  const tail = await fetch(media.url, { headers: { Range: 'bytes=-16' } }); assert.deepEqual(Buffer.from(await tail.arrayBuffer()), bytes.subarray(-16));
+  for (const value of ['bytes=9999999-', 'bytes=20-10', 'bytes=1-3,5-7', 'bytes=-0']) assert.equal((await fetch(media.url, { headers: { Range: value } })).status, 416);
+  assert.equal((await fetch(new URL('/missing', media.url))).status, 404);
+  assert.equal((await fetch(media.url, { method: 'POST', body: 'x' })).status, 405);
+  await assert.rejects(service.issue({ file: __filename, mime: 'video/mp4' }), /outside/);
+  fs.appendFileSync(file, 'changed'); assert.equal((await fetch(media.url)).status, 409);
+  await service.close(); await assert.rejects(fetch(media.url));
+});

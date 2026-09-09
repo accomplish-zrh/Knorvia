@@ -1,9 +1,26 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
 const listeners = new Map();
+const nativeNotificationListeners = new Set();
+
+ipcRenderer.on("knorvia:native-notification", (_event, notification) => {
+  for (const listener of nativeNotificationListeners) {
+    try { listener(notification); } catch {}
+  }
+});
 
 contextBridge.exposeInMainWorld("knorviaDesktop", {
   fetch: (request) => ipcRenderer.invoke("knorvia:fetch", request),
+  native: {
+    // This is intentionally JSON-RPC envelope in/envelope out. The renderer
+    // cannot select a child process or invoke an arbitrary daemon method.
+    request: (message) => ipcRenderer.invoke("knorvia:native-request", message),
+    onNotification: (callback) => {
+      if (typeof callback !== "function") throw new Error("Native notification listener must be a function");
+      nativeNotificationListeners.add(callback);
+      return () => nativeNotificationListeners.delete(callback);
+    },
+  },
   wsOpen: (id, path) => ipcRenderer.send("knorvia:ws-open", { id, path }),
   wsSend: (id, data) => ipcRenderer.send("knorvia:ws-send", { id, data }),
   wsClose: (id) => ipcRenderer.send("knorvia:ws-close", { id }),
@@ -19,6 +36,7 @@ contextBridge.exposeInMainWorld("knorviaDesktop", {
   },
   chrome: {
     platform: process.platform,
+    backdropSupported: process.argv.includes("--knorvia-backdrop-supported=true"),
     captionOverlay: process.platform === "win32",
     trafficLights: process.platform === "darwin",
     setTitleBarOverlay: (overlay) => ipcRenderer.send("knorvia:titlebar-overlay", overlay),

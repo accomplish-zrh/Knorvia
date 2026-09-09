@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
+import { READING_KEY, readingPreference } from "@/lib/native-reading";
 import {
   isKnorviaDesktop,
   syncDesktopChrome,
@@ -37,20 +38,33 @@ export default function DesktopChrome() {
 
   useEffect(() => {
     if (!isKnorviaDesktop()) return;
+    let lastChrome = "";
     const applyChrome = () => {
       const theme = getStoredTheme() ?? getSystemTheme();
       const frost = readStoredWindowFrost();
       applyWindowFrostToDocument(frost);
-      syncDesktopChrome(theme, frost.enabled);
+      let reducedMotion = false;
+      try { reducedMotion = readingPreference(localStorage.getItem(READING_KEY) ?? "").reducedMotion; } catch { /* Storage can be unavailable. */ }
+      const signature = `${theme}:${frost.enabled}:${reducedMotion}`;
+      if (signature === lastChrome) return;
+      lastChrome = signature;
+      syncDesktopChrome(theme, frost.enabled, reducedMotion);
     };
     applyChrome();
     const stopTheme = subscribeToThemeChanges(applyChrome);
     const stopFrost = subscribeToWindowFrost(applyChrome);
+    const storage = (event: StorageEvent) => {
+      if (event.key === null || event.key === READING_KEY || event.key === "knorvia-theme" || event.key === "knorvia-window-frost") applyChrome();
+    };
+    window.addEventListener("storage", storage);
+    window.addEventListener("knorvia-ui-preference", applyChrome);
     const chrome = window.knorviaDesktop?.chrome;
     if (!chrome) {
       return () => {
         stopTheme();
         stopFrost();
+        window.removeEventListener("storage", storage);
+        window.removeEventListener("knorvia-ui-preference", applyChrome);
       };
     }
     const syncMaximized = (value: boolean) => {
@@ -66,6 +80,8 @@ export default function DesktopChrome() {
     return () => {
       stopTheme();
       stopFrost();
+      window.removeEventListener("storage", storage);
+      window.removeEventListener("knorvia-ui-preference", applyChrome);
       stopState?.();
     };
   }, []);

@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from typing import Any, Awaitable, Callable
 
-from knorvia.core.stream import StreamEvent, StreamEventType
 from knorvia.core.trace import build_trace_metadata, derive_trace_metadata, new_call_id
 from knorvia.services.llm import clean_thinking_tags, get_llm_config, get_token_limit_kwargs
 from knorvia.services.llm import stream as llm_stream
@@ -14,7 +13,15 @@ from knorvia.utils.json_parser import parse_json_response
 
 logger = logging.getLogger(__name__)
 
-EventSink = Callable[[StreamEvent], Awaitable[None]]
+
+def _event(type_name: str, **kwargs: Any) -> Any:
+    """Build a duck-typed stream event (SimpleNamespace with .type etc.)."""
+    from types import SimpleNamespace
+
+    return SimpleNamespace(type=type_name, **kwargs)
+
+
+EventSink = Callable[[Any], Awaitable[None]]
 
 
 def _clip_text(value: str, limit: int) -> str:
@@ -67,8 +74,8 @@ class NotebookAnalysisAgent:
 
         if emit is not None:
             await emit(
-                StreamEvent(
-                    type=StreamEventType.RESULT,
+                _event(
+                    type="RESULT",
                     source="notebook_analysis",
                     metadata={
                         "observation": observation,
@@ -114,8 +121,8 @@ class NotebookAnalysisAgent:
             chunks.append(chunk)
             if emit is not None:
                 await emit(
-                    StreamEvent(
-                        type=StreamEventType.THINKING,
+                    _event(
+                        type="THINKING",
                         source="notebook_analysis",
                         stage="notebook_thinking",
                         content=chunk,
@@ -179,8 +186,8 @@ class NotebookAnalysisAgent:
 
         if emit is not None:
             await emit(
-                StreamEvent(
-                    type=StreamEventType.TOOL_CALL,
+                _event(
+                    type="TOOL_CALL",
                     source="notebook_analysis",
                     stage="notebook_acting",
                     content="notebook_lookup",
@@ -192,8 +199,8 @@ class NotebookAnalysisAgent:
                 )
             )
             await emit(
-                StreamEvent(
-                    type=StreamEventType.TOOL_RESULT,
+                _event(
+                    type="TOOL_RESULT",
                     source="notebook_analysis",
                     stage="notebook_acting",
                     content=self._tool_result_text(wanted),
@@ -242,8 +249,8 @@ class NotebookAnalysisAgent:
             chunks.append(chunk)
             if emit is not None:
                 await emit(
-                    StreamEvent(
-                        type=StreamEventType.OBSERVATION,
+                    _event(
+                        type="OBSERVATION",
                         source="notebook_analysis",
                         stage="notebook_observing",
                         content=chunk,
@@ -262,8 +269,8 @@ class NotebookAnalysisAgent:
         if emit is None:
             return
         await emit(
-            StreamEvent(
-                type=StreamEventType.STAGE_START,
+            _event(
+                type="STAGE_START",
                 source="notebook_analysis",
                 stage=stage,
                 metadata=metadata,
@@ -279,8 +286,8 @@ class NotebookAnalysisAgent:
         if emit is None:
             return
         await emit(
-            StreamEvent(
-                type=StreamEventType.STAGE_END,
+            _event(
+                type="STAGE_END",
                 source="notebook_analysis",
                 stage=stage,
                 metadata=metadata,

@@ -1,18 +1,23 @@
 {
   "name": "knorvia-desktop",
-  "version": "1.1.0-dev",
+  "version": "1.1.0",
   "private": true,
-  "description": "Knorvia AI learning and personal knowledge workspace",
+  "description": "Knorvia general-purpose local Agent workbench",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
+    "native-gateway": "node native-gateway.js --dev",
+    "native-gateway:fixture": "node tests/fixtures/start-native-gateway-fixture.js",
     "dist": "electron-builder --win nsis",
-    "test": "node --test tests/*.test.js"
+    "test": "node --test tests/*.test.js",
+    "postinstall": "node prepare-terminal.js"
   },
   "devDependencies": {
     "@electron/asar": "3.4.1",
     "electron": "^39.0.0",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "^26.0.12",
+    "ws": "^8.21.3",
+    "yazl": "3.3.1"
   },
   "build": {
     "appId": "ai.knorvia.desktop",
@@ -26,14 +31,84 @@
       "preload.js",
       "frontend-host.js",
       "protocol-stream.js",
+      "protocol-framing.js",
+      "knorvia-protocol-client.js",
+      "kernel-engine.js",
+      "builtin-skills.js",
+      "builtin-skills/**/*",
+      "native-rpc-router.js",
+      "native-runtime.js",
+      "connection-config.js",
+      "responses-probe.js",
+      "desktop-path-actions.js",
+      "workspace-preview.js",
+      "personal-library.js",
+      "personal-library-cli.js",
+      "web-renderer.js",
+      "kernel-chat-bridge.js",
+      "kernel-turn-stream.js",
       "window-chrome.js",
+      "window-lifecycle.js",
+      "window-appearance.js",
+      "startup-screen.js",
+      {
+        "from": "../web/lib",
+        "to": ".",
+        "filter": [
+          "appearance-palettes.json"
+        ]
+      },
       "win32-corners.js",
       "wallpaper.js",
       "update-check.js",
       "wallpapers/**/*",
       "package.json",
       "build/icon.ico",
-      "build/logo.png"
+      "build/logo.png",
+      "workspace-terminal.js",
+      "prepare-terminal.js",
+      "media-studio.js",
+      "media-frame-worker.js",
+      "media-sequence.js",
+      "media-composition.js",
+      "media-composition-worker.js",
+      "media-edit-import.js",
+      "media-subtitles.js",
+      "media-retake.js",
+      "article-video.js",
+      "article-video-worker.js",
+      "article-voice.ps1",
+      "studio-subtitles.js",
+      "media-lock.js",
+      "media-playback.js",
+      "studio-adapters.js",
+      "studio-comfy.js",
+      "studio-workflow.js",
+      "studio-templates.js",
+      "studio-providers.js",
+      "studio-mcp.js",
+      "cli-backends.js",
+      "cli-dispatch.js",
+      "creative-cli.js",
+      "creative-cli-service.js",
+      "learning-pack.js",
+      "openmaic-course.js",
+      "curated-catalog.js",
+      "skill-preflight.js",
+      "library-image-ops.js",
+      "creative-cli.README.md",
+      "turn-notifications.js",
+      "extension-compat.js",
+      "extension-files.js",
+      "extension-manager.js",
+      "ssh-store.js",
+      "ssh-session.js",
+      "worktree-snapshots.js",
+      "pet-atlas.js",
+      "pet-package.js",
+      "pet-runtime.js",
+      "pet-service.js",
+      "pet-workflow.js"
     ],
     "extraResources": [
       {
@@ -57,10 +132,21 @@
       "allowToChangeInstallationDirectory": true,
       "createDesktopShortcut": true,
       "createStartMenuShortcut": true
-    }
+    },
+    "asarUnpack": [
+      "node_modules/node-pty/**/*"
+    ],
+    "npmRebuild": false
   },
   "allowScripts": {
     "electron@39.8.10": true,
-    "electron-winstaller@5.4.0": true
+    "electron-winstaller@5.4.0": true,
+    "node-pty@1.1.0": true
+  },
+  "dependencies": {
+    "node-pty": "1.1.0",
+    "ssh2": "1.17.0",
+    "yaml": "2.8.2",
+    "yauzl": "3.4.0"
   }
 }

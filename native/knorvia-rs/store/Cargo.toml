@@ -1,0 +1,16 @@
+[package]
+name = "knorvia-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Knorvia product store, event journal, artifact and job runtimes."
+
+[dependencies]
+knorvia-platform-paths = { workspace = true }
+knorvia-protocol = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+thiserror = { workspace = true }

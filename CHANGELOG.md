@@ -7,7 +7,104 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Native workbench update — 2026-09-09
+
+- Publish the current Knorvia Rust runtime under `native/knorvia-rs`, with the
+  exact upstream App Server baseline and reproducible source-build instructions.
+- Consolidate the native conversation/project workbench, scoped right panel,
+  terminal, SSH, Git/worktrees, approvals and turn notifications.
+- Add the personal library, editable previews, image/video creation with pinned
+  references and first/last frames, sequential shots and tail-frame continuity.
+- Include optional composition, subtitle, article-video, Remotion and media CLI
+  workflows; the ordinary image/video studio remains available.
+- Include Bot roles, direct/group rooms and persistent conversation bindings;
+  provider profiles, reasoning controls, usage/cache accounting, memory,
+  extension compatibility and bundled learning/creation skills.
+- Refine desktop settings, themes, acrylic/background controls, startup and tool
+  activity presentation, responsive layouts and reduced-motion behavior.
+- Rebuild the product website around an original interactive Three.js brand
+  sculpture, material/lighting controls, scroll-pinned real product screens,
+  keyboard-operable previews and graceful non-WebGL/non-JavaScript fallbacks.
+- Correct integration-test synchronization: await media finalization and usage
+  ledger writes after model-turn completion, and continue waiting when a child
+  wait call times out. Explicit child cancellation is verified durably while its
+  peer finishes. Status/count/token and no-late-write checks remain strict.
+
+The source version is 1.1.0 development. This source update does not publish a
+new stable installer or change the public v1.0.0 release assets.
+
+Verification for this snapshot on Windows: 821 web tests, 359 desktop tests,
+271 Rust tests and 55 scoped Python tests passed, along with TypeScript and
+the production web build. Desktop reported 12 skips; Rust reported four
+explicitly gated/manual checks. Model integrations used local fixtures, not
+paid live providers. The deployed product site passed 14 Chrome acceptance
+categories covering interaction, responsive layout and graceful fallbacks.
+
 ### Added
+- **AI Classroom lesson editing (T4)**: generated lessons are editable via
+  minimal atomic ops (OpenMAIC patch/edit_deck discipline) —
+  `set` (whitelisted fields incl. sanitized `html`), `str_replace`
+  (exact-match, ambiguous hits rejected), `retitle`, `insert_blank`
+  (scenes + outlines shift together), `delete_scene`, `reorder` (full
+  id permutation required), `quiz_edit` (server revalidates types,
+  options, answer indexes, short-answer rubrics). `apply_ops` clones →
+  applies → validates → hands back; any failure raises with the offending
+  op index and nothing is written (`version` bumps only on success, scene
+  and question ids stay stable). `PATCH /api/v1/classroom/{id}` (admin)
+  returns 409 with the op reason or the updated document; `GET
+  ?revision=N` answers lite when unchanged. The store gained a locked
+  `save_edit` read-modify-write transaction (concurrent edits cannot
+  clobber). The player gains an edit toggle rendering the new
+  `ClassroomEditor` (rename/objective/key points/narration, quiz editor,
+  widget-HTML source with a client-side safety preview, per-page
+  move/insert/delete) — every save is one PATCH op list, and the player
+  refreshes from the response document (21 new tests in
+  `tests/services/classroom/test_classroom_edit.py`).
+- **AI Classroom interactive scenes (T3)**: a fourth scene type —
+  self-contained HTML widgets rendered in a sandboxed iframe
+  (`sandbox="allow-scripts"`, `referrerpolicy="no-referrer"`, no
+  `allow-same-origin`). Two widget kinds: `simulation` (real draggable
+  inputs bound to `key_variables` with a live canvas/SVG redraw) and
+  `diagram` (`flow`/`hierarchy`, clickable nodes highlight their path).
+  Outlines must carry a structured `WidgetOutline` (validated at outline
+  time through the T1 checker; `MAX_INTERACTIVE_SCENES=2`, consecutive
+  interactive banned for hands-on, whose `allowed_types` now include
+  `interactive`). A deterministic regex safety gate (`sanitize.py`)
+  strips `fetch(`/XHR/WebSocket/`import(`/`window.top`/`window.parent`/
+  `localStorage`/`<form action>` in place; document-tier hits
+  (`<script src>`, nested `srcdoc`, `javascript:` URIs) degrade the whole
+  scene to a slide (title/key_points kept, `scene_degraded` event, lesson
+  continues). Player gains the interactive card (concept strip + iframe +
+  narration points); widget context joins discussions and notebook export.
+  Legacy lessons read back unchanged (26 new tests in
+  `tests/services/classroom/test_classroom_interactive.py`).
+- **AI Classroom durable generation jobs (T2)**: `POST /api/v1/classroom/generate`
+  now returns `{job_id}` immediately and the lesson keeps generating in a
+  request-independent background task — closing the tab, refreshing or even a
+  client crash never aborts a class. Every protocol event is appended to
+  `data/classrooms/_jobs/{job_id}.json` (atomic tmp+replace; payload stores
+  names/references only, never KB text). New `GET /jobs/{id}` snapshot and
+  `GET /jobs/{id}/events` SSE (replay the full history, then follow live,
+  close on terminal). The frontend holds the job_id, reconnects via
+  snapshot-then-stream with retries, and the list page shows a 「生成中…
+  点击查看」 recovery bar for unfinished jobs (localStorage-tracked). On
+  process startup leftover running jobs are honestly marked
+  `failed("interrupted by restart")`; `store.list()` provably ignores
+  `_jobs` (13 new tests in `tests/services/classroom/test_classroom_jobs.py`).
+- **AI Classroom teaching styles (OpenMAIC-inspired skill packs)**: the
+  generation form gains a card-style style picker — 「大师讲授 / 动手实验 /
+  讲义速览」 plus the previous default behavior. Each style ships a Chinese
+  pedagogy directive injected into the outline prompt and a machine-checkable
+  `OutlineConstraints` contract (scene-count bounds, allowed types, opening
+  type, quiz/discussion budgets, `no_consecutive_types`, slide-ratio floor)
+  enforced by a deterministic validator (`styles/verify.py`): violating
+  outlines get one diagnostic re-plan, then a delete-only deterministic
+  repair (over-budget quiz/discussion degrade to slide keeping title/points,
+  surplus tail truncates, opening type swapped in) with an
+  `outline_repaired` SSE progress event — never a hard failure. New readonly
+  `GET /api/v1/classroom/styles`, `style_id` persisted on the document and
+  shown as a player-header badge; zh/en copy included (21 new tests in
+  `tests/services/classroom/test_classroom_styles.py`).
 - **Desktop self-update check**: the Electron shell now polls
   `releases/latest` on the public GitHub repo (start + every 24 h, plus a
   manual 「检查更新…」 tray item and `knorviaDesktop.update.check()` IPC).

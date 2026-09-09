@@ -303,18 +303,27 @@ class TestRegenerateLastTurn:
                     budget=0,
                 )
 
-        responses = iter(["original answer", "regenerated answer"])
+        answers = iter(["original answer", "regenerated answer"])
 
-        class FakeOrchestrator:
-            async def handle(self, _context):
-                yield StreamEvent(
-                    type=StreamEventType.CONTENT,
-                    source="chat",
-                    stage="responding",
-                    content=next(responses),
-                    metadata={"call_kind": "llm_final_response"},
-                )
-                yield StreamEvent(type=StreamEventType.DONE, source="chat")
+        async def fake_start_turn(content: str, **_kwargs):
+            # Each Kernel turn returns one agentMessage item; the runtime's
+            # legacy projection turns it into content + result + done.
+            return {
+                "thread": {"id": "thr_regen"},
+                "turn": {
+                    "turn": {"id": "turn_regen", "status": "completed"},
+                    "items": [
+                        {
+                            "kind": "agentMessage",
+                            "payload": {
+                                "text": next(answers),
+                                "metadata": {"call_kind": "llm_final_response"},
+                            },
+                            "turnId": "turn_regen",
+                        }
+                    ],
+                },
+            }
 
         refresh_calls: list[Any] = []
 
@@ -326,7 +335,9 @@ class TestRegenerateLastTurn:
             "knorvia.services.session.context_builder.ContextBuilder",
             FakeContextBuilder,
         )
-        monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+        monkeypatch.setattr(
+            "knorvia.runtime.kernel_client.start_turn_async", fake_start_turn
+        )
         monkeypatch.setattr(
             "knorvia.services.memory.get_memory_store",
             lambda: SimpleNamespace(

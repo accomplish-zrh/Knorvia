@@ -50,8 +50,9 @@ export function frostMix(clarity: number, plates: number): {
 } {
   const seeThrough = clampPercent(clarity, DEFAULT_FROST_CLARITY)
   const solid = clampPercent(plates, DEFAULT_FROST_PLATES)
-  const canvas = Math.round(82 - (70 * seeThrough) / 100)
-  const sidebar = Math.max(8, Math.round(canvas * 0.62))
+  // Zero really is opaque; the upper bound retains a tint for legibility.
+  const canvas = Math.round(100 - (88 * seeThrough) / 100)
+  const sidebar = Math.round(100 - (92 * seeThrough) / 100)
   const plate = Math.round(62 + (34 * solid) / 100)
   return {
     canvas,
@@ -96,7 +97,7 @@ export function readStoredWindowFrost(): WindowFrostState {
 export function applyWindowFrostToDocument(state: WindowFrostState): void {
   if (typeof document === "undefined") return
   const html = document.documentElement
-  if (state.enabled) {
+  if (state.enabled && window.knorviaDesktop?.chrome?.backdropSupported !== false) {
     html.setAttribute("data-window-frost", "")
     const mix = frostMix(state.clarity, state.plates)
     html.style.setProperty("--frost-canvas", `${mix.canvas}%`)

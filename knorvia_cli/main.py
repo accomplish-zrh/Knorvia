@@ -16,6 +16,7 @@ from .config_cmd import register as register_config
 from .init_cmd import register as register_init
 from .kb import register as register_kb
 from .memory import register as register_memory
+from .migrate_cmd import register as register_migrate
 from .notebook import register as register_notebook
 from .partner import register as register_partner
 from .plugin import register as register_plugin
@@ -67,6 +68,7 @@ register_plugin(plugin_app)
 register_config(config_app)
 register_session(session_app)
 register_notebook(notebook_app)
+register_migrate(app)
 register_provider(provider_app)
 register_book(book_app)
 register_init(app)

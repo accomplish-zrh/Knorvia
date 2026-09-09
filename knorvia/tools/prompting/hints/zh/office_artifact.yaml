@@ -1,0 +1,12 @@
+short_description: "以隔离草稿方式打开 Office 来源或新建制品；生命周期、撤销/重做、提交用户审查。"
+when_to_use: "处理聊天附件、创意库、工作区文件或新建 xlsx/docx/pptx 的入口。先调用本工具，再按需通过 load_tools 加载 office_read/office_apply。"
+input_format: |
+  {"action": "open", "source": "attachment:att_123"}
+  {"action": "open", "source": "library:lib_entry_abc"}
+  {"action": "open", "source": "workspace:report.xlsx"}
+  {"action": "create", "filename": "report.xlsx", "kind": "xlsx"}
+  {"action": "status", "draft_id": "abcd1234"}
+  {"action": "undo", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "redo", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "ready", "draft_id": "abcd1234"}
+guideline: "source 是不透明引用，不要自行拼接文件路径。open/create 返回 draft_id + artifact_id，供 office_read/office_apply 使用。仅 XLSX 支持严格编辑；docx/pptx 草稿只能查看/导出。完成后调用 ready 让用户审查差异并合并；合并由用户执行，不要代替用户。"

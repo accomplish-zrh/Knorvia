@@ -1,0 +1,14 @@
+[package]
+name = "knorvia-kernel-adapter"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Private adapter from Knorvia Protocol to the in-tree Codex-derived App Server. Never execs a user-installed codex."
+
+[dependencies]
+knorvia-platform-paths = { workspace = true }
+knorvia-provider-gateway = { path = "../provider-gateway" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

@@ -7,6 +7,8 @@
  * inlines the snippet into the SSR HTML so the browser executes it before
  * hydration.
  */
+import { THEME_PALETTES } from "@/lib/theme";
+
 export default function ThemeScript() {
   const themeScript = `
     (function() {
@@ -26,32 +28,24 @@ export default function ThemeScript() {
           }
           localStorage.removeItem(key);
         }
+        const palettes = ${JSON.stringify(THEME_PALETTES)};
         const stored = localStorage.getItem('knorvia-theme');
-
-        document.documentElement.classList.remove('dark', 'theme-glass', 'theme-snow');
-
-        if (stored === 'dark') {
-          document.documentElement.classList.add('dark');
-        } else if (stored === 'glass') {
-          document.documentElement.classList.add('theme-glass');
-        } else if (stored === 'snow') {
-          document.documentElement.classList.add('theme-snow');
-        } else if (stored === 'light') {
-          // already clean
-        } else {
-          // No stored preference: Default (snow) for light systems,
-          // Dark for prefers-color-scheme: dark.
-          if (window.matchMedia('(prefers-color-scheme: dark)').matches) {
-            document.documentElement.classList.add('dark');
-            localStorage.setItem('knorvia-theme', 'dark');
-          } else {
-            document.documentElement.classList.add('theme-snow');
-            localStorage.setItem('knorvia-theme', 'snow');
-          }
-        }
+        const selected = Object.hasOwn(palettes, stored) ? stored : (window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'snow');
+        const palette = palettes[selected];
+        const root = document.documentElement;
+        root.classList.remove('dark', 'theme-glass', 'theme-snow');
+        if (palette.dark) root.classList.add('dark');
+        else if (selected === 'glass' || selected === 'snow') root.classList.add('theme-' + selected);
+        root.dataset.theme = selected;
+        root.style.colorScheme = palette.dark ? 'dark' : 'light';
+        Object.entries(palette.colors).forEach(function(entry) { root.style.setProperty('--kn-theme-' + entry[0], entry[1]); });
+        localStorage.setItem('knorvia-theme', selected);
 
         var frostRaw = localStorage.getItem('knorvia-window-frost');
         var frostOn = frostRaw === 'true' || (frostRaw === null && stored === 'glass');
+        // Make legacy Glass migration explicit before any new colour is selected.
+        if (frostRaw === null) localStorage.setItem('knorvia-window-frost', String(frostOn));
+        if (window.knorviaDesktop && window.knorviaDesktop.chrome && window.knorviaDesktop.chrome.backdropSupported === false) frostOn = false;
         var clarity = parseInt(localStorage.getItem('knorvia-frost-clarity') || '62', 10);
         var plates = parseInt(localStorage.getItem('knorvia-frost-plates') || '86', 10);
         if (!(clarity >= 0 && clarity <= 100)) clarity = 62;
@@ -59,8 +53,8 @@ export default function ThemeScript() {
         var htmlEl = document.documentElement;
         if (frostOn) {
           htmlEl.setAttribute('data-window-frost', '');
-          var canvas = Math.round(82 - (70 * clarity) / 100);
-          var sidebar = Math.max(8, Math.round(canvas * 0.62));
+          var canvas = Math.round(100 - (88 * clarity) / 100);
+          var sidebar = Math.round(100 - (92 * clarity) / 100);
           var plate = Math.round(62 + (34 * plates) / 100);
           htmlEl.style.setProperty('--frost-canvas', canvas + '%');
           htmlEl.style.setProperty('--frost-sidebar', sidebar + '%');
@@ -93,12 +87,8 @@ export default function ThemeScript() {
           var chromeApi = window.knorviaDesktop.chrome;
           var platform = (chromeApi && chromeApi.platform) || 'unknown';
           htmlEl.setAttribute('data-desktop-chrome', platform);
-          var storedTheme = localStorage.getItem('knorvia-theme');
-          var symbol = '#0d0d0d';
-          var fill = '#ffffff';
-          if (storedTheme === 'dark') { fill = '#1a1918'; symbol = '#e8e4de'; }
-          else if (storedTheme === 'glass') { fill = '#eaf2f8'; symbol = '#10151c'; }
-          else if (storedTheme === 'light') { fill = '#fdfcf9'; symbol = '#1c1816'; }
+          var symbol = palette.colors.ink;
+          var fill = palette.colors.bg;
           if (chromeApi && chromeApi.setTitleBarOverlay && chromeApi.captionOverlay) {
             chromeApi.setTitleBarOverlay(frostOn ? { color: '#00000000', symbolColor: symbol } : { color: fill, symbolColor: symbol });
           }
@@ -106,7 +96,7 @@ export default function ThemeScript() {
             var material = { material: 'none', backgroundColor: fill, vibrancy: null };
             if (frostOn && platform === 'win32') material = { material: 'acrylic', backgroundColor: '#00000000', vibrancy: null };
             else if (frostOn && platform === 'darwin') material = { material: 'none', backgroundColor: '#00000000', vibrancy: 'under-window' };
-            chromeApi.setWindowMaterial(material);
+            chromeApi.setWindowMaterial(Object.assign(material, { theme: selected, frost: localStorage.getItem('knorvia-window-frost') === 'true' }));
           }
         }
       } catch (e) {

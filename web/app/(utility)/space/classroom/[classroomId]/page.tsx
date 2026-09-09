@@ -43,7 +43,11 @@ export default function ClassroomDetailPage() {
   }
   return (
     <div className="h-[calc(100dvh-2rem)] px-2 py-2">
-      <ClassroomPlayer document={document} onBack={() => window.history.back()} />
+      <ClassroomPlayer
+        document={document}
+        onBack={() => window.history.back()}
+        onDocumentUpdated={setDocument}
+      />
     </div>
   );
 }

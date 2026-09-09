@@ -8,8 +8,8 @@ const pkg = JSON.parse(
   fs.readFileSync(path.join(desktopRoot, "package.json"), "utf8"),
 );
 
-test("desktop ships Knorvia 1.1.0-dev NSIS installer settings", () => {
-  assert.equal(pkg.version, "1.1.0-dev");
+test("desktop ships Knorvia 1.1.0 NSIS installer settings", () => {
+  assert.equal(pkg.version, "1.1.0");
   assert.equal(pkg.build.productName, "Knorvia");
   assert.equal(pkg.scripts.dist, "electron-builder --win nsis");
   assert.equal(pkg.build.directories.output, "../release");

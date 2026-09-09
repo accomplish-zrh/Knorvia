@@ -17,6 +17,7 @@ import {
   ChevronRight,
   Loader2,
   MessagesSquare,
+  Pencil,
   Save,
   SkipForward,
 } from "lucide-react";
@@ -24,16 +25,20 @@ import { useTranslation } from "react-i18next";
 import {
   discussionTurn,
   exportClassroomToNotebook,
+  fetchClassroomStyles,
   gradeQuizScene,
+  patchClassroom,
   saveClassroomQuestions,
   type ClassroomAction,
   type ClassroomAgentProfile,
   type ClassroomDocument,
   type ClassroomQuizQuestion,
   type ClassroomScene,
+  type ClassroomStyle,
   type DiscussionState,
   type GradeResult,
 } from "@/lib/classroom-api";
+import ClassroomEditor, { type ClassroomEditOp } from "./ClassroomEditor";
 
 /** Length-derived beat per speech line (OpenMAIC's no-TTS fallback). */
 function speechBeatMs(text: string): number {
@@ -51,15 +56,18 @@ export default function ClassroomPlayer({
   document: doc,
   onBack,
   onToast,
+  onDocumentUpdated,
 }: {
   document: ClassroomDocument;
   onBack: () => void;
   onToast?: (message: string) => void;
+  onDocumentUpdated?: (document: ClassroomDocument) => void;
 }) {
   const { t, i18n } = useTranslation();
   const [sceneIndex, setSceneIndex] = useState(0);
   const [lines, setLines] = useState<SpeechLine[]>([]);
   const [phase, setPhase] = useState<"idle" | "playing">("playing");
+  const [editing, setEditing] = useState(false);
   const consumedDiscussions = useRef(new Set<string>());
   const [discussion, setDiscussion] = useState<null | {
     seed: string;
@@ -76,6 +84,26 @@ export default function ClassroomPlayer({
   }>(null);
   const [savedNotebook, setSavedNotebook] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
+  // Teaching-style badge source (only shown when the lesson was styled).
+  const [style, setStyle] = useState<ClassroomStyle | null>(null);
+
+  useEffect(() => {
+    if (!doc.style_id) {
+      setStyle(null);
+      return;
+    }
+    let cancelled = false;
+    void fetchClassroomStyles()
+      .then((styles) => {
+        if (!cancelled) {
+          setStyle(styles.find((s) => s.id === doc.style_id) ?? null);
+        }
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [doc.style_id]);
 
   const scene = doc.scenes[sceneIndex];
   const profileFor = useMemo(() => {
@@ -121,6 +149,19 @@ export default function ClassroomPlayer({
     scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight });
   }, [lines.length, discussion?.transcript.length]);
 
+  // Deleting pages can leave the index past the end — clamp it.
+  useEffect(() => {
+    if (sceneIndex > doc.scenes.length - 1) {
+      setSceneIndex(Math.max(0, doc.scenes.length - 1));
+    }
+  }, [doc.scenes.length, sceneIndex]);
+
+  const applyEditOps = async (ops: ClassroomEditOp[]) => {
+    const updated = await patchClassroom(doc.id, ops);
+    onDocumentUpdated?.(updated);
+    return updated;
+  };
+
   /** The scene's tail interaction (OpenMAIC discussion/quiz consumption). */
   const onSpeechesDone = (current: ClassroomScene) => {
     const discussionAction = current.actions.find((a) => a.type === "discussion");
@@ -156,10 +197,21 @@ export default function ClassroomPlayer({
 
   const runDiscussionTurn = async (userMessage: string) => {
     if (!discussion || !doc.id || !scene) return;
+    // Interactive scenes fold the widget's concept/variables into the
+    // discussion context so the debate can address what was manipulated.
+    const contextPoints = [...scene.key_points];
+    if (scene.widget) {
+      contextPoints.push(scene.widget.concept);
+      if (scene.widget.key_variables?.length) {
+        contextPoints.push(
+          `${t("Hands-on variables")}: ${scene.widget.key_variables.join(", ")}`,
+        );
+      }
+    }
     const base = {
       scene_id: scene.id,
       scene_title: scene.title,
-      scene_key_points: scene.key_points,
+      scene_key_points: contextPoints,
       seed_prompt: discussion.seed,
       transcript: discussion.transcript.map((line) => ({
         agent_id: line.agentId,
@@ -233,6 +285,15 @@ export default function ClassroomPlayer({
         <div className="min-w-0 flex-1">
           <p className="truncate text-[14px] font-medium text-[var(--foreground)]">
             {doc.title}
+            {style && (
+              <span
+                data-classroom-style-badge=""
+                className="ml-2 inline-block max-w-[10rem] truncate rounded-full border border-[var(--border)] px-2 align-middle text-[10.5px] font-normal text-[var(--muted-foreground)]"
+                title={i18n.language?.startsWith("zh") ? style.description : style.description_en || style.description}
+              >
+                {i18n.language?.startsWith("zh") ? style.title : style.title_en || style.title}
+              </span>
+            )}
           </p>
           <div className="mt-1 h-1 w-full max-w-xs overflow-hidden rounded-full bg-[var(--muted)]">
             <div
@@ -244,6 +305,19 @@ export default function ClassroomPlayer({
         <span className="shrink-0 text-[11.5px] text-[var(--muted-foreground)]">
           {sceneIndex + 1} / {doc.scenes.length}
         </span>
+        <button
+          type="button"
+          data-classroom-edit-toggle=""
+          onClick={() => setEditing((v) => !v)}
+          className={`inline-flex shrink-0 items-center gap-1 rounded-lg border px-2 py-1 text-[11.5px] ${
+            editing
+              ? "border-[var(--ring)] bg-[var(--accent)] text-[var(--foreground)]"
+              : "border-[var(--border)] text-[var(--foreground)]"
+          }`}
+        >
+          <Pencil size={12} />
+          {editing ? t("Done") : t("Edit")}
+        </button>
         <button
           type="button"
           data-classroom-save-notebook=""
@@ -274,7 +348,13 @@ export default function ClassroomPlayer({
             className="rounded-2xl border border-[var(--border)] bg-[var(--card)] p-5 shadow-sm"
           >
             <p className="text-[11px] uppercase tracking-wide text-[var(--muted-foreground)]">
-              {scene.type === "quiz" ? t("Quiz") : scene.type === "discussion" ? t("Discussion") : t("Lesson")}
+              {scene.type === "quiz"
+                ? t("Quiz")
+                : scene.type === "discussion"
+                  ? t("Discussion")
+                  : scene.type === "interactive"
+                    ? t("Interactive")
+                    : t("Lesson")}
             </p>
             <h2 className="mt-1 text-[19px] font-semibold text-[var(--foreground)]">
               {scene.title}
@@ -293,6 +373,64 @@ export default function ClassroomPlayer({
               </ul>
             )}
           </div>
+
+          {scene.type === "interactive" && scene.html && (
+            <div
+              data-classroom-interactive=""
+              className="space-y-3 rounded-2xl border border-[var(--border)] bg-[var(--card)] p-4 shadow-sm"
+            >
+              {scene.widget?.concept && (
+                <p className="text-[12.5px] leading-relaxed text-[var(--foreground)]">
+                  <span className="mr-1.5 rounded bg-[var(--accent)] px-1.5 py-0.5 text-[11px] font-medium text-[var(--primary)]">
+                    {scene.widget.widget_type === "diagram" ? t("Diagram") : t("Simulation")}
+                  </span>
+                  {scene.widget.concept}
+                </p>
+              )}
+              <p className="text-[11.5px] text-[var(--muted-foreground)]">
+                {t("Try it — the visualization updates as you change the controls.")}
+              </p>
+              <div className="relative w-full overflow-hidden rounded-xl border border-[var(--border)] pt-[56.25%]">
+                <iframe
+                  data-classroom-widget=""
+                  srcDoc={scene.html}
+                  sandbox="allow-scripts"
+                  referrerPolicy="no-referrer"
+                  title={scene.title}
+                  className="absolute inset-0 h-full w-full"
+                />
+              </div>
+              {scene.narration && scene.narration.length > 0 && (
+                <div>
+                  <p className="text-[11px] uppercase tracking-wide text-[var(--muted-foreground)]">
+                    {t("Narration points")}
+                  </p>
+                  <ul className="mt-1.5 space-y-1">
+                    {scene.narration.map((point, i) => (
+                      <li
+                        key={i}
+                        className="flex items-start gap-2 text-[12.5px] leading-relaxed text-[var(--foreground)]"
+                      >
+                        <span className="mt-1.5 h-1.5 w-1.5 shrink-0 rounded-full bg-[var(--primary)]" />
+                        {point}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
+            </div>
+          )}
+
+          {editing && (
+            <ClassroomEditor
+              key={scene.id}
+              document={doc}
+              scene={scene}
+              sceneIndex={sceneIndex}
+              onApply={applyEditOps}
+              onNavigate={gotoScene}
+            />
+          )}
 
           {lines.map((line, i) => {
             const profile = profileFor(line.agentId);

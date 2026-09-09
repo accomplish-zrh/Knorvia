@@ -28,7 +28,7 @@ from knorvia.core.agentic.tool_arg_guard import (
 from knorvia.core.agentic.tool_dispatch import dispatch_tool_calls
 from knorvia.core.context import UnifiedContext
 from knorvia.core.stream import StreamEvent, StreamEventType
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 from knorvia.core.tool_protocol import (
     BaseTool,
     ToolDefinition,

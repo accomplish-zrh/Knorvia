@@ -54,6 +54,21 @@ def test_non_terminal_error_keeps_completed_done_status() -> None:
     assert error == ""
 
 
+def test_interrupted_terminal_never_projects_to_completed() -> None:
+    status, _error = _resolve_turn_outcome(
+        [],
+        StreamEvent(
+            type=StreamEventType.DONE,
+            source="knorvia-daemon",
+            metadata={"status": "interrupted", "remoteStatus": "interrupted"},
+        ),
+    )
+
+    # The legacy session schema has no interrupted state, so its compatible
+    # projection is failed—not a fabricated completed turn.
+    assert status == "failed"
+
+
 @pytest.mark.asyncio
 async def test_subscribe_turn_does_not_synthesize_done_for_running_turn(tmp_path) -> None:
     """A paused/replaced subscription must not make the UI think the turn ended."""

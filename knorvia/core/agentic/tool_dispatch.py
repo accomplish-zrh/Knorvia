@@ -31,7 +31,6 @@ from knorvia.core.agentic.tool_arg_guard import (
     missing_required_args,
 )
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
 from knorvia.core.tool_protocol import ToolLookup, provider_identity
 from knorvia.core.trace import (
     build_trace_metadata,
@@ -79,7 +78,7 @@ async def dispatch_tool_calls(
     *,
     tool_calls: list[dict[str, Any]],
     context: UnifiedContext,
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
     iteration_index: int,
@@ -281,7 +280,7 @@ async def _reject_if_args_missing(
     registry: ToolLookup,
     tool_name: str,
     exec_args: dict[str, Any],
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
     trace_meta: dict[str, Any] | None,
@@ -447,7 +446,7 @@ async def execute_tool_call(
     registry: ToolLookup,
     tool_name: str,
     tool_args: dict[str, Any],
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
     retrieve_meta: dict[str, Any] | None,
@@ -607,7 +606,7 @@ async def _collect_outcome(
     results: list[dict[str, Any]],
     per_tool_trace_meta: list[dict[str, Any]],
     suppress_ui_indices: set[int] | None = None,
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
 ) -> DispatchOutcome:

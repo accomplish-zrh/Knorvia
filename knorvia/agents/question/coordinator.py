@@ -9,23 +9,124 @@ to the new pipeline.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 import inspect
 import logging
 from pathlib import Path
+import time
+from types import SimpleNamespace
 from typing import Any
 
 from knorvia.agents.question.mimic_source import parse_exam_paper_to_templates
 from knorvia.agents.question.pipeline import QuestionPipeline
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream import StreamEvent
-from knorvia.core.stream_bus import StreamBus
 from knorvia.services.path_service import get_path_service
 from knorvia.services.settings.interface_settings import get_response_language
 
 logger = logging.getLogger(__name__)
 
 WsCallback = Callable[[dict[str, Any]], Awaitable[None] | None]
+
+
+def _event(**kwargs: Any) -> Any:
+    """Duck-typed stream event with the StreamEvent attribute + to_dict surface."""
+    base: dict[str, Any] = {
+        "type": "",
+        "source": "",
+        "stage": "",
+        "content": "",
+        "metadata": {},
+        "session_id": "",
+        "turn_id": "",
+        "seq": 0,
+        "timestamp": time.time(),
+    }
+    base.update(kwargs)
+    event = SimpleNamespace(**base)
+
+    def to_dict() -> dict[str, Any]:
+        return {
+            "type": event.type,
+            "source": event.source,
+            "stage": event.stage,
+            "content": event.content,
+            "metadata": event.metadata,
+            "session_id": event.session_id,
+            "turn_id": event.turn_id,
+            "seq": event.seq,
+            "timestamp": event.timestamp,
+        }
+
+    event.to_dict = to_dict  # type: ignore[method-assign]
+    return event
+
+
+class _CoordinatorStream:
+    """Local WebSocket bridge for the legacy coordinator facade.
+
+    Duck-typed stand-in for the legacy stream bus: the pipeline emits via the
+    stage/content/thinking/progress/error surface, this class queues plain
+    events and the forwarder drains them to the WebSocket callback.
+    """
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._closed = False
+
+    async def _put(self, event: dict[str, Any]) -> None:
+        if not self._closed:
+            await self._queue.put(event)
+
+    async def _emit(self, etype: str, **kwargs: Any) -> None:
+        await self._put({**_event(type=etype, **kwargs).to_dict()})
+
+    async def content(self, message: str, source: str = "", stage: str = "", **_: Any) -> None:
+        await self._emit("content", content=message, source=source, stage=stage)
+
+    async def thinking(self, message: str, source: str = "", stage: str = "", **_: Any) -> None:
+        await self._emit("thinking", content=message, source=source, stage=stage)
+
+    async def progress(self, message: str = "", source: str = "", stage: str = "", **_: Any) -> None:
+        await self._emit("progress", content=message, source=source, stage=stage)
+
+    async def error(self, message: str, source: str = "", stage: str = "", **_: Any) -> None:
+        await self._emit("error", content=message, source=source, stage=stage)
+
+    async def result(self, data: dict[str, Any], source: str = "", **_: Any) -> None:
+        await self._emit("result", metadata=dict(data), source=source)
+
+    def stage(self, name: str, source: str = "", **_: Any) -> "_CoordinatorStreamStage":
+        return _CoordinatorStreamStage(self, name, source)
+
+    def subscribe(self) -> AsyncIterator[dict[str, Any]]:
+        async def _iterate() -> AsyncIterator[dict[str, Any]]:
+            while True:
+                event = await self._queue.get()
+                if event is None:
+                    return
+                yield event
+
+        return _iterate()
+
+    async def close(self) -> None:
+        self._closed = True
+        await self._queue.put(None)
+
+
+class _CoordinatorStreamStage:
+    """Async context manager emitting stage_start / stage_end markers."""
+
+    def __init__(self, owner: _CoordinatorStream, name: str, source: str) -> None:
+        self._owner = owner
+        self._name = name
+        self._source = source
+
+    async def __aenter__(self) -> "_CoordinatorStreamStage":
+        await self._owner._emit("stage_start", stage=self._name, source=self._source)
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self._owner._emit("stage_end", stage=self._name, source=self._source)
 
 
 class AgentCoordinator:
@@ -169,12 +270,12 @@ class AgentCoordinator:
     def _active_kb_name(self) -> str | None:
         return self.kb_name if self.enable_idea_rag else None
 
-    def _new_stream_bus(self) -> StreamBus:
-        return StreamBus()
+    def _new_stream_bus(self) -> Any:
+        return _CoordinatorStream()
 
     async def _run_with_forwarding(
         self,
-        stream: StreamBus,
+        stream: Any,
         pipeline_call: Awaitable[dict[str, Any]],
     ) -> dict[str, Any]:
         """Run a pipeline coroutine and forward its stream events if possible."""
@@ -189,14 +290,14 @@ class AgentCoordinator:
             except Exception:
                 logger.debug("Question stream forwarding task failed", exc_info=True)
 
-    async def _forward_stream(self, stream: StreamBus) -> None:
+    async def _forward_stream(self, stream: Any) -> None:
         async for event in stream.subscribe():
             await self._emit_callback(self._event_payload(event))
 
     @staticmethod
-    def _event_payload(event: StreamEvent) -> dict[str, Any]:
+    def _event_payload(event: Any) -> dict[str, Any]:
         payload = event.to_dict()
-        if event.type.value == "result":
+        if event.type == "result":
             payload.setdefault("content", event.metadata.get("response", ""))
         return payload
 

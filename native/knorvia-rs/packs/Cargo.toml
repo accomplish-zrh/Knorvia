@@ -1,0 +1,20 @@
+[package]
+name = "knorvia-packs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Official Knorvia domain packs: RAG, Memory, Office, Media, Learning, Partners, Automations."
+
+[dependencies]
+knorvia-capability-host = { workspace = true }
+knorvia-platform-paths = { workspace = true }
+knorvia-protocol = { workspace = true }
+knorvia-store = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+base64 = { workspace = true }
+knorvia-provider-gateway = { workspace = true }
+thiserror = { workspace = true }

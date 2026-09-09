@@ -1,4 +1,4 @@
-import type { Theme } from "@/lib/theme"
+import { THEME_PALETTES, type Theme } from "@/lib/theme"
 
 /** True when the UI is running inside the Knorvia desktop shell. */
 export function isKnorviaDesktop(): boolean {
@@ -23,19 +23,8 @@ export function titleBarOverlayForTheme(
   theme: Theme,
   frost = false,
 ): TitleBarOverlayColors {
-  const solid = (() => {
-    switch (theme) {
-      case "dark":
-        return { color: "#1a1918", symbolColor: "#e8e4de" }
-      case "glass":
-        return { color: "#eaf2f8", symbolColor: "#10151c" }
-      case "light":
-        return { color: "#fdfcf9", symbolColor: "#1c1816" }
-      case "snow":
-      default:
-        return { color: "#ffffff", symbolColor: "#0d0d0d" }
-    }
-  })()
+  const palette = THEME_PALETTES[theme].colors
+  const solid = { color: palette.bg, symbolColor: palette.ink }
   if (!frost) return solid
   return { color: "#00000000", symbolColor: solid.symbolColor }
 }
@@ -59,10 +48,9 @@ export function windowMaterialForFrost(
     if (/win/i.test(platform)) {
       return { material: "acrylic", backgroundColor: "#00000000", vibrancy: null }
     }
-    return { material: "none", backgroundColor: "#fdfcf9", vibrancy: null }
+    return { material: "none", backgroundColor: THEME_PALETTES[theme].colors.bg, vibrancy: null }
   }
-  const backgroundColor =
-    theme === "dark" ? "#1a1918" : theme === "snow" ? "#ffffff" : theme === "glass" ? "#eaf2f8" : "#fdfcf9"
+  const backgroundColor = THEME_PALETTES[theme].colors.bg
   return { material: "none", backgroundColor, vibrancy: null }
 }
 
@@ -87,14 +75,14 @@ export function syncDesktopTitleBarOverlay(theme: Theme, frost = false): void {
   chrome.setTitleBarOverlay(titleBarOverlayForTheme(theme, frost))
 }
 
-export function syncDesktopWindowMaterial(theme: Theme, frost = false): void {
+export function syncDesktopWindowMaterial(theme: Theme, frost = false, reducedMotion?: boolean): void {
   const chrome = window.knorviaDesktop?.chrome
   if (!chrome?.setWindowMaterial) return
-  chrome.setWindowMaterial(windowMaterialForFrost(frost, theme, chrome.platform))
+  chrome.setWindowMaterial({ ...windowMaterialForFrost(frost && chrome.backdropSupported !== false, theme, chrome.platform), theme, frost, ...(reducedMotion === undefined ? {} : { reducedMotion }) })
 }
 
-export function syncDesktopChrome(theme: Theme, frost = false): void {
+export function syncDesktopChrome(theme: Theme, frost = false, reducedMotion?: boolean): void {
   applyDesktopChromeAttribute()
-  syncDesktopTitleBarOverlay(theme, frost)
-  syncDesktopWindowMaterial(theme, frost)
+  syncDesktopTitleBarOverlay(theme, frost && window.knorviaDesktop?.chrome?.backdropSupported !== false)
+  syncDesktopWindowMaterial(theme, frost, reducedMotion)
 }

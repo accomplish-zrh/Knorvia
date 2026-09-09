@@ -18,7 +18,7 @@ import pytest
 
 from knorvia.core.agentic.loop import LabelProtocol, run_agentic_loop
 from knorvia.core.agentic.tool_dispatch import DispatchOutcome
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 # --------------------------- scripted LLM client ---------------------------
 

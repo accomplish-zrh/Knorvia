@@ -88,11 +88,6 @@ class MasteryLoopCapability:
             return updated
         return kwargs
 
-    def pre_loop_seed(self, context: UnifiedContext) -> str:
-        _ = context
-        return ""
-
-
 def _prompt_text(prompts: dict[str, Any], path: tuple[str, ...]) -> str:
     value: Any = prompts
     for key in path:

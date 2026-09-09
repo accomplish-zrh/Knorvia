@@ -1,0 +1,30 @@
+.nw-sidebar-resize { position: absolute; inset: 0 0 0 auto; width: 6px; cursor: col-resize; touch-action: none; z-index: 6; }
+.nw-sidebar-resize:hover, .nw-sidebar-resize:focus-visible { background: color-mix(in srgb, var(--nw-muted) 25%, transparent); }
+@media (min-width: 651px) { .nw-sidebar { position: relative; width: min(var(--nw-sidebar-width, 260px), max(220px, calc(100vw - 380px))); flex-basis: min(var(--nw-sidebar-width, 260px), max(220px, calc(100vw - 380px))); } }
+.nw-conversation-find { position: absolute; top: 12px; right: 24px; z-index: 9; display: flex; align-items: center; gap: 5px; width: min(450px, calc(100% - 40px)); padding: 6px 8px 6px 14px; background: var(--nw-popover); border: 1px solid var(--nw-line); border-radius: 14px; box-shadow: 0 4px 20px #00000010; backdrop-filter: blur(24px); flex-wrap: wrap; }
+.nw-root .nw-conversation-find input { flex: 1; width: 0; min-width: 30px; height: 30px; padding: 0 5px; border: 0; background: transparent; box-shadow: none; font-size: 13px; }
+.nw-root .nw-conversation-find input:focus-visible { outline: 0; }
+.nw-conversation-find:focus-within { outline: 1px solid var(--nw-muted); outline-offset: 2px; }
+::highlight(knorvia-conversation-find) { background: #f5cc76; color: #302209; }
+.nw-task-composer { position: relative; }
+.nw-task-composer > .nw-jump { top: -33px; bottom: auto; z-index: 3; }
+.nw-conversation-find > span { font-size: 11px; color: var(--nw-muted); min-width: 35px; text-align: center; }
+.nw-conversation-find .nw-icon { width: 28px; height: 30px; }
+.nw-conversation-find > small { flex-basis: 100%; font-size: 11px; color: var(--nw-muted); padding: 0 4px 3px; }
+.nw-task-content [data-find-current] { outline: 2px solid var(--nw-amber); outline-offset: 6px; border-radius: 8px; }
+.nw-conversation-nav { position: absolute; top: 50%; left: 3px; z-index: 8; transform: translateY(-50%); }
+.nw-outline-toggle { opacity: .4; width: 26px; height: 28px; }
+.nw-conversation-nav:hover .nw-outline-toggle, .nw-conversation-nav:focus-within .nw-outline-toggle { opacity: 1; }
+.nw-message-rail { display: flex; flex-direction: column; align-items: center; max-height: 35vh; overflow-y: auto; scrollbar-width: none; width: 26px; }
+.nw-message-rail button { display: grid; place-items: center; width: 24px; min-height: 12px; flex-shrink: 0; border-radius: 4px; }
+.nw-message-rail button span { width: 5px; height: 2px; background: var(--nw-muted); opacity: .35; transition: width .1s; }
+.nw-message-rail button:hover span, .nw-message-rail button:focus-visible span { opacity: 1; width: 15px; }
+.nw-outline-list { position: absolute; left: 30px; top: 0; transform: translateY(-30%); width: min(310px, calc(100vw - 65px)); max-height: 45vh; overflow: auto; border: 1px solid var(--nw-line); border-radius: 14px; padding: 6px; background: var(--nw-popover); box-shadow: 0 6px 22px #0000001c; backdrop-filter: blur(24px); }
+.nw-outline-list header { display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; font-size: 12px; }
+.nw-outline-list > button { display: flex; align-items: baseline; gap: 10px; width: 100%; padding: 9px 10px; text-align: left; border-radius: 7px; font-size: 12px; }
+.nw-outline-list > button:hover { background: var(--nw-hover); }
+.nw-outline-list > button small { color: var(--nw-muted); font-variant-numeric: tabular-nums; }
+.nw-outline-list > button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+@media (max-width: 1180px) { .nw-message-rail { display: none; }.nw-conversation-nav { left: 0; }.nw-outline-toggle { width: 20px; background: var(--nw-reading); }.nw-conversation-find { right: 12px; width: calc(100% - 24px); } }
+@media (max-width: 650px) { .nw-sidebar-resize { display: none; }.nw-task-tools { gap: 2px; }.nw-conversation-find { gap: 2px; padding-left: 10px; }.nw-conversation-find .nw-icon { width: 26px; } }
+@media (prefers-reduced-motion: reduce) { .nw-message-rail button span { transition: none; } }

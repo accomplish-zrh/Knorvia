@@ -119,11 +119,6 @@ class SubagentCapability(KnowledgeCapability):
         }
         return updated
 
-    def pre_loop_seed(self, context: UnifiedContext) -> str:
-        _ = context
-        return ""
-
-
 # Default instruction injected (CC --append-system-prompt) so a consulted agent
 # behaves like a delegate, not an interactive session, when the user hasn't set
 # their own in /settings.

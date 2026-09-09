@@ -30,28 +30,6 @@ class LoopCapability(Protocol):
     augmenting it. Plain capabilities leave the attribute absent (read with a
     ``getattr(cap, "exclusive_tools", False)`` default) so this default — and
     the augment-don't-suppress invariant above — stays true for them.
-
-    Optional async ``pre_loop`` hook
-    --------------------------------
-    A capability MAY define::
-
-        async def pre_loop(
-            self, context, stream, *, usage=None
-        ) -> PromptBlock | None: ...
-
-    which the chat pipeline awaits **once, before the answer loop's first LLM
-    call**, when the capability is active. Its returned block is folded into
-    the loop's user-message seed (alongside the KB seed) so the answer loop
-    treats it as grounding context for the turn. Use it for a bounded
-    pre-pass that produces context the loop should have up front — e.g.
-    :class:`~knorvia.capabilities.explore_context.ExploreContextCapability`
-    briefs the turn's attached sources objectively before the model answers.
-
-    This hook is **optional** and not part of the required structural surface:
-    the pipeline reads it with a ``getattr(cap, "pre_loop", None)`` default
-    (mirroring :attr:`exclusive_tools`), so plain capabilities that omit it are
-    unaffected. ``usage`` is the turn's token tracker, passed so a pre-pass can
-    fold its own LLM cost into the turn total.
     """
 
     name: str
@@ -80,9 +58,6 @@ class LoopCapability(Protocol):
     ) -> dict[str, Any]:
         """Inject server-owned private kwargs for this capability's tools."""
 
-    def pre_loop_seed(self, context: UnifiedContext) -> str:
-        """Optional text appended to the initial user message seed."""
-
 
 class KnowledgeCapability:
     """Base for capabilities bound to an agentic knowledge base.
@@ -96,7 +71,7 @@ class KnowledgeCapability:
     The exclusivity is decided by **category membership**, not a per-instance
     knob: subclassing this sets :attr:`exclusive_tools`. Subclasses still
     satisfy :class:`LoopCapability` structurally (``name`` / ``owned_tools`` /
-    ``is_active`` / ``system_block`` / ``augment_kwargs`` / ``pre_loop_seed``).
+    ``is_active`` / ``system_block`` / ``augment_kwargs``).
     """
 
     exclusive_tools: bool = True

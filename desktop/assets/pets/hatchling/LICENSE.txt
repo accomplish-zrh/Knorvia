@@ -1,0 +1,3 @@
+Knorvia built-in pet "Hatchling" — generated locally by the Knorvia night
+shift as a fixture asset (solid-color placeholder atlas, no third-party
+material). Same license as the Knorvia project.

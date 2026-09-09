@@ -1,0 +1,23 @@
+.ns-edit-entry { align-self: center; margin-top: 10px; }
+.ns-edit-library { display: grid; gap: 16px; min-width: 0; }
+.ns-edit-library > label { display: grid; gap: 8px; font-size: 13px; }
+.ns-edit-library input:not([type=checkbox]) { min-width: 0; width: 100%; }
+.ns-edit-library-toolbar { display: flex; align-items: center; gap: 10px; }
+.ns-edit-library-toolbar > input { flex: 1; }
+.ns-edit-library-files { max-height: 240px; overflow: auto; border-block: 1px solid var(--nw-line); padding-block: 8px; }
+.ns-edit-library-files label { display: flex; align-items: center; gap: 10px; padding: 10px 4px; cursor: pointer; }
+.ns-edit-library-files span, .ns-edit-library-order span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ns-edit-library-files small { color: var(--nw-muted); white-space: nowrap; }
+.ns-edit-library-order { display: grid; gap: 6px; margin: 0; padding: 0; list-style: none; max-height: 240px; overflow: auto; }
+.ns-edit-library-order li { display: flex; align-items: center; gap: 6px; padding: 8px; border: 1px solid var(--nw-line); border-radius: 10px; }
+.ns-edit-library-projects { display: grid; gap: 8px; margin-top: 12px; }
+.ns-edit-library-projects button { justify-content: flex-start; overflow-wrap: anywhere; white-space: normal; }
+.ns-timeline-fields select { min-width: 0; max-width: 100%; }
+.ns-edit-library-files label { min-height: 44px; padding-inline: 10px; border-radius: 8px; font-size: 14px; }
+.ns-edit-library-files label:has(input:checked) { background: var(--nw-soft); }
+.ns-edit-library-files input[type="checkbox"] { width: 17px; height: 17px; flex: 0 0 17px; }
+.ns-edit-library-order li { min-height: 46px; font-size: 13px; }
+.ns-edit-library :is(input, button) { min-height: 36px; }
+.ns-edit-library summary { padding-block: 10px; font-size: 14px; cursor: pointer; }
+@media (hover: hover) { .ns-edit-library-files label:hover { background: var(--nw-hover); } }
+@media (max-width: 500px) { .ns-edit-library-toolbar { flex-wrap: wrap; } .ns-edit-library-toolbar > input { flex-basis: 100%; } .ns-edit-library-files small { font-size: 11px; } }

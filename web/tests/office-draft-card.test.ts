@@ -5,6 +5,7 @@ import { join } from "node:path";
 
 import {
   canConfirmOfficeDraft,
+  canShowOfficeDraftFiles,
   collectOfficeDrafts,
   isOfficeDraftTerminal,
   patchOfficeDraft,
@@ -70,6 +71,7 @@ test("collectOfficeDrafts renders draft, ready, and merged states", () => {
   assert.equal(merged.status, "merged");
   assert.equal(isOfficeDraftTerminal(merged.status), true);
   assert.equal(canConfirmOfficeDraft(merged.status), false);
+  assert.equal(canShowOfficeDraftFiles(merged.status), true);
   assert.equal(hasChatTaskCards(draftEvents), true);
 });
 
@@ -86,6 +88,7 @@ test("collectOfficeDrafts surfaces discarded terminal badge state", () => {
   assert.equal(card.status, "discarded");
   assert.equal(isOfficeDraftTerminal(card.status), true);
   assert.equal(canConfirmOfficeDraft(card.status), false);
+  assert.equal(canShowOfficeDraftFiles(card.status), false);
 });
 
 test("patchOfficeDraft button callbacks PATCH merge and discard", async () => {

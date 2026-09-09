@@ -20,6 +20,7 @@ const config = [
       "node_modules/**",
       ".next/**",
       ".next-knorvia/**",
+      ".next-*/**",
       "dist/**",
       "out/**",
       "public/director-desk/**",

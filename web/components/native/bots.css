@@ -1,0 +1,314 @@
+/* Bots & groups surface. Layout-only styling on top of the shared nw-*
+ * primitives; follows theme variables so dark/light/reader modes inherit. */
+
+.bots-page {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-height: 100%;
+}
+
+.bots-unread, .bots-pending {
+  display: inline-flex;
+  padding: 2px 7px;
+  margin-inline-start: 6px;
+  border-radius: 999px;
+  color: var(--nw-text);
+  background: color-mix(in srgb, currentColor 9%, transparent);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.bots-attention, .bots-checkpoint {
+  padding: 12px 14px;
+  border: 1px solid var(--nw-border);
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--nw-text) 3%, transparent);
+  font-size: 13px;
+}
+
+.bots-attention { max-height: 220px; overflow: auto; }
+.bots-attention > div { display: flex; align-items: start; gap: 12px; }
+.bots-attention p { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.bots-attention button { flex-shrink: 0; margin-block: 10px; }
+.bots-checkpoint summary { cursor: pointer; }
+.bots-checkpoint p { white-space: pre-wrap; overflow-wrap: anywhere; }
+.bots-checkpoint small { color: var(--nw-muted); }
+
+.bots-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bots-columns {
+  display: grid;
+  grid-template-columns: minmax(240px, 320px) 1fr;
+  gap: 16px;
+  align-items: start;
+  flex: 1;
+  min-height: 0;
+}
+
+@media (max-width: 900px) {
+  .bots-columns {
+    grid-template-columns: 1fr;
+  }
+}
+
+.bots-roster,
+.bots-panel {
+  border: 1px solid var(--nw-border, color-mix(in srgb, currentColor 14%, transparent));
+  border-radius: 12px;
+  padding: 12px;
+  background: var(--nw-surface, transparent);
+}
+
+.bots-roster h2 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  margin: 10px 0 6px;
+  opacity: 0.85;
+}
+
+.bots-roster ul {
+  list-style: none;
+  margin: 0 0 8px;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.bots-roster li {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.bots-row {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  background: transparent;
+  cursor: pointer;
+  text-align: start;
+  font: inherit;
+  color: inherit;
+}
+
+.bots-row:hover,
+.bots-row:focus-visible {
+  border-color: var(--nw-border, color-mix(in srgb, currentColor 18%, transparent));
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.bots-row span {
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.bots-backends li {
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+}
+
+.bots-backend-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  border: 1px solid var(--nw-border, color-mix(in srgb, currentColor 16%, transparent));
+}
+
+.bots-backend-badge.is-off {
+  opacity: 0.55;
+}
+
+.bots-panel {
+  min-height: 420px;
+  display: flex;
+  flex-direction: column;
+}
+
+.bots-empty {
+  margin: auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  opacity: 0.6;
+}
+
+.bots-chat {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  height: 100%;
+  min-height: 420px;
+}
+
+.bots-chat-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.bots-chat-head h2 {
+  font-size: 15px;
+  margin: 0;
+  flex: 1;
+}
+
+.bots-chat-log {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 4px 2px;
+  max-height: 56vh;
+}
+
+.bots-msg {
+  border: 1px solid var(--nw-border, color-mix(in srgb, currentColor 12%, transparent));
+  border-radius: 10px;
+  padding: 8px 10px;
+  max-width: 88%;
+}
+
+.bots-msg.is-user {
+  align-self: flex-end;
+}
+
+.bots-msg.is-system {
+  align-self: center;
+  opacity: 0.75;
+  font-size: 13px;
+}
+
+.bots-msg header {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  font-size: 12px;
+  opacity: 0.7;
+  margin-bottom: 2px;
+}
+
+.bots-msg-meta {
+  border: 1px dashed var(--nw-border, color-mix(in srgb, currentColor 25%, transparent));
+  border-radius: 999px;
+  padding: 0 6px;
+}
+
+.bots-msg p {
+  margin: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.bots-composer {
+  display: flex;
+  gap: 8px;
+}
+
+.bots-composer input {
+  flex: 1;
+}
+
+.bots-detail {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.bots-detail-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.bots-detail-head h2 {
+  margin: 0;
+  font-size: 17px;
+  flex: 1;
+}
+
+.bots-soul p,
+.bots-soul-history p {
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin: 4px 0 0;
+}
+
+.bots-soul h3,
+.bots-soul-history h3,
+.bots-bindings h3 {
+  font-size: 13px;
+  margin: 0;
+  opacity: 0.85;
+}
+
+.bots-soul-history ol {
+  margin: 6px 0 0;
+  padding-inline-start: 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.bots-soul-history header {
+  font-size: 12px;
+  opacity: 0.65;
+}
+
+.bots-soul-history p {
+  font-size: 13px;
+}
+
+.bots-bindings ul {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.bots-bindings li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 13px;
+}
+
+.bots-bindings small {
+  width: 100%;
+  opacity: 0.65;
+}
+
+.bots-member-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+
+.bots-search {
+  flex: 1;
+  min-width: 180px;
+  max-width: 320px;
+}

@@ -320,10 +320,10 @@ async def _execute_capability_stream(
         return
 
     from knorvia.core.context import Attachment, UnifiedContext
-    from knorvia.runtime.orchestrator import ChatOrchestrator
+    from knorvia.runtime.kernel_client import stream_as_stream_events
+    from knorvia.runtime.registry.capability_registry import get_capability_registry
 
-    orch = ChatOrchestrator()
-    if capability_name not in orch.list_capabilities():
+    if get_capability_registry().get(capability_name) is None:
         yield _sse("error", {"detail": f"Capability {capability_name!r} not found"})
         return
 
@@ -388,7 +388,7 @@ async def _execute_capability_stream(
                         try:
                             if body.llm_selection:
                                 _, llm_token = activate_llm_selection(body.llm_selection)
-                            async for event in orch.handle(ctx):
+                            async for event in stream_as_stream_events(body.content):
                                 if event.type.value == "result":
                                     final_result = dict(event.metadata)
                                     continue

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -218,32 +219,31 @@ class TestRoutedTurn:
 class TestRunnerRouting:
     @pytest.fixture
     def fake_orchestrator(self, monkeypatch):
-        """Scripted ChatOrchestrator (same pattern as test_partner_runtime)."""
-        import knorvia.runtime.orchestrator as orch_mod
+        """Scripted Kernel stream (the LLM path runs on knorvia-daemon now).
+
+        The old ChatOrchestrator double is replaced by a scripted
+        ``stream_as_stream_events`` patch — the partner runner's LLM path
+        consumes the daemon stream lazily from kernel_client. Tests assign
+        ``fake_orchestrator.script = [...]``.
+        """
         from knorvia.services.model_selection import runtime as selection_runtime
 
-        class _FakeOrchestrator:
-            script: list = []
-            scripts: list = []
+        holder = SimpleNamespace(script=[])
 
-            def __init__(self) -> None:
-                pass
+        async def fake_stream(content: str, **_kwargs):
+            for event in list(holder.script):
+                yield event
 
-            async def handle(self, context):
-                script = type(self).scripts.pop(0) if type(self).scripts else type(self).script
-                for event in script:
-                    yield event
-
-        _FakeOrchestrator.script = []
-        _FakeOrchestrator.scripts = []
-        monkeypatch.setattr(orch_mod, "ChatOrchestrator", _FakeOrchestrator)
+        monkeypatch.setattr(
+            "knorvia.runtime.kernel_client.stream_as_stream_events", fake_stream
+        )
         monkeypatch.setattr(
             selection_runtime,
             "activate_llm_selection",
             lambda selection: (None, None),
         )
         monkeypatch.setattr(selection_runtime, "reset_llm_selection", lambda token: None)
-        return _FakeOrchestrator
+        return holder
 
     @pytest.mark.asyncio
     async def test_process_message_uses_routed_backend_and_persists(

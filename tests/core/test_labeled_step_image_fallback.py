@@ -16,7 +16,7 @@ import pytest
 
 from knorvia.core.agentic.labeled_step import run_labeled_step
 from knorvia.core.stream import StreamEventType
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 from knorvia.services.llm.multimodal import has_image_parts
 
 

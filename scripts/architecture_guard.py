@@ -46,6 +46,32 @@ LIMITS = {
 SOURCE_ROOTS = ("knorvia", "knorvia_cli", "web/app", "web/components", "web/lib")
 SUFFIXES = {".py", ".ts", ".tsx"}
 
+# ARCHITECTURE.md: "New source files should remain below 800 lines." The
+# per-file LIMITS table above only pins oversized legacy files, so a 868-line
+# module passed unnoticed. These prefixes hold the Office Artifact Runtime's
+# own modules to that cap; prefixes rather than file names, so splitting a
+# module cannot escape the budget by renaming. Grow by extracting a module,
+# never by raising these numbers.
+STRICT_PREFIXES = {
+    "knorvia/services/office_artifacts/": 800,
+    "knorvia/tools/office_": 800,
+    "knorvia/api/routers/office_drafts.py": 800,
+    "web/lib/office-draft.ts": 800,
+    "web/lib/xlsx-ops.ts": 800,
+    "web/components/chat/preview/previewers/SpreadsheetGrid.tsx": 800,
+    "web/components/chat/home/OfficeDraftCard.tsx": 800,
+    "web/components/library/LibraryExcelEditor.tsx": 800,
+}
+
+
+def budget_for(relative: str) -> int:
+    if relative in LIMITS:
+        return LIMITS[relative]
+    for prefix, limit in STRICT_PREFIXES.items():
+        if relative.startswith(prefix):
+            return limit
+    return DEFAULT_LIMIT
+
 
 def main() -> int:
     failures: list[str] = []
@@ -55,7 +81,7 @@ def main() -> int:
                 continue
             relative = path.relative_to(ROOT).as_posix()
             line_count = len(path.read_text(encoding="utf-8").splitlines())
-            limit = LIMITS.get(relative, DEFAULT_LIMIT)
+            limit = budget_for(relative)
             if line_count > limit:
                 failures.append(f"{relative}: {line_count} lines (budget {limit})")
     if failures:

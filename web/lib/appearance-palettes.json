@@ -1,0 +1,26 @@
+{
+  "snow": {
+    "zh": "明亮", "en": "Light", "descriptionZh": "Codex 配色", "descriptionEn": "Codex palette", "dark": false,
+    "colors": { "bg": "#ffffff", "sidebar": "#eff3f7", "ink": "#242528", "muted": "#646970", "line": "#e5e7eb", "hover": "#e3e8ed", "soft": "#f5f6f8", "green": "#286849", "green-soft": "#e8f2ed", "error": "#ad393b", "lilac": "#65617f", "lilac-soft": "#f0eef7", "action": "#202124", "action-ink": "#ffffff", "amber": "#8b571a", "amber-soft": "#fbf1e2" }
+  },
+  "dark": {
+    "zh": "深色", "en": "Dark", "descriptionZh": "Codex 配色", "descriptionEn": "Codex palette", "dark": true,
+    "colors": { "bg": "#212121", "sidebar": "#181818", "ink": "#ececec", "muted": "#b1b1b1", "line": "#383838", "hover": "#303030", "soft": "#292929", "green": "#8fd0aa", "green-soft": "#253b30", "error": "#ffa5a5", "lilac": "#bfb4dc", "lilac-soft": "#34303f", "action": "#ececec", "action-ink": "#202124", "amber": "#ecc48b", "amber-soft": "#3a3023" }
+  },
+  "light": {
+    "zh": "暖纸", "en": "Paper", "descriptionZh": "温润的米白与墨色", "descriptionEn": "Warm ivory and ink", "dark": false,
+    "colors": { "bg": "#fcfaf6", "sidebar": "#f1ece3", "ink": "#322e28", "muted": "#72695e", "line": "#e5ddd1", "hover": "#e9e1d5", "soft": "#f4efe7", "green": "#596641", "green-soft": "#eaf0e0", "error": "#aa3e35", "lilac": "#826059", "lilac-soft": "#f2e6e1", "action": "#4f4538", "action-ink": "#fffcf6", "amber": "#8a5a23", "amber-soft": "#f5ead6" }
+  },
+  "glass": {
+    "zh": "雾蓝", "en": "Mist", "descriptionZh": "清透的蓝灰与留白", "descriptionEn": "Soft blue and open space", "dark": false,
+    "colors": { "bg": "#f8fbff", "sidebar": "#e9f0f8", "ink": "#25364a", "muted": "#536579", "line": "#dbe5f0", "hover": "#dce8f4", "soft": "#eef4fa", "green": "#32634e", "green-soft": "#e4f0e9", "error": "#a83c46", "lilac": "#626b9a", "lilac-soft": "#eaedf8", "action": "#365f85", "action-ink": "#ffffff", "amber": "#855d26", "amber-soft": "#f7eedf" }
+  },
+  "jade": {
+    "zh": "青苔", "en": "Sage", "descriptionZh": "安静的浅绿与石色", "descriptionEn": "Quiet sage and stone", "dark": false,
+    "colors": { "bg": "#fafcf9", "sidebar": "#edf2eb", "ink": "#2c3b32", "muted": "#617267", "line": "#dce5dc", "hover": "#dfe9df", "soft": "#f0f5ee", "green": "#33634a", "green-soft": "#e0edde", "error": "#a53e3a", "lilac": "#736782", "lilac-soft": "#eeeaf4", "action": "#3d6650", "action-ink": "#ffffff", "amber": "#865d27", "amber-soft": "#f5eedf" }
+  },
+  "dusk": {
+    "zh": "暮紫", "en": "Dusk", "descriptionZh": "适合夜晚的紫灰色", "descriptionEn": "Muted violet after hours", "dark": true,
+    "colors": { "bg": "#262430", "sidebar": "#1e1d27", "ink": "#eeeaf7", "muted": "#b7afc7", "line": "#403b4e", "hover": "#373241", "soft": "#2e2b39", "green": "#a6d6ba", "green-soft": "#2c3e36", "error": "#ffa6b2", "lilac": "#c3afe3", "lilac-soft": "#3e354f", "action": "#d3c3ec", "action-ink": "#2c223a", "amber": "#edc790", "amber-soft": "#42382c" }
+  }
+}

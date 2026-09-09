@@ -1,0 +1,12 @@
+[package]
+name = "knorvia-protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Stable Knorvia Protocol types, framing, and handshake."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }

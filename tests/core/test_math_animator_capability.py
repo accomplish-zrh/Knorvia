@@ -1,14 +1,16 @@
+"""Math animator capability test: the pack route (media.manim)."""
+
 from __future__ import annotations
 
 import asyncio
-from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
 from knorvia.agents.math_animator.capability import MathAnimatorCapability
 from knorvia.core.context import UnifiedContext
 from knorvia.core.stream import StreamEvent, StreamEventType
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 
 async def _collect_events(run_coro) -> list[StreamEvent]:
@@ -29,7 +31,7 @@ async def _collect_events(run_coro) -> list[StreamEvent]:
 
 
 @pytest.mark.asyncio
-async def test_math_animator_capability_emits_summary_and_result(
+async def test_math_animator_capability_invokes_media_manim_pack(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # Unit test should not require real optional dependency installation.
@@ -38,82 +40,63 @@ async def test_math_animator_capability_emits_summary_and_result(
         lambda name: object() if name == "manim" else None,
     )
 
-    class FakePipeline:
-        def __init__(self, **_kwargs) -> None:
-            pass
+    captured: dict[str, Any] = {}
 
-        async def run_analysis(self, **_kwargs):
-            return SimpleNamespace(model_dump=lambda: {"learning_goal": "teach parabola"})
+    async def fake_emit(stream, *, source: str, pack_id: str, user_message: str, extra=None):
+        captured.update(
+            {
+                "source": source,
+                "pack_id": pack_id,
+                "user_message": user_message,
+                "extra": extra or {},
+            }
+        )
+        await stream.content(f"{pack_id} succeeded", source=source)
+        await stream.result(
+            {
+                "response": f"{pack_id} done",
+                "pack": {"packId": pack_id, "status": "succeeded"},
+            },
+            source=source,
+        )
+        return {"packId": pack_id, "status": "succeeded"}
 
-        async def run_design(self, **_kwargs):
-            return SimpleNamespace(model_dump=lambda: {"title": "Parabola animation"})
-
-        async def run_code_generation(self, **_kwargs):
-            return SimpleNamespace(
-                code="from manim import *\n\nclass MainScene(Scene):\n    pass\n"
-            )
-
-        async def run_render(self, **_kwargs):
-            return (
-                "from manim import *\n\nclass MainScene(Scene):\n    pass\n",
-                SimpleNamespace(
-                    artifacts=[
-                        SimpleNamespace(
-                            model_dump=lambda: {
-                                "type": "video",
-                                "url": "/api/outputs/agent/math_animator/turn_1/artifacts/video.mp4",
-                                "filename": "video.mp4",
-                                "content_type": "video/mp4",
-                                "label": "Animation video",
-                            }
-                        )
-                    ],
-                    retry_attempts=1,
-                    retry_history=[
-                        SimpleNamespace(model_dump=lambda: {"attempt": 1, "error": "boom"})
-                    ],
-                    source_code_path="/tmp/scene.py",
-                ),
-            )
-
-        async def run_summary(self, **_kwargs):
-            return SimpleNamespace(
-                summary_text="用户想讲抛物线，系统生成了一个视频动画。",
-                model_dump=lambda: {
-                    "summary_text": "用户想讲抛物线，系统生成了一个视频动画。",
-                    "user_request": "讲解抛物线",
-                    "generated_output": "一个视频",
-                    "key_points": ["parabola"],
-                },
-            )
-
-    monkeypatch.setattr("knorvia.agents.math_animator.pipeline.MathAnimatorPipeline", FakePipeline)
     monkeypatch.setattr(
-        "knorvia.services.llm.config.get_llm_config",
-        lambda: SimpleNamespace(api_key="k", base_url="u", api_version="v1"),
+        "knorvia.runtime.kernel_client.emit_pack_on_stream", fake_emit
     )
 
     context = UnifiedContext(
         session_id="session_1",
         user_message="讲解抛物线",
         active_capability="math_animator",
-        language="zh",
-        metadata={"turn_id": "turn_1", "conversation_context_text": "之前讨论过函数图像"},
+        config_overrides={"output_mode": "video", "quality": "high"},
+        metadata={"conversation_context_text": "previous discussion"},
+        attachments=[],
     )
     capability = MathAnimatorCapability()
     events = await _collect_events(lambda bus: capability.run(context, bus))
 
-    assert [event.stage for event in events if event.type == StreamEventType.STAGE_START] == [
-        "concept_analysis",
-        "concept_design",
-        "code_generation",
-        "code_retry",
-        "summary",
-        "render_output",
-    ]
-    content_event = next(event for event in events if event.type == StreamEventType.CONTENT)
-    assert "抛物线" in content_event.content
-    result_event = next(event for event in events if event.type == StreamEventType.RESULT)
-    assert result_event.metadata["output_mode"] == "video"
-    assert result_event.metadata["code"]["language"] == "python"
-    assert result_event.metadata["artifacts"][0]["filename"] == "video.mp4"
+    assert captured["pack_id"] == "media.manim"
+    assert captured["source"] == "math_animator"
+    assert captured["user_message"] == "讲解抛物线"
+    assert captured["extra"]["config_overrides"]["output_mode"] == "video"
+    assert any(
+        event.type == StreamEventType.CONTENT and "media.manim" in event.content
+        for event in events
+    )
+    result = [e for e in events if e.type == StreamEventType.RESULT]
+    assert result and result[0].metadata["pack"]["packId"] == "media.manim"
+
+
+@pytest.mark.asyncio
+async def test_math_animator_without_manim_raises_typed() -> None:
+    monkeypatch = pytest.MonkeyPatch()
+    monkeypatch.setattr(
+        "knorvia.agents.math_animator.capability.importlib.util.find_spec",
+        lambda name: None,
+    )
+    capability = MathAnimatorCapability()
+    with pytest.raises(RuntimeError, match="math-animator"):
+        await capability.run(
+            UnifiedContext(user_message="讲解抛物线"), StreamBus()
+        )

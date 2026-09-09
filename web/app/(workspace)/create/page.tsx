@@ -10,9 +10,9 @@ function first(value: string | string[] | undefined): string {
 export default async function CreateRedirectPage({
   searchParams,
 }: {
-  searchParams?: Promise<Search> | Search
+  searchParams?: Promise<Search>
 }) {
-  const params = await Promise.resolve(searchParams || {})
+  const params: Search = await (searchParams ?? Promise.resolve({}))
   const asset = first(params.asset) || first(params.library)
   const query = new URLSearchParams()
   if (asset) query.set('library', asset)

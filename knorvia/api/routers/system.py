@@ -46,12 +46,12 @@ async def get_runtime_topology():
     """
     return {
         "primary_runtime": {
-            "transport": "/api/v1/ws",
-            "manager": "TurnRuntimeManager",
-            "orchestrator": "ChatOrchestrator",
-            "session_store": "SQLiteSessionStore",
-            "capability_entry": "CapabilityRegistry",
-            "tool_entry": "ToolRegistry",
+            "transport": "knorvia-protocol",
+            "manager": "knorvia-daemon",
+            "orchestrator": "knorvia-daemon",
+            "session_store": "KnorviaProductStore",
+            "capability_entry": "CapabilityHost",
+            "tool_entry": "Kernel tools + Packs",
         },
         "compatibility_routes": [
             {"router": "chat", "mode": "legacy_adapter_target"},

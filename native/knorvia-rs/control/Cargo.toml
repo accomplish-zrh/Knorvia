@@ -1,0 +1,21 @@
+[package]
+name = "knorvia-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Knorvia control plane: handshake, product methods, policy, activity."
+
+[dependencies]
+knorvia-platform-paths = { workspace = true }
+knorvia-protocol = { workspace = true }
+knorvia-store = { workspace = true }
+knorvia-capability-host = { workspace = true }
+knorvia-packs = { workspace = true }
+knorvia-provider-gateway = { workspace = true }
+knorvia-migration = { workspace = true }
+knorvia-kernel-adapter = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }

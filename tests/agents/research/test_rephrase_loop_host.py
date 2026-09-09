@@ -16,7 +16,7 @@ import pytest
 
 from knorvia.agents.research.pipeline import ResearchPipeline, _RephraseLoopHost
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 
 class _FakeLLM:

@@ -1,0 +1,14 @@
+short_description: "对草稿 XLSX 应用一次原子、严格类型的操作批次（基于确定修订）。"
+when_to_use: "在 office_read 给出最新内容和 base_revision 之后使用。经 load_tools 按需加载；适合对导入或生成的工作簿做精确、可验证的修改。"
+input_format: |
+  {"draft_id": "abcd1234", "artifact_id": "art_1", "base_revision": 3,
+   "operations": [
+     {"op": "set_cell", "sheet": "Data", "cell": "B2", "number": 42},
+     {"op": "set_cell", "sheet": "Data", "cell": "C2", "text": "合计"},
+     {"op": "set_formula", "sheet": "Data", "cell": "D2", "formula": "=SUM(B2:C2)"},
+     {"op": "clear_cells", "sheet": "Data", "cells": ["E2", "E3"]},
+     {"op": "set_range", "sheet": "Data", "range": "A10:B11", "rows": [["a", 1], ["b", 2]]},
+     {"op": "copy_style", "sheet": "Data", "source": "A1", "targets": ["A2", "A3"]},
+     {"op": "merge_cells", "sheet": "Data", "range": "A1:D1"}
+   ]}
+guideline: "一个批次 = 一个原子事务：要么全部生效，要么全部不生效。base_revision 必须等于你最近一次读取的修订，否则返回冲突（重新读取后重试）。set_cell 只能带 text/number/boolean/value_date/value_datetime/empty 之一；导入文件写日期通常失败关闭（缓存格式有歧义），改用文本或公式。公式必须以 '=' 开头。超出用户选定工作表/范围的操作会被拒绝，不要越界。结果包含语义差异与验证信息，请向用户汇报，然后调用 office_artifact ready 交由用户审查。"

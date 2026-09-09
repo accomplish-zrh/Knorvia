@@ -1,0 +1,168 @@
+/* Shared controls use the active palette, including translucent themes.
+   Motion is limited to direct feedback; no persistent compositor layers. */
+.nw-root, .nw-modal {
+  --nw-control-radius: 11px;
+  --nw-radius-compact: 8px;
+  --nw-radius-surface: 16px;
+  --nw-radius-overlay: 22px;
+  --nw-control-height: 38px;
+  --nw-control-shadow: 0 1px 2px color-mix(in srgb, var(--nw-ink) 5%, transparent);
+  --nw-focus-halo: 0 0 0 3px color-mix(in srgb, var(--nw-action) 12%, transparent);
+}
+.nw-root { font-size: 14px; line-height: 1.6; letter-spacing: -.008em; }
+:is(.nw-root, .nw-modal) :is(button, select, input, textarea) { font-family: inherit; }
+:is(.nw-root, .nw-modal) :is(time, output, .nw-count, .nw-status-label) { font-variant-numeric: tabular-nums; }
+:is(.nw-root, .nw-modal) .nw-button {
+  min-height: var(--nw-control-height);
+  border-radius: var(--nw-control-radius);
+  font-weight: 500;
+  font-size: 13px;
+  line-height: 1.4;
+  white-space: nowrap;
+  background: var(--nw-reading);
+  box-shadow: var(--nw-control-shadow);
+}
+:is(.nw-root, .nw-modal) .nw-button-small { min-height: 32px; padding: 6px 10px; border-radius: var(--nw-radius-compact); }
+:is(.nw-root, .nw-modal) .nw-icon { width: 34px; height: 34px; border-radius: var(--nw-radius-compact); }
+:is(.nw-root, .nw-modal) :is(button, a, summary):focus-visible {
+  outline: 2px solid var(--nw-action); outline-offset: 3px;
+}
+:is(.nw-root, .nw-modal) :is(.nw-button-primary, .nw-button.primary) {
+  background: var(--nw-action); color: var(--nw-action-ink); border-color: var(--nw-action);
+  box-shadow: inset 0 1px 0 #ffffff18, var(--nw-control-shadow);
+}
+:is(.nw-root, .nw-modal) :is(.nw-button-primary, .nw-button.primary):hover {
+  background: var(--nw-action); color: var(--nw-action-ink); opacity: 1; transform: none;
+}
+:is(.nw-root, .nw-modal) .nw-field :is(input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]), textarea) {
+  width: 100%; min-width: 0; padding: 11px 13px;
+  border: 1px solid var(--nw-line); border-radius: var(--nw-control-radius);
+  background: var(--nw-reading); color: var(--nw-ink); line-height: 1.6;
+  transition: border-color 150ms, box-shadow 150ms, background-color 150ms;
+}
+:is(.nw-root, .nw-modal) .nw-field textarea { resize: vertical; min-height: 88px; }
+:is(.nw-root, .nw-modal) .nw-field :is(input, textarea):focus-visible {
+  border-color: color-mix(in srgb, var(--nw-action) 48%, var(--nw-line));
+  box-shadow: var(--nw-focus-halo); outline: 2px solid transparent; outline-offset: 2px;
+}
+:is(.nw-root, .nw-modal) :is(input, textarea)::placeholder { color: var(--nw-muted); opacity: 1; }
+:is(.nw-root, .nw-modal) :is(input, textarea):disabled { cursor: not-allowed; opacity: .6; }
+:is(.nw-root, .nw-modal) :is(button, a, input, textarea, select) { -webkit-tap-highlight-color: transparent; }
+.nw-modal {
+  background: var(--nw-popover);
+  border-radius: var(--nw-radius-overlay);
+  box-shadow: 0 24px 80px #00000026, 0 4px 16px #0000000d;
+  scrollbar-gutter: stable; overscroll-behavior: contain;
+}
+.nw-modal .nw-modal-heading {
+  position: sticky; top: -28px; z-index: 2;
+  margin: -1px -1px 20px; padding: 14px 0;
+  background: var(--nw-popover); border-bottom: 1px solid var(--nw-line);
+}
+.nw-modal .nw-modal-heading h2 { font-size: 18px; letter-spacing: -.02em; line-height: 1.5; }
+.nw-modal .nw-help { line-height: 1.7; }
+:is(.nw-root, .nw-modal) input[type="file"] {
+  max-width: 100%; color: var(--nw-muted); font-size: 12px;
+  border: 1px dashed var(--nw-line); border-radius: 11px; padding: 7px;
+}
+:is(.nw-root, .nw-modal) input[type="file"]::file-selector-button {
+  margin-inline-end: 10px; padding: 7px 12px; border-radius: 8px;
+  border: 1px solid var(--nw-line); background: var(--nw-reading);
+  color: var(--nw-ink); font: inherit; cursor: pointer;
+  transition: background-color 150ms, border-color 150ms;
+}
+:is(.nw-root, .nw-modal) input[type="file"]::file-selector-button:hover { background: var(--nw-soft); }
+.nw-modal .ns-article > .nw-field { margin-top: 0; }
+.nw-modal .ns-article-scene {
+  padding: 14px; border: 1px solid var(--nw-line); border-radius: 14px;
+  background: var(--nw-soft);
+}
+.nw-modal .ns-article-scene small { font-variant-numeric: tabular-nums; color: var(--nw-muted); opacity: 1; }
+.nw-modal .ns-article-scene > input { border-radius: 10px; background: var(--nw-reading); }
+.nw-root :is(.nw-popover, .nw-sidebar-menu, .nl-menu) {
+  border-radius: 14px; box-shadow: 0 12px 36px #00000016, 0 2px 6px #00000008;
+}
+.nw-root :is(.nw-composer, .ns-composer) {
+  transition: border-color 180ms, box-shadow 180ms;
+}
+.nw-root :is(.nw-composer, .ns-composer):focus-within {
+  border-color: color-mix(in srgb, var(--nw-ink) 24%, var(--nw-line));
+  box-shadow: 0 6px 24px color-mix(in srgb, var(--nw-ink) 6%, transparent);
+}
+.nw-root :is(.nw-content-tab, .nw-panel-tab) { border-radius: 8px; }
+.nw-root :is(.nw-inline-error, .ns-error, .nw-banner) { border-radius: 12px; overflow-wrap: anywhere; }
+.nw-root :is(.nw-inline-search, .nw-search-field) { transition: border-color 160ms, box-shadow 160ms; }
+.nw-root :is(.nw-inline-search, .nw-search-field):focus-within {
+  border-color: color-mix(in srgb, var(--nw-action) 45%, var(--nw-line)); box-shadow: var(--nw-focus-halo);
+}
+.nw-root :is(.nw-inline-search, .nw-search-field) input:focus-visible { outline: 0; }
+.nw-root .nw-page { width: 100%; max-width: 1160px; margin-inline: auto; padding-inline: clamp(24px, 3.5vw, 56px); }
+.nw-root .nw-page-heading h1 { font-size: 28px; font-weight: 600; line-height: 1.3; }
+.nw-root .nw-page-heading p { max-width: 65ch; margin-top: 10px; }
+.nw-root .nw-empty-panel { padding-block: clamp(48px, 9vh, 100px); }
+.nw-root .nw-empty-panel > svg { border: 0; background: var(--nw-soft); color: var(--nw-muted); box-shadow: none; }
+.nw-root .nw-empty-panel p { max-width: 46ch; margin-inline: auto; }
+.nw-root :is(.nw-tabs, .nw-segmented) { border-color: transparent; background: var(--nw-soft); gap: 3px; }
+.nw-root :is(.nw-tabs, .nw-segmented) button { min-height: 34px; padding: 6px 13px; font-size: 13px; }
+.nw-root :is(.nw-tabs, .nw-segmented) button.is-active { color: var(--nw-ink); background: var(--nw-reading); box-shadow: var(--nw-control-shadow); }
+.nw-root .nw-results-caption { font-size: 12px; color: var(--nw-muted); }
+.nw-root .nw-task-row { min-height: 70px; gap: 16px; }
+.nw-root .nw-task-row strong { font-size: 14px; font-weight: 550; }
+.nw-root .nw-task-row :is(time, div > span) { font-size: 12px; }
+.nw-root .nw-task-row > div { min-width: 0; }
+.nw-root .nw-task-row strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nw-root :is(.nw-project-card, .nw-automation, .nw-extension-note) { box-shadow: none; border-radius: var(--nw-radius-surface); }
+.nw-root .nw-project-card:hover { transform: none; background: var(--nw-soft); }
+.nw-root .nw-sidebar-tabs a { font-size: 14px; font-weight: 500; }
+.nw-root .nw-sidebar-tabs a[aria-current="page"] { font-weight: 600; }
+.nw-root .nw-connection { font-size: 12px; }
+.nw-root .nw-locale { min-height: 32px; min-width: 32px; font-size: 12px; }
+.nw-root .nw-project-conversations .nw-task-link { min-height: 34px; font-size: 13px; }
+.nw-root .nw-task-header-content .nw-status-label { font-size: 11px; padding: 4px 8px; }
+.nw-root .nw-composer-wrap > footer { font-size: 12px; line-height: 1.6; }
+.nw-root .nw-tool summary { min-height: 44px; gap: 10px; font-size: 13px; }
+.nw-root .nw-tool summary > .nw-tool-symbol { width: 28px; height: 28px; border-radius: 8px; }
+.nw-root .nw-tool summary > span:not(.nw-tool-symbol):not(.nw-tool-state) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nw-root .nw-tool-state { font-size: 12px; }
+.nw-root .nw-tool-method { font-size: 11px; }
+.nw-root .nw-tool pre { font-size: 12px; padding: 16px; }
+.nw-root .nw-panel-header { height: 48px; min-height: 48px; padding-inline: 8px; gap: 4px; }
+.nw-root .nw-content-tab { margin-block: 5px; max-width: 220px; border-bottom: 0; border-radius: 8px; }
+.nw-root .nw-content-tab.is-active { background: var(--nw-soft); box-shadow: inset 0 0 0 1px var(--nw-line); }
+.nw-root .nw-content-tab [role="tab"] { font-size: 13px; padding-left: 10px; }
+.nw-root .nw-content-tab [role="tab"]:focus-visible { outline: 2px solid var(--nw-action); outline-offset: -3px; border-radius: 8px; }
+.nw-root .nw-tab-close { width: 28px; height: 28px; margin-right: 3px; border-radius: 6px; }
+.nw-root .nw-panel-secondary button { min-height: 32px; font-size: 12px; }
+.nw-root :is(.nw-browser-toolbar input, .nw-preview-toolbar > span, .nw-terminal-toolbar > span) { font-size: 13px; }
+.nw-root :is(.nw-browser-hint, .nw-terminal-toolbar small, .nw-terminal > footer) { font-size: 12px; line-height: 1.6; }
+.nw-root .nw-browser-toolbar input { min-height: 34px; border-radius: 8px; }
+.nw-root :is(.nw-settings-main, .nw-task-scroll, .nl-file-list, .nw-panel-content), .nw-modal {
+  scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--nw-muted) 32%, transparent) transparent;
+}
+@media (hover: hover) {
+  :is(.nw-root, .nw-modal) .nw-button:not(:disabled):not(.primary):not(.nw-button-primary):hover {
+    background: var(--nw-soft); border-color: color-mix(in srgb, var(--nw-ink) 20%, var(--nw-line));
+    box-shadow: 0 2px 5px color-mix(in srgb, var(--nw-ink) 7%, transparent);
+  }
+  :is(.nw-root, .nw-modal) :is(.nw-button-primary, .nw-button.primary):not(:disabled):hover {
+    box-shadow: inset 0 0 0 100px #ffffff0c, 0 3px 9px #00000016;
+  }
+}
+@media (max-width: 650px) {
+  .nw-modal { padding: 20px; border-radius: 18px; max-height: 90dvh; }
+  .nw-modal .nw-modal-heading { top: -20px; }
+  .nw-root .nw-page { padding-inline: 20px; padding-top: 28px; }
+  .nw-root .nw-page-heading { gap: 16px; }
+  .nw-root .nw-page-heading h1 { font-size: 24px; }
+  .nw-root .nw-task-row { gap: 10px; }
+  .nw-root .nw-task-row > time { display: none; }
+  .nw-root .nw-content-tab { max-width: 170px; }
+  .nw-root .nw-tool pre { padding: 12px; }
+}
+@media (pointer: coarse) {
+  :is(.nw-root, .nw-modal) :is(.nw-icon, .nw-button, .nw-button-small) { min-height: 40px; }
+  :is(.nw-root, .nw-modal) .nw-icon { min-width: 40px; }
+}
+@media (forced-colors: active) {
+  :is(.nw-root, .nw-modal) .nw-field :is(input, textarea):focus-visible { outline: 2px solid Highlight; }
+}

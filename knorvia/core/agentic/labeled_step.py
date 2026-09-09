@@ -49,7 +49,6 @@ from knorvia.core.agentic.usage import (
     message_content_chars,
     record_streamed_usage,
 )
-from knorvia.core.stream_bus import StreamBus
 from knorvia.core.trace import merge_trace_metadata
 from knorvia.services.llm import clean_thinking_tags
 from knorvia.services.llm.multimodal import should_degrade_to_text, strip_image_parts_inplace
@@ -116,7 +115,7 @@ async def run_labeled_step(
     allowed_labels: tuple[str, ...],
     final_labels: frozenset[str],
     tool_label: str | None,
-    stream: StreamBus,
+    stream: Any,
     source: str,
     stage: str,
     iter_meta: dict[str, Any],

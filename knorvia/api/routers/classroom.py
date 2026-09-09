@@ -21,6 +21,7 @@ from knorvia.api.routers.auth import require_admin
 from knorvia.services.classroom.director import build_agent_roster_json, pick_next_speaker, speak
 from knorvia.services.classroom.generator import generate_classroom
 from knorvia.services.classroom.grading import grade_answers
+from knorvia.services.classroom.jobs import get_classroom_job_store
 from knorvia.services.classroom.store import get_classroom_store
 
 logger = logging.getLogger(__name__)
@@ -181,7 +182,14 @@ async def export_to_notebook(classroom_id: str, notebook_id: str = ""):
         lines.append(f"## {scene.title}")
         if scene.objective:
             lines.append(f"*{scene.objective}*")
+        if scene.widget is not None:
+            widget = scene.widget.to_dict()
+            lines.append(f"- 互动件: {widget.get('concept')}")
+            if widget.get("key_variables"):
+                lines.append(f"- 可操作变量: {', '.join(widget['key_variables'])}")
         for point in scene.key_points:
+            lines.append(f"- {point}")
+        for point in scene.narration:
             lines.append(f"- {point}")
         for question in scene.questions:
             data = question.to_dict()
@@ -214,6 +222,26 @@ async def list_classrooms():
     return {"classrooms": get_classroom_store().list()}
 
 
+@router.get("/styles")
+async def list_teaching_styles():
+    """Teaching-style skill packs (title/description in Chinese, *_en for the
+    English UI; the frontend picks by locale)."""
+    from knorvia.services.classroom.styles import list_styles
+
+    return {
+        "styles": [
+            {
+                "id": style.id,
+                "title": style.title,
+                "description": style.description,
+                "title_en": style.title_en,
+                "description_en": style.description_en,
+            }
+            for style in list_styles()
+        ]
+    }
+
+
 class GenerateRequest(BaseModel):
     topic: str = Field(..., min_length=1, max_length=400)
     minutes: int = 12
@@ -222,6 +250,8 @@ class GenerateRequest(BaseModel):
     # bases, and seat saved Personas as the classmate agents.
     kb_name: str = ""
     persona_names: list[str] = Field(default_factory=list, max_length=3)
+    # Teaching-style skill pack ("" = default behavior, checked server-side).
+    style_id: str = Field(default="", max_length=64)
 
 
 async def _resolve_kb_grounding(kb_name: str, topic: str) -> str:
@@ -282,52 +312,98 @@ def _resolve_persona_specs(persona_names: list[str]) -> list[dict[str, str]]:
 
 @router.post("/generate")
 async def generate(payload: GenerateRequest):
-    """Generate a lesson, streaming progress events; final event = document."""
-    kb_context = await _resolve_kb_grounding(payload.kb_name, payload.topic)
-    persona_specs = _resolve_persona_specs(payload.persona_names)
+    """Create a durable generation job and return ``{job_id}`` immediately.
+
+    The lesson keeps generating in a background task (request-independent):
+    clients follow ``GET /jobs/{id}/events`` (replay + live SSE) and can
+    reconnect after refresh/restart. The job's stored payload is a summary
+    (names only) — KB text never lands in the job file.
+    """
+    job_store = get_classroom_job_store()
+    job = job_store.create(
+        topic=payload.topic,
+        payload={
+            "topic": payload.topic,
+            "minutes": payload.minutes,
+            "language": payload.language,
+            "kb_name": payload.kb_name,
+            "persona_names": payload.persona_names,
+            "style_id": payload.style_id,
+        },
+    )
+    task = asyncio.create_task(_run_generation_job(job.id, payload))
+    _background_tasks.add(task)
+    task.add_done_callback(_background_tasks.discard)
+    return {"job_id": job.id}
+
+
+_background_tasks: set[asyncio.Task] = set()
+
+
+async def _run_generation_job(job_id: str, payload: GenerateRequest) -> None:
+    """Run one generation job to completion — never bound to a request."""
+    job_store = get_classroom_job_store()
+    job_store.mark_running(job_id)
+
+    async def on_progress(step: str, info: dict[str, Any]) -> None:
+        job_store.append_event(job_id, "progress", {"step": step, **info})
+
+    try:
+        kb_context = await _resolve_kb_grounding(payload.kb_name, payload.topic)
+        persona_specs = _resolve_persona_specs(payload.persona_names)
+        document = await generate_classroom(
+            payload.topic,
+            minutes=payload.minutes,
+            language=payload.language,
+            on_progress=on_progress,
+            kb_context=kb_context,
+            persona_specs=persona_specs,
+            style_id=payload.style_id,
+        )
+        get_classroom_store().save(document)
+        job_store.append_event(job_id, "done", {"id": document.id, "title": document.title})
+        job_store.mark_done(job_id, document.id)
+    except Exception as exc:  # noqa: BLE001 - job failure is recorded, not raised
+        logger.exception("Classroom generation job %s failed", job_id)
+        job_store.append_event(job_id, "error", {"message": str(exc)})
+        job_store.mark_failed(job_id, str(exc))
+
+
+@router.get("/jobs/{job_id}")
+async def get_generation_job(job_id: str):
+    """Job snapshot: status, payload summary, and every event so far."""
+    job = get_classroom_job_store().get(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
+
+
+@router.get("/jobs/{job_id}/events")
+async def stream_generation_job_events(job_id: str):
+    """SSE: replay all stored events, then follow live until terminal."""
+    job_store = get_classroom_job_store()
+    if job_store.get(job_id) is None:
+        raise HTTPException(status_code=404, detail="Job not found")
 
     async def stream():
-        def progress_payload(step: str, info: dict[str, Any]) -> str:
-            return _sse("progress", {"step": step, **info})
-
-        queue: "asyncio.Queue[tuple[str, dict[str, Any]] | None]" = asyncio.Queue()
-
-        async def on_progress(step: str, info: dict[str, Any]) -> None:
-            await queue.put((step, info))
-
-        async def run() -> None:
-            try:
-                document = await generate_classroom(
-                    payload.topic,
-                    minutes=payload.minutes,
-                    language=payload.language,
-                    on_progress=on_progress,
-                    kb_context=kb_context,
-                    persona_specs=persona_specs,
+        index = 0
+        while True:
+            job = job_store.get(job_id)
+            if job is None:
+                yield _sse("error", {"message": "job record vanished"})
+                return
+            events = job.events
+            while index < len(events):
+                event = events[index]
+                index += 1
+                yield _sse(
+                    str(event.get("type") or "progress"), dict(event.get("data") or {})
                 )
-                get_classroom_store().save(document)
-                await queue.put(("done", {"id": document.id, "title": document.title}))
-            except Exception as exc:  # noqa: BLE001 - reported as an SSE error
-                logger.exception("Classroom generation failed")
-                await queue.put(("error", {"message": str(exc)}))
-            finally:
-                await queue.put(None)
-
-        task = asyncio.create_task(run())
-        try:
-            while True:
-                item = await queue.get()
-                if item is None:
-                    break
-                step, info = item
-                if step == "done":
-                    yield _sse("done", info)
-                elif step == "error":
-                    yield _sse("error", info)
-                else:
-                    yield progress_payload(step, info)
-        finally:
-            task.cancel()
+                if event.get("type") in {"done", "error"}:
+                    return
+            if job.status in {"done", "failed"}:
+                return
+            await job_store.wait_for_events(job_id)
 
     return StreamingResponse(
         stream(),
@@ -337,8 +413,36 @@ async def generate(payload: GenerateRequest):
 
 
 @router.get("/{classroom_id}")
-async def get_classroom(classroom_id: str):
+async def get_classroom(classroom_id: str, revision: int | None = None):
+    """Full document; with ``?revision=N`` a lite answer when unchanged."""
     document = get_classroom_store().get(classroom_id)
+    if document is None:
+        raise HTTPException(status_code=404, detail="Classroom not found")
+    if revision is not None and int(revision) == document.version:
+        return {"id": document.id, "version": document.version, "unchanged": True}
+    return document.to_dict()
+
+
+class EditOpsRequest(BaseModel):
+    """Atomic edit transaction: every op applies, or nothing does."""
+
+    ops: list[dict[str, Any]] = Field(..., min_length=1, max_length=50)
+
+
+@router.patch("/{classroom_id}")
+async def edit_classroom(classroom_id: str, payload: EditOpsRequest):
+    """Apply a list of edit ops atomically (OpenMAIC edit-deck discipline).
+
+    409 names the offending op and the reason; on success the FULL updated
+    document is returned so the client can refresh from the response body.
+    """
+    from knorvia.services.classroom.edit import EditError, apply_ops
+
+    store = get_classroom_store()
+    try:
+        document = store.save_edit(classroom_id, lambda doc: apply_ops(doc, payload.ops))
+    except EditError as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
     if document is None:
         raise HTTPException(status_code=404, detail="Classroom not found")
     return document.to_dict()

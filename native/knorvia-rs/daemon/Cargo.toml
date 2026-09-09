@@ -1,0 +1,29 @@
+[package]
+name = "knorvia-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Knorvia product control plane process. Public identity is knorvia-daemon, not Codex."
+
+[[bin]]
+name = "knorvia-daemon"
+path = "src/main.rs"
+
+[lib]
+name = "knorvia_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+knorvia-platform-paths = { workspace = true }
+knorvia-protocol = { workspace = true }
+knorvia-control = { workspace = true }
+knorvia-store = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+hex = { workspace = true }
+getrandom = "0.2.17"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }

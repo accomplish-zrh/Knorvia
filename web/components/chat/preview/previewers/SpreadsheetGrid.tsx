@@ -1,6 +1,12 @@
 "use client";
 
-import { useMemo, useState, type KeyboardEvent } from "react";
+import {
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MouseEvent,
+} from "react";
 import { useTranslation } from "react-i18next";
 import {
   cellAddress,
@@ -10,40 +16,68 @@ import {
   type SpreadsheetWorkbook,
 } from "@/lib/xlsx-workbook";
 
-type Selection = CellAddress;
+export type GridCell = { row: number; col: number };
+export type GridRange = { sheetIndex: number; from: GridCell; to: GridCell };
+
+function normalize(from: GridCell, to: GridCell): { from: GridCell; to: GridCell } {
+  return {
+    from: {
+      row: Math.min(from.row, to.row),
+      col: Math.min(from.col, to.col),
+    },
+    to: {
+      row: Math.max(from.row, to.row),
+      col: Math.max(from.col, to.col),
+    },
+  };
+}
 
 export default function SpreadsheetGrid({
   workbook,
   editable = false,
   error = "",
   onCommit,
+  onSelectionChange,
+  changedCells,
 }: {
   workbook: SpreadsheetWorkbook;
   editable?: boolean;
   error?: string;
   onCommit?: (address: CellAddress, raw: string) => void;
+  /** Reports the selected rectangle (single cells included) for a frozen turn selection. */
+  onSelectionChange?: (range: GridRange, sheetName: string) => void;
+  /** "Sheet!A1" addresses to highlight, e.g. the cells a draft's last diff touched. */
+  changedCells?: string[];
 }) {
   const { t } = useTranslation();
   const [activeSheet, setActiveSheet] = useState(0);
-  const [selection, setSelection] = useState<Selection>({
-    sheetIndex: 0,
-    row: 1,
-    col: 1,
-  });
+  const [anchor, setAnchor] = useState<GridCell>({ row: 1, col: 1 });
+  const [focus, setFocus] = useState<GridCell>({ row: 1, col: 1 });
+  const [selectionSheet, setSelectionSheet] = useState(0);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState("");
+  const dragging = useRef(false);
+  const [formulaEditing, setFormulaEditing] = useState(false);
 
   const sheet =
     workbook.sheets[Math.min(activeSheet, Math.max(workbook.sheets.length - 1, 0))];
+  const bounds = useMemo(() => normalize(anchor, focus), [anchor, focus]);
   const selected =
-    selection.sheetIndex === activeSheet
-      ? sheet?.rows[selection.row - 1]?.[selection.col - 1]
+    selectionSheet === activeSheet
+      ? sheet?.rows[focus.row - 1]?.[focus.col - 1]
       : undefined;
+  const changed = useMemo(() => new Set(changedCells ?? []), [changedCells]);
 
   const formulaValue = useMemo(() => {
-    if (editing && selection.sheetIndex === activeSheet) return draft;
+    if (editing && selectionSheet === activeSheet) return draft;
     return formulaBarValue(selected);
-  }, [activeSheet, draft, editing, selected, selection.sheetIndex]);
+  }, [activeSheet, draft, editing, selected, selectionSheet]);
+
+  const rangeLabel = `${cellAddress(bounds.from.row, bounds.from.col)}${
+    bounds.from.row === bounds.to.row && bounds.from.col === bounds.to.col
+      ? ""
+      : `:${cellAddress(bounds.to.row, bounds.to.col)}`
+  }`;
 
   if (!sheet) {
     return (
@@ -53,13 +87,48 @@ export default function SpreadsheetGrid({
     );
   }
 
-  function selectCell(row: number, col: number, startEdit = false) {
+  function report(sheetIndex: number, from: GridCell, to: GridCell) {
+    if (!onSelectionChange) return;
+    const span = normalize(from, to);
+    onSelectionChange(
+      { sheetIndex, from: span.from, to: span.to },
+      workbook.sheets[sheetIndex]?.name || "",
+    );
+  }
+
+  function selectCell(
+    row: number,
+    col: number,
+    options: { extend?: boolean; startEdit?: boolean } = {},
+  ) {
     if (editing && !commitIfNeeded()) return;
-    setSelection({ sheetIndex: activeSheet, row, col });
+    const { extend = false, startEdit = false } = options;
+    const next = { row, col };
+    const from = extend ? anchor : next;
+    if (!extend) setAnchor(next);
+    setFocus(next);
+    setSelectionSheet(activeSheet);
     const cell = sheet.rows[row - 1]?.[col - 1];
-    const next = formulaBarValue(cell);
-    setDraft(next);
+    setDraft(formulaBarValue(cell));
     setEditing(startEdit);
+    report(activeSheet, from, next);
+  }
+
+  function onMouseDownCell(event: MouseEvent<HTMLTableCellElement>, row: number, col: number) {
+    // Left button only; a plain click selects one cell, then dragging extends.
+    if (event.button !== 0) return;
+    setFormulaEditing(false);
+    dragging.current = true;
+    selectCell(row, col, { extend: event.shiftKey });
+  }
+
+  function onMouseEnterCell(row: number, col: number) {
+    if (!dragging.current) return;
+    selectCell(row, col, { extend: true });
+  }
+
+  function endDrag() {
+    dragging.current = false;
   }
 
   function commitIfNeeded(): boolean {
@@ -68,7 +137,7 @@ export default function SpreadsheetGrid({
       return true;
     }
     try {
-      onCommit(selection, draft);
+      onCommit({ sheetIndex: activeSheet, row: focus.row, col: focus.col }, draft);
       setEditing(false);
       return true;
     } catch {
@@ -77,6 +146,7 @@ export default function SpreadsheetGrid({
   }
 
   function onGridKeyDown(event: KeyboardEvent<HTMLDivElement>) {
+    if (event.defaultPrevented || event.nativeEvent.isComposing) return;
     if (!sheet) return;
     const maxRow = sheet.rowCount;
     const maxCol = sheet.colCount;
@@ -84,7 +154,7 @@ export default function SpreadsheetGrid({
       if (event.key === "Enter") {
         event.preventDefault();
         if (commitIfNeeded()) {
-          selectCell(Math.min(selection.row + 1, maxRow), selection.col);
+          selectCell(Math.min(focus.row + 1, maxRow), focus.col);
         }
       } else if (event.key === "Escape") {
         event.preventDefault();
@@ -94,9 +164,9 @@ export default function SpreadsheetGrid({
         event.preventDefault();
         if (commitIfNeeded()) {
           const nextCol = event.shiftKey
-            ? Math.max(1, selection.col - 1)
-            : Math.min(maxCol, selection.col + 1);
-          selectCell(selection.row, nextCol);
+            ? Math.max(1, focus.col - 1)
+            : Math.min(maxCol, focus.col + 1);
+          selectCell(focus.row, nextCol);
         }
       }
       return;
@@ -104,7 +174,8 @@ export default function SpreadsheetGrid({
     if (event.key === "Enter" || event.key === "F2") {
       if (!editable) return;
       event.preventDefault();
-      selectCell(selection.row, selection.col, true);
+      setFormulaEditing(false);
+      selectCell(focus.row, focus.col, { startEdit: true });
       return;
     }
     const move: Record<string, [number, number]> = {
@@ -118,14 +189,25 @@ export default function SpreadsheetGrid({
     if (delta) {
       event.preventDefault();
       selectCell(
-        Math.min(maxRow, Math.max(1, selection.row + delta[0])),
-        Math.min(maxCol, Math.max(1, selection.col + delta[1])),
+        Math.min(maxRow, Math.max(1, focus.row + delta[0])),
+        Math.min(maxCol, Math.max(1, focus.col + delta[1])),
+        { extend: event.shiftKey },
       );
     } else if (editable && event.key.length === 1 && !event.ctrlKey && !event.metaKey) {
-      setSelection({ sheetIndex: activeSheet, row: selection.row, col: selection.col });
+      setFormulaEditing(false);
       setDraft(event.key);
       setEditing(true);
     }
+  }
+
+  function cellState(row: number, col: number) {
+    if (selectionSheet !== activeSheet) return { inRange: false, isFocus: false };
+    const inRange =
+      row >= bounds.from.row &&
+      row <= bounds.to.row &&
+      col >= bounds.from.col &&
+      col <= bounds.to.col;
+    return { inRange, isFocus: row === focus.row && col === focus.col };
   }
 
   return (
@@ -133,12 +215,18 @@ export default function SpreadsheetGrid({
       className="flex h-full min-h-0 flex-col bg-[var(--card)]"
       data-spreadsheet-grid=""
       data-editable={editable ? "true" : "false"}
+      data-selection-range={sheet ? `${sheet.name}!${rangeLabel}` : ""}
       tabIndex={0}
       onKeyDown={onGridKeyDown}
+      onMouseUp={endDrag}
+      onMouseLeave={endDrag}
     >
       <div className="flex shrink-0 items-center gap-2 border-b border-[var(--border)]/50 bg-[var(--muted)]/20 px-2 py-1.5">
-        <span className="w-14 shrink-0 text-[10px] uppercase tracking-wide text-[var(--muted-foreground)]">
-          {sheet ? cellAddress(selection.row, selection.col) : ""}
+        <span
+          data-selection-label=""
+          className="w-20 shrink-0 text-[10px] uppercase tracking-wide text-[var(--muted-foreground)]"
+        >
+          {rangeLabel}
         </span>
         <label className="sr-only" htmlFor="spreadsheet-formula">
           {t("Formula")}
@@ -150,6 +238,7 @@ export default function SpreadsheetGrid({
           readOnly={!editable}
           onFocus={() => {
             if (editable) {
+              setFormulaEditing(true);
               setDraft(formulaBarValue(selected));
               setEditing(true);
             }
@@ -163,12 +252,14 @@ export default function SpreadsheetGrid({
             commitIfNeeded();
           }}
           onKeyDown={(event) => {
+            if (event.nativeEvent.isComposing) return;
             if (event.key === "Enter") {
               event.preventDefault();
+              event.stopPropagation();
               if (commitIfNeeded()) {
                 selectCell(
-                  Math.min(selection.row + 1, sheet.rowCount),
-                  selection.col,
+                  Math.min(focus.row + 1, sheet.rowCount),
+                  focus.col,
                 );
               }
             }
@@ -204,29 +295,40 @@ export default function SpreadsheetGrid({
                   {rowIndex + 1}
                 </th>
                 {cells.map((cell, colIndex) => {
-                  const selectedCell =
-                    selection.sheetIndex === activeSheet &&
-                    selection.row === rowIndex + 1 &&
-                    selection.col === colIndex + 1;
-                  const editingCell = selectedCell && editing && editable;
+                  const address = `${columnLabel(colIndex + 1)}${rowIndex + 1}`;
+                  const { inRange, isFocus } = cellState(rowIndex + 1, colIndex + 1);
+                  const editingCell = isFocus && editing && editable;
+                  const isChanged = changed.has(`${sheet.name}!${address}`);
                   return (
                     <td
                       key={colIndex}
-                      data-cell={`${columnLabel(colIndex + 1)}${rowIndex + 1}`}
-                      onClick={() => selectCell(rowIndex + 1, colIndex + 1)}
+                      data-cell={address}
+                      data-changed={isChanged ? "true" : undefined}
+                      onMouseDown={(event) =>
+                        onMouseDownCell(event, rowIndex + 1, colIndex + 1)
+                      }
+                      onMouseEnter={() => onMouseEnterCell(rowIndex + 1, colIndex + 1)}
                       onDoubleClick={() =>
-                        editable && selectCell(rowIndex + 1, colIndex + 1, true)
+                        editable && selectCell(rowIndex + 1, colIndex + 1, { startEdit: true })
                       }
                       className={`max-w-[280px] truncate border border-[var(--border)]/40 px-2 py-1 ${
-                        selectedCell
+                        isFocus
                           ? "bg-[var(--primary)]/12 ring-1 ring-inset ring-[var(--primary)]/50"
-                          : rowIndex === 0
-                            ? "bg-[var(--muted)]/25"
-                            : "bg-[var(--card)]"
-                      }`}
-                      title={formulaBarValue(cell)}
+                          : inRange
+                            ? "bg-[var(--primary)]/8"
+                            : isChanged
+                              ? "bg-amber-500/12"
+                              : rowIndex === 0
+                                ? "bg-[var(--muted)]/25"
+                                : "bg-[var(--card)]"
+                      }${isChanged ? " outline outline-1 -outline-offset-1 outline-amber-500/60" : ""}`}
+                      title={
+                        isChanged
+                          ? `${formulaBarValue(cell)} — ${t("Changed in this draft")}`
+                          : formulaBarValue(cell)
+                      }
                     >
-                      {editingCell ? (
+                      {editingCell && !formulaEditing ? (
                         <input
                           autoFocus
                           value={draft}
@@ -249,6 +351,11 @@ export default function SpreadsheetGrid({
             {t("Large sheet — preview truncated. Download for the full file.")}
           </p>
         ) : null}
+        {changed.size ? (
+          <p className="px-3 py-2 text-[11px] text-[var(--muted-foreground)]/70">
+            {t("Highlighted cells changed in this draft.")}
+          </p>
+        ) : null}
         {editable ? (
           <p className="px-3 py-2 text-[11px] text-[var(--muted-foreground)]/70">
             {t("Formulas are stored, not calculated. Excel or WPS will compute them.")}
@@ -266,8 +373,12 @@ export default function SpreadsheetGrid({
               onClick={() => {
                 commitIfNeeded();
                 setActiveSheet(index);
-                setSelection({ sheetIndex: index, row: 1, col: 1 });
+                const reset = { row: 1, col: 1 };
+                setAnchor(reset);
+                setFocus(reset);
+                setSelectionSheet(index);
                 setEditing(false);
+                report(index, reset, reset);
               }}
               className={`shrink-0 rounded-md px-2.5 py-1 text-[11.5px] font-medium transition-colors ${
                 index === activeSheet

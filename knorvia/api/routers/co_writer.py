@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import traceback
-from typing import AsyncGenerator, Literal
+from typing import Any, AsyncGenerator, AsyncIterator, Literal
 import uuid
 
 from fastapi import APIRouter, HTTPException
@@ -24,7 +24,6 @@ from knorvia.co_writer.storage import (
     CoWriterDocumentSummary,
     get_co_writer_storage,
 )
-from knorvia.core.stream_bus import StreamBus
 from knorvia.services.config import load_config_with_main
 from knorvia.services.llm import clean_thinking_tags
 from knorvia.services.settings.interface_settings import get_response_language
@@ -242,11 +241,89 @@ def _trace_preview(text: str) -> str:
     return cleaned[:_TRACE_PREVIEW_CHARS].rstrip() + "…"
 
 
+class _SseEditStream:
+    """Local SSE bridge for the react-edit turn.
+
+    Duck-typed stand-in for the legacy stream bus: the edit agent emits
+    progress/result events, this class queues them as plain dicts, and the
+    SSE generator drains them. Local to this router — the co-writer pack/worker
+    migration replaces the whole edit path.
+    """
+
+    def __init__(self) -> None:
+        self._queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+        self._closed = False
+
+    async def _put(self, event: dict[str, Any]) -> None:
+        if not self._closed:
+            await self._queue.put(event)
+
+    async def tool_call(
+        self, name: str, args: dict[str, Any], source: str = "", stage: str = "", **_: Any
+    ) -> None:
+        await self._put(
+            {"type": "tool_call", "tool_name": name, "args": args, "source": source, "stage": stage}
+        )
+
+    async def tool_result(
+        self, name: str, result: object, source: str = "", stage: str = "", **_: Any
+    ) -> None:
+        await self._put(
+            {"type": "tool_result", "tool_name": name, "result": result, "source": source, "stage": stage}
+        )
+
+    async def content(self, message: str, source: str = "", stage: str = "", **_: Any) -> None:
+        await self._put({"type": "content", "content": message, "source": source, "stage": stage})
+
+    async def progress(self, message: str = "", source: str = "", stage: str = "", **_: Any) -> None:
+        await self._put({"type": "progress", "content": message, "source": source, "stage": stage})
+
+    async def result(self, data: dict[str, Any], source: str = "", **_: Any) -> None:
+        await self._put({"type": "result", "metadata": data, "source": source})
+
+    def stage(self, name: str, source: str = "", **_: Any) -> "_SseEditStreamStage":
+        return _SseEditStreamStage(self, name, source)
+
+    def subscribe(self) -> AsyncIterator[dict[str, Any]]:
+        async def _iterate() -> AsyncIterator[dict[str, Any]]:
+            while True:
+                event = await self._queue.get()
+                if event is None:
+                    return
+                yield event
+
+        return _iterate()
+
+    async def close(self) -> None:
+        self._closed = True
+        await self._queue.put(None)
+
+
+class _SseEditStreamStage:
+    """Async context manager emitting stage_start / stage_end markers."""
+
+    def __init__(self, owner: _SseEditStream, name: str, source: str) -> None:
+        self._owner = owner
+        self._name = name
+        self._source = source
+
+    async def __aenter__(self) -> "_SseEditStreamStage":
+        await self._owner._put(
+            {"type": "stage_start", "stage": self._name, "source": self._source}
+        )
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        await self._owner._put(
+            {"type": "stage_end", "stage": self._name, "source": self._source}
+        )
+
+
 async def _run_react_edit(
     request: ReactEditRequest,
     *,
     language: str,
-    stream: StreamBus | None = None,
+    stream: Any | None = None,
 ) -> dict[str, object]:
     selected_text, instruction, tools = _prepare_react_edit_request(request, language)
     operation_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
@@ -359,7 +436,7 @@ async def _run_react_edit(
 
 async def _stream_react_edit(request: ReactEditRequest) -> AsyncGenerator[str, None]:
     language = _current_language()
-    bus = StreamBus()
+    bus = _SseEditStream()
     error_holder: dict[str, str] = {}
     result_holder: dict[str, object] | None = None
 
@@ -377,7 +454,7 @@ async def _stream_react_edit(request: ReactEditRequest) -> AsyncGenerator[str, N
     task = asyncio.create_task(_run())
     try:
         async for event in bus.subscribe():
-            yield f"event: stream\ndata: {json.dumps(event.to_dict(), default=str)}\n\n"
+            yield f"event: stream\ndata: {json.dumps(event, default=str)}\n\n"
 
         await task
         if error_holder:

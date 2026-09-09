@@ -67,11 +67,6 @@ class ObsidianCapability(KnowledgeCapability):
         updated["_vault_path"] = binding["path"]
         return updated
 
-    def pre_loop_seed(self, context: UnifiedContext) -> str:
-        _ = context
-        return ""
-
-
 def _prompt_text(prompts: dict[str, Any], path: tuple[str, ...]) -> str:
     value: Any = prompts
     for key in path:

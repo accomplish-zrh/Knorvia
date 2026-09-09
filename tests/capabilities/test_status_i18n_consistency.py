@@ -22,7 +22,9 @@ import yaml
 
 _REPO = Path(__file__).resolve().parents[2]
 _PROMPTS = _REPO / "knorvia" / "agents" / "visualize" / "prompts"
-_CODE = _REPO / "knorvia" / "agents" / "visualize" / "capability.py"
+# The visualize orchestration moved to the Python media worker; i18n usage is
+# checked there now.
+_CODE = _REPO / "knorvia" / "workers" / "media_worker.py"
 
 
 def _status_keys(lang: str) -> set[str]:
@@ -50,7 +52,7 @@ def test_code_i18n_keys_exist_in_yaml() -> None:
     yaml_keys = _status_keys("en")
     missing = used - yaml_keys
     assert not missing, (
-        "i18n keys used in visualize.py but missing from visualize.yaml "
+        "i18n keys used in media_worker.py but missing from visualize.yaml "
         f"(zh falls back to English): {sorted(missing)}"
     )
 
@@ -63,5 +65,5 @@ def test_no_orphan_yaml_keys() -> None:
     code = _code()
     orphans = {k for k in _status_keys("en") if f'"{k}"' not in code}
     assert not orphans, (
-        f"yaml status keys never referenced in visualize.py (dead copy): {sorted(orphans)}"
+        f"yaml status keys never referenced in media_worker.py (dead copy): {sorted(orphans)}"
     )

@@ -24,19 +24,18 @@ For each book a per-book ``asyncio.Queue`` schedules pages with priority:
 - Highest priority: page the user just opened (handled inline).
 - Background: remaining unfinished pages, processed by a single worker.
 
-The engine emits all progress over a ``StreamBus`` (wrapped by ``BookStream``)
+The engine emits all progress through a duck-typed stream (wrapped by ``BookStream``)
 which the WebSocket router fans out to clients.
 """
 
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 import logging
 import time
 from typing import Any
-
-from knorvia.core.stream_bus import StreamBus
 
 from .agents.ideation_agent import IdeationAgent
 from .agents.source_explorer import SourceExplorer
@@ -74,6 +73,36 @@ from .streaming import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+class _NullStream:
+    """Throwaway emitter for callers that don't consume book events.
+
+    Duck-typed surface (stage/content/thinking/progress/result/error/emit);
+    every emission is a no-op. Replaces the legacy StreamBus() default.
+    """
+
+    @asynccontextmanager
+    async def stage(self, name: str, source: str = "", metadata: dict[str, Any] | None = None):
+        yield
+
+    async def content(self, text: str, source: str = "", stage: str = "", **_: Any) -> None:
+        return
+
+    async def thinking(self, text: str, source: str = "", stage: str = "", **_: Any) -> None:
+        return
+
+    async def progress(self, message: str = "", source: str = "", stage: str = "", **_: Any) -> None:
+        return
+
+    async def result(self, data: dict[str, Any], source: str = "", **_: Any) -> None:
+        return
+
+    async def error(self, message: str, source: str = "", stage: str = "", **_: Any) -> None:
+        return
+
+    async def emit(self, event: Any) -> None:
+        return
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -208,10 +237,10 @@ class BookEngine:
         question_categories: list[int] | None = None,
         question_entries: list[int] | None = None,
         language: str = "en",
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> tuple[Book, BookProposal]:
         """Capture inputs, run IdeationAgent, persist DRAFT book + proposal."""
-        bus = stream or StreamBus()
+        bus = stream or _NullStream()
         bstream = BookStream(bus)
 
         async with bstream.stage(STAGE_IDEATION):
@@ -283,7 +312,7 @@ class BookEngine:
         *,
         book_id: str,
         edited_proposal: BookProposal | None = None,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> tuple[Book, Spine]:
         """User confirms (and optionally edits) the proposal → run SpineAgent."""
         book = self.storage.load_book(book_id)
@@ -295,7 +324,7 @@ class BookEngine:
             book.title = edited_proposal.title or book.title
             book.description = edited_proposal.description or book.description
 
-        bus = stream or StreamBus()
+        bus = stream or _NullStream()
         bstream = BookStream(bus)
 
         proposal = book.proposal or BookProposal(title=book.title)
@@ -400,7 +429,7 @@ class BookEngine:
         spine: Spine,
         book: Book,
         *,
-        stream: StreamBus | None,
+        stream: Any | None,
     ) -> Spine:
         """Insert an Overview chapter at position 0 (idempotent)."""
         # Idempotent guard — already injected?
@@ -456,7 +485,7 @@ class BookEngine:
         pages: list[Page],
         book: Book,
         *,
-        stream: StreamBus | None,
+        stream: Any | None,
     ) -> None:
         """Build the Overview page's blocks deterministically."""
         if not spine.chapters:
@@ -584,7 +613,7 @@ class BookEngine:
         *,
         book_id: str,
         edited_spine: Spine | None = None,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
         auto_compile: bool = True,
     ) -> list[Page]:
         """User confirms (or edits) the spine → create pending page shells.
@@ -665,7 +694,7 @@ class BookEngine:
         self,
         *,
         book_id: str,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
         auto_compile: bool = True,
     ) -> list[Page]:
         """Regenerate all pages while preserving the confirmed proposal/spine."""
@@ -718,7 +747,7 @@ class BookEngine:
         *,
         book_id: str,
         page_id: str,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
         force: bool = False,
     ) -> Page:
         """Drive the compiler for one page (used when a user opens it)."""
@@ -752,7 +781,7 @@ class BookEngine:
         if chapter is None:
             raise ValueError(f"Page {page_id} references unknown chapter {page.chapter_id}")
 
-        bus = stream or StreamBus()
+        bus = stream or _NullStream()
         bstream = BookStream(bus)
 
         try:
@@ -792,7 +821,7 @@ class BookEngine:
         book_id: str,
         pages: list[Page],
         *,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> None:
         runtime = await self._get_or_create_runtime(book_id, stream)
         async with runtime.lock:
@@ -805,7 +834,7 @@ class BookEngine:
                 await runtime.queue.put(page.id)
             self._ensure_worker(book_id)
 
-    async def _get_or_create_runtime(self, book_id: str, stream: StreamBus | None) -> _BookRuntime:
+    async def _get_or_create_runtime(self, book_id: str, stream: Any | None) -> _BookRuntime:
         async with self._global_lock:
             runtime = self._runtimes.get(book_id)
             if runtime is None:
@@ -814,7 +843,7 @@ class BookEngine:
             if stream is not None and runtime.stream is None:
                 runtime.stream = BookStream(stream)
             elif runtime.stream is None:
-                runtime.stream = BookStream(StreamBus())
+                runtime.stream = BookStream(_NullStream())
             return runtime
 
     def _mark_page_error(self, page: Page | None, exc: Exception, *, prefix: str) -> None:
@@ -851,7 +880,7 @@ class BookEngine:
         runtime = self._runtimes.get(book_id)
         if runtime is None:
             return
-        bstream = runtime.stream or BookStream(StreamBus())
+        bstream = runtime.stream or BookStream(_NullStream())
         while True:
             try:
                 # Wrap the get() in a task so a timeout cancel is explicitly
@@ -954,7 +983,7 @@ class BookEngine:
         page_id: str,
         block_id: str,
         params_override: dict[str, Any] | None = None,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> Block | None:
         """Re-run a single block generator (e.g. user clicked 'regenerate')."""
         book = self.storage.load_book(book_id)
@@ -971,7 +1000,7 @@ class BookEngine:
         if params_override:
             block.params = {**block.params, **params_override}
 
-        bus = stream or StreamBus()
+        bus = stream or _NullStream()
         bstream = BookStream(bus)
 
         from .blocks.base import BlockContext, get_block_registry
@@ -1052,7 +1081,7 @@ class BookEngine:
         block_type: BlockType,
         params: dict[str, Any] | None = None,
         position: int | None = None,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
         compile_now: bool = True,
     ) -> Block | None:
         """Insert a fresh PENDING block at *position* (default: end)."""
@@ -1094,7 +1123,7 @@ class BookEngine:
                     if self.storage.load_book(book_id)
                     else [],
                 )
-                bus = stream or StreamBus()
+                bus = stream or _NullStream()
                 bstream = BookStream(bus)
                 async with bstream.stage(STAGE_COMPILATION):
                     await generator.generate(ctx)
@@ -1158,7 +1187,7 @@ class BookEngine:
         block_id: str,
         new_type: BlockType,
         params_override: dict[str, Any] | None = None,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> Block | None:
         spine = self.storage.load_spine(book_id)
         page = self.storage.load_page(book_id, page_id)
@@ -1192,7 +1221,7 @@ class BookEngine:
         topic: str,
         block_id: str | None = None,
         content_type: ContentType = ContentType.CONCEPT,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> Page | None:
         """Spawn a child Page that deepens *topic* and link it from the parent."""
         book = self.storage.load_book(book_id)
@@ -1308,7 +1337,7 @@ class BookEngine:
         book_id: str,
         page_id: str,
         topic: str,
-        stream: StreamBus | None = None,
+        stream: Any | None = None,
     ) -> Block | None:
         """Append an extra TEXT + QUIZ block when the user struggles."""
         await self.insert_block(

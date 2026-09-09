@@ -58,7 +58,6 @@ from knorvia.core.agentic.labels import find_inline_labels
 from knorvia.core.agentic.tool_dispatch import MAX_PARALLEL_TOOL_CALLS
 from knorvia.core.agentic.usage import record_streamed_usage
 from knorvia.core.context import Attachment, UnifiedContext
-from knorvia.core.stream_bus import StreamBus
 from knorvia.core.trace import (
     build_trace_metadata,
     derive_trace_metadata,
@@ -448,7 +447,7 @@ class QuestionPipeline:
         attachments: list[Attachment] | None = None,
         quiz_history: list[QuizHistoryEntry] | None = None,
         templates_override: list[QuizTemplate] | None = None,
-        stream: StreamBus,
+        stream: Any,
     ) -> dict[str, Any]:
         """Drive the pipeline. ``templates_override`` is the mimic-mode hook:
         when caller supplies pre-built templates (e.g., extracted from an
@@ -506,7 +505,7 @@ class QuestionPipeline:
         image_attachments: list[Attachment],
         quiz_history: list[QuizHistoryEntry],
         templates_override: list[QuizTemplate] | None,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> dict[str, Any]:
         is_mimic = templates_override is not None
@@ -617,7 +616,7 @@ class QuestionPipeline:
         attachments: list[Attachment],
         image_attachments: list[Attachment],
         quiz_history: list[QuizHistoryEntry],
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> tuple[str, str]:
         """Drive Phase 1 and return a ``(finish_text, exploration_trace)`` pair.
@@ -697,7 +696,7 @@ class QuestionPipeline:
         difficulty: str,
         allowed_types: list[str],
         per_type_counts: dict[str, int],
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> QuizPlan:
         system_prompt = self._t("plan.system", num_questions=num_questions)
@@ -828,7 +827,7 @@ class QuestionPipeline:
         previous_pairs: list[QuizPair],
         image_attachments: list[Attachment],
         context: UnifiedContext,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> QuizPair:
         system_prompt = self._t(
@@ -916,7 +915,7 @@ class QuestionPipeline:
         template: QuizTemplate,
         payload: dict[str, Any],
         issues: list[str],
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> dict[str, Any] | None:
         system_prompt = append_language_directive(
@@ -965,7 +964,7 @@ class QuestionPipeline:
         tool_name: str,
         tool_result: str,
         iteration: int,
-        stream: StreamBus,
+        stream: Any,
         client: Any,
     ) -> str | None:
         """Run one main-model LLM call that compresses ``tool_result`` into a
@@ -1200,7 +1199,7 @@ class QuestionPipeline:
     async def _emit_quiz_question(
         self,
         *,
-        stream: StreamBus,
+        stream: Any,
         qa_pair: QuizPair,
         index: int,
         total: int,
@@ -1421,7 +1420,7 @@ class QuestionPipeline:
         *,
         client: Any,
         messages: list[dict[str, Any]],
-        stream: StreamBus,
+        stream: Any,
         stage: str,
         trace_root: str,
         trace_extras: dict[str, Any],
@@ -1635,7 +1634,7 @@ class QuestionPipeline:
         messages: list[dict[str, Any]],
         tool_schemas: list[dict[str, Any]] | None,
         protocol: LabelProtocol,
-        stream: StreamBus,
+        stream: Any,
         stage: str,
         iter_meta: dict[str, Any],
         max_tokens: int = DEFAULT_MAX_TOKENS,
@@ -1831,7 +1830,7 @@ class QuestionPipeline:
     # ------------------------------------------------------------------
     # Visible failure
     # ------------------------------------------------------------------
-    async def _emit_visible_failure(self, stream: StreamBus, exc: BaseException) -> None:
+    async def _emit_visible_failure(self, stream: Any, exc: BaseException) -> None:
         call_id = new_call_id("quiz-failure")
         meta = build_trace_metadata(
             call_id=call_id,
@@ -1892,7 +1891,7 @@ class _BaseLoopHost:
         self,
         *,
         pipeline: QuestionPipeline,
-        stream: StreamBus,
+        stream: Any,
         context: UnifiedContext,
         client: Any,
     ) -> None:
@@ -2104,7 +2103,7 @@ class _QuizLoopHost(_BaseLoopHost):
         *,
         pipeline: QuestionPipeline,
         template: QuizTemplate,
-        stream: StreamBus,
+        stream: Any,
         context: UnifiedContext,
         client: Any,
     ) -> None:

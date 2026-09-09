@@ -64,51 +64,60 @@ def _answer_visible_narration(call_id: str, text: str) -> list[StreamEvent]:
     ]
 
 
-class _FakeOrchestrator:
-    """Yields a scripted event sequence instead of running the chat loop."""
+class _KernelStreamHolder:
+    """Scripted Kernel stream double (the LLM path runs on knorvia-daemon).
 
-    script: list[StreamEvent] = []
-    # Optional queue of per-turn scripts; when non-empty, each handle() call
-    # pops the next one (lets tests model a failed turn + a backup retry).
-    scripts: list[list[StreamEvent]] = []
-    seen_contexts: list[Any] = []
-    activated_selections: list[Any] = []
-    # The memory root in effect while the turn runs — proves the partner reads
-    # the owner's (admin) memory via memory_path_service_override, not its own.
-    seen_memory_roots: list[Any] = []
+    Mirrors the old ``_FakeOrchestrator`` surface: ``script`` / ``scripts``
+    per-turn queues, ``seen_contexts`` (captured via the runner's own
+    ``_build_context`` seam), ``activated_selections``, ``seen_memory_roots``
+    (captured inside the fake stream, which runs inside the runner's memory
+    scoping) plus ``kernel_calls`` (the content strings handed to the daemon).
+    """
 
     def __init__(self) -> None:
-        pass
-
-    async def handle(self, context):
-        from knorvia.services.memory.paths import memory_root
-
-        type(self).seen_contexts.append(context)
-        type(self).seen_memory_roots.append(memory_root())
-        script = type(self).scripts.pop(0) if type(self).scripts else type(self).script
-        for event in script:
-            yield event
+        self.script: list[StreamEvent] = []
+        self.scripts: list[list[StreamEvent]] = []
+        self.seen_contexts: list[Any] = []
+        self.activated_selections: list[Any] = []
+        self.seen_memory_roots: list[Any] = []
+        self.kernel_calls: list[str] = []
 
 
 @pytest.fixture
 def fake_orchestrator(monkeypatch):
-    import knorvia.runtime.orchestrator as orch_mod
     from knorvia.services.model_selection import runtime as selection_runtime
 
-    _FakeOrchestrator.script = []
-    _FakeOrchestrator.scripts = []
-    _FakeOrchestrator.seen_contexts = []
-    _FakeOrchestrator.activated_selections = []
-    _FakeOrchestrator.seen_memory_roots = []
-    monkeypatch.setattr(orch_mod, "ChatOrchestrator", _FakeOrchestrator)
+    holder = _KernelStreamHolder()
+
+    async def fake_stream(content: str, **_kwargs):
+        from knorvia.services.memory.paths import memory_root
+
+        holder.kernel_calls.append(content)
+        holder.seen_memory_roots.append(memory_root())
+        script = holder.scripts.pop(0) if holder.scripts else holder.script
+        for event in script:
+            yield event
+
+    monkeypatch.setattr(
+        "knorvia.runtime.kernel_client.stream_as_stream_events", fake_stream
+    )
+
+    original_build_context = PartnerRunner._build_context
+
+    def capturing_build_context(self, msg):
+        context = original_build_context(self, msg)
+        holder.seen_contexts.append(context)
+        return context
+
+    monkeypatch.setattr(PartnerRunner, "_build_context", capturing_build_context)
 
     def _record_activate(selection):
-        _FakeOrchestrator.activated_selections.append(selection)
+        holder.activated_selections.append(selection)
         return (None, None)
 
     monkeypatch.setattr(selection_runtime, "activate_llm_selection", _record_activate)
     monkeypatch.setattr(selection_runtime, "reset_llm_selection", lambda token: None)
-    return _FakeOrchestrator
+    return holder
 
 
 def _runner(partners_root, config: PartnerConfig | None = None) -> PartnerRunner:
@@ -326,8 +335,8 @@ class TestTurnExecution:
 
         final = await runner.process_message(_msg("hi"))
         assert "No active LLM model is configured." in final
-        # The orchestrator is never reached when LLM-selection resolution fails.
-        assert fake_orchestrator.seen_contexts == []
+        # The Kernel turn is never started when LLM-selection resolution fails.
+        assert fake_orchestrator.kernel_calls == []
 
     @pytest.mark.asyncio
     async def test_backup_retried_when_primary_selection_unresolvable(

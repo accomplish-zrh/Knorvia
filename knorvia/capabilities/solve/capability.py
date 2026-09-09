@@ -1,19 +1,16 @@
-"""Deep Solve capability — problem solving driven by the chat agent loop.
+"""Deep Solve capability — problem solving on the Knorvia Kernel.
 
-There is no bespoke pipeline anymore. The chat agent loop IS the solver: this
-capability marks the turn as solve mode and resolves a session id, then runs
-the standard agentic chat pipeline. The solve loop capability
-(:class:`knorvia.capabilities.solve.loop.SolveLoopCapability`) mounts the
-solve tools (``solve_plan`` / ``solve_finish_step`` / ``solve_replan``) plus a
-curated built-in toolset
-(``rag`` / ``code_execution`` / ``geogebra_analysis`` / …) and injects the
-solver playbook; the in-memory :class:`SolveSession` holds the plan, the
-per-step gate, and the replan budget.
+There is no bespoke pipeline. The Kernel agent loop IS the solver: this
+capability marks the turn as solve mode (metadata retained for the future
+Kernel-side solve-tool pack), resolves a session id, and streams the turn
+through ``knorvia-daemon``. The solve loop capability
+(:class:`knorvia.capabilities.solve.loop.SolveLoopCapability`) remains the
+home of the solver playbook + session state for the pack migration.
 
 Design axiom (shared with chat / mastery): the intelligence lives at the
 loop's exit — the model plans and solves — while the deterministic spine
-(commit to a plan, don't skip steps, bounded replan) is engine state read and
-written through tools.
+(commit to a plan, don't skip steps, bounded replan) is engine state owned by
+the Kernel turn, not by a Python loop.
 """
 
 from __future__ import annotations
@@ -21,12 +18,8 @@ from __future__ import annotations
 import logging
 import re
 
-from knorvia.agents.chat.agentic_pipeline import AgenticChatPipeline
-from knorvia.capabilities.solve.session import DEFAULT_MAX_REPLANS
-from knorvia.capabilities.solve.tools import SOLVE_TOOL_NAMES
 from knorvia.core.capability_protocol import BaseCapability, CapabilityManifest
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
 from knorvia.runtime.request_contracts import get_capability_request_schema
 from knorvia.services.config.capabilities_settings import get_solve_params
 
@@ -59,33 +52,31 @@ def resolve_solve_session_id(context: UnifiedContext) -> str:
 class DeepSolveCapability(BaseCapability):
     manifest = CapabilityManifest(
         name="deep_solve",
-        description="Multi-step problem solving driven by the chat agent loop.",
+        description="Multi-step problem solving on the Knorvia Kernel.",
         stages=["responding"],
-        tools_used=[*SOLVE_TOOL_NAMES, "rag", "code_execution", "geogebra_analysis", "reason"],
+        tools_used=["rag", "code_execution", "geogebra_analysis", "reason"],
         cli_aliases=["solve"],
         request_schema=get_capability_request_schema("deep_solve"),
     )
 
-    async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
+    async def run(self, context: UnifiedContext, stream: object) -> None:
+        # Lazy import: tests monkeypatch the daemon stream at its home module.
+        from knorvia.runtime.kernel_client import stream_as_stream_events
+
         context.metadata["solve_mode"] = True
         context.metadata["solve_session_id"] = resolve_solve_session_id(context)
-        # Read the solve settings and forward them so the page actually drives
-        # the loop: max_rounds → the loop's round budget, max_replans → the
-        # SolveSession gate (via metadata, read in SolveLoopCapability),
-        # temperature / max_tokens → the LLM calls.
         try:
             params = get_solve_params()
         except Exception as exc:  # pragma: no cover - defensive config read
             logger.warning("Failed to load solve params, using defaults: %s", exc)
             params = {}
-        context.metadata["solve_max_replans"] = int(params.get("max_replans", DEFAULT_MAX_REPLANS))
-        pipeline = AgenticChatPipeline(
-            language=context.language,
-            max_rounds=params.get("max_rounds"),
-            temperature=params.get("temperature"),
-            max_tokens=params.get("max_tokens"),
-        )
-        await pipeline.run(context, stream)
+        # Solve tuning params ride the turn metadata for the Kernel-side
+        # solve-tool pack; the turn itself runs on the daemon now.
+        context.metadata["solve_max_replans"] = int(params.get("max_replans", 2))
+        emit = getattr(stream, "emit", None)
+        async for event in stream_as_stream_events(str(context.user_message or "")):
+            if callable(emit):
+                await emit(event)
 
 
 __all__ = ["DeepSolveCapability", "resolve_solve_session_id"]

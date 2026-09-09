@@ -7,14 +7,24 @@ import {
   applyCellEdit,
   loadExcelWorkbook,
   spreadsheetFromWorkbook,
-  workbookToXlsxFile,
   type CellAddress,
   type ExcelJsModule,
   type SpreadsheetWorkbook,
 } from "@/lib/xlsx-workbook";
 import { useBinarySource } from "@/components/chat/preview/previewers/useBinarySource";
 import SpreadsheetGrid from "@/components/chat/preview/previewers/SpreadsheetGrid";
-import { putLibraryEntryContent } from "@/lib/creative-library-api";
+import {
+  OfficeDraftApiError,
+  applyOfficeOperations,
+  openOfficeDraftFromSource,
+  patchOfficeDraft,
+} from "@/lib/office-draft";
+import {
+  chunkOperations,
+  diffWorkbookToOperations,
+  TooManyOperationsError,
+  type OfficeOperation,
+} from "@/lib/xlsx-ops";
 
 export default function LibraryExcelEditor({
   entryId,
@@ -30,9 +40,16 @@ export default function LibraryExcelEditor({
   const live = useRef<{
     book: Awaited<ReturnType<typeof loadExcelWorkbook>>;
   } | null>(null);
+  const baseline = useRef<SpreadsheetWorkbook | null>(null);
   const [model, setModel] = useState<SpreadsheetWorkbook | null>(null);
+  // Hash of the exact bytes that were rendered, i.e. the version the user is
+  // editing against. The draft is opened with it so a concurrent save to the
+  // same entry conflicts instead of being overwritten.
+  const anchor = useRef<string>("");
   const [failed, setFailed] = useState(false);
   const [error, setError] = useState("");
+  const [notice, setNotice] = useState("");
+  const [saving, setSaving] = useState(false);
 
   useEffect(() => {
     if (src.kind === "error") {
@@ -40,6 +57,8 @@ export default function LibraryExcelEditor({
       setError(src.message);
       setModel(null);
       live.current = null;
+      baseline.current = null;
+      anchor.current = "";
       return;
     }
     if (src.kind !== "ready") return;
@@ -47,17 +66,25 @@ export default function LibraryExcelEditor({
     let cancelled = false;
     setFailed(false);
     setError("");
+    setNotice("");
     setModel(null);
     live.current = null;
+    baseline.current = null;
+    anchor.current = "";
     (async () => {
       try {
         const mod = await import("exceljs");
         const ExcelJS = ((mod as unknown as { default?: typeof mod }).default ??
           mod) as unknown as ExcelJsModule;
         if (cancelled) return;
+        const fingerprint = await contentFingerprint(src.buffer);
+        if (cancelled) return;
         const book = await loadExcelWorkbook(ExcelJS, src.buffer);
         if (cancelled) return;
         live.current = { book };
+        // Snapshot taken before any edit; the save path diffs against it.
+        baseline.current = spreadsheetFromWorkbook(book, { editable: true });
+        anchor.current = fingerprint;
         setModel(spreadsheetFromWorkbook(book, { editable: true }));
       } catch (caught) {
         if (cancelled) return;
@@ -69,15 +96,83 @@ export default function LibraryExcelEditor({
     return () => {
       cancelled = true;
       live.current = null;
+      baseline.current = null;
     };
   }, [src]);
 
   const save = useCallback(async () => {
     const current = live.current;
-    if (!current) throw new Error("Workbook is not loaded.");
-    const file = await workbookToXlsxFile(current.book, "workbook.xlsx");
-    await putLibraryEntryContent(entryId, file);
-  }, [entryId]);
+    const baselineModel = baseline.current;
+    if (!current || !baselineModel) throw new Error("Workbook is not loaded.");
+    const currentModel = spreadsheetFromWorkbook(current.book, { editable: true });
+    let operations: OfficeOperation[];
+    try {
+      operations = diffWorkbookToOperations(baselineModel, currentModel);
+    } catch (caught) {
+      if (caught instanceof TooManyOperationsError) {
+        setError(
+          t("Too many changes to save here. Download the file and edit it offline."),
+        );
+      }
+      throw caught;
+    }
+    if (!operations.length) return;
+    if (!anchor.current) {
+      setError(
+        t(
+          "This browser can't verify which version of the entry you opened, so saving is disabled here. Download the file and edit it offline.",
+        ),
+      );
+      return;
+    }
+    setSaving(true);
+    setNotice("");
+    try {
+      const draft = await openOfficeDraftFromSource(
+        `library:${entryId}`,
+        anchor.current,
+      );
+      const artifact = draft.artifacts?.[0];
+      if (!artifact) throw new Error("The office draft has no spreadsheet artifact.");
+      let baseRevision = artifact.currentRevision;
+      for (const chunk of chunkOperations(operations)) {
+        const result = await applyOfficeOperations(
+          draft.draftId,
+          artifact.artifactId,
+          baseRevision,
+          chunk,
+        );
+        baseRevision = Number(result.revision_after ?? baseRevision);
+      }
+      const merged = await patchOfficeDraft(draft.draftId, "merge");
+      const published = merged.artifacts?.find(
+        (item) => item.artifactId === artifact.artifactId,
+      );
+      // Re-anchor on what we just published: the next save diffs against it.
+      const publishedHash = published?.currentHash || "";
+      baseline.current = currentModel;
+      anchor.current = publishedHash;
+      setError("");
+      setNotice(
+        publishedHash
+          ? t("Saved changes to this library entry.")
+          : t("Saved, but reopen this entry before making more edits."),
+      );
+    } catch (caught) {
+      if (caught instanceof OfficeDraftApiError && caught.status === 409) {
+        setError(
+          t(
+            "This entry changed while you were editing. Close and reopen the editor to get the latest version.",
+          ),
+        );
+      } else {
+        setError(caught instanceof Error ? caught.message : "Couldn't save this spreadsheet.");
+      }
+      throw caught;
+    } finally {
+      setSaving(false);
+    }
+  }, [entryId, t]);
 
   useEffect(() => {
     onRegisterSave?.(save);
@@ -108,6 +203,7 @@ export default function LibraryExcelEditor({
         };
       });
       setError("");
+      setNotice("");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : "Couldn't save this spreadsheet.");
       throw caught;
@@ -140,12 +236,22 @@ export default function LibraryExcelEditor({
     <div className="flex min-h-0 flex-1 flex-col">
       <div className="flex items-center gap-2 border-b border-[var(--border)] px-3 py-1.5 text-[11px] text-[var(--muted-foreground)]">
         <span>
-          {t(
-            "Editing the spreadsheet grid. Save writes the real .xlsx and keeps other sheets.",
-          )}
+          {saving
+            ? t("Saving…")
+            : notice ||
+              t(
+                "Editing the spreadsheet grid. Save writes the real .xlsx and keeps other sheets.",
+              )}
         </span>
       </div>
       <SpreadsheetGrid workbook={model} editable error={error} onCommit={commit} />
     </div>
   );
+}
+
+/** SHA-256 of the bytes the editor is showing, used as the save-time CAS anchor. */
+async function contentFingerprint(buffer: ArrayBuffer): Promise<string> {
+  if (!globalThis.crypto?.subtle) return "";
+  const digest = await globalThis.crypto.subtle.digest("SHA-256", buffer);
+  return [...new Uint8Array(digest)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
 }

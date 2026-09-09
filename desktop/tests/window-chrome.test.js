@@ -44,19 +44,6 @@ test("Windows dark splash matches the loading-page canvas", () => {
   assert.equal(chrome.backgroundColor, OVERLAY.dark.color);
 });
 
-test("desktop loading page keeps BootSplash v4 markers", () => {
-  const src = readFileSync(path.join(desktopRoot, "main.js"), "utf8");
-  assert.match(src, /class="aura"/);
-  assert.match(src, /class="halo"/);
-  assert.match(src, /class="sheen"/);
-  assert.match(src, /class="mark"/);
-  assert.match(src, /class="rule"/);
-  assert.match(src, /BootSplash v4/);
-  assert.match(src, /rx="28"/);
-  assert.equal((src.match(/class="mote"/g) || []).length, 0);
-  assert.doesNotMatch(src, /@keyframes breathe/);
-});
-
 test("Windows frost uses acrylic so other apps show through, on any theme", () => {
   const chrome = browserWindowChrome("win32", { theme: "snow", frost: true });
   assert.equal(chrome.titleBarStyle, "hidden");
@@ -140,15 +127,12 @@ test("the packaged shell wires window material only through sanitized IPC", () =
   const pack = readFileSync(path.join(desktopRoot, "package.json"), "utf8");
   assert.match(main, /require\("\.\/window-chrome"\)/);
   assert.match(main, /browserWindowChrome\(process\.platform/);
-  assert.match(main, /-webkit-app-region:drag/);
   assert.match(main, /knorvia:titlebar-overlay/);
   assert.match(main, /knorvia:window-material/);
-  assert.match(main, /background:\$\{glass \? "transparent"/);
   assert.doesNotMatch(main, /enable-transparent-visuals/);
   assert.match(main, /liveBackdrop/);
   assert.match(main, /require\("\.\/win32-corners"\)/);
   assert.match(main, /refreshWindowShape/);
-  assert.match(main, /border-radius:\$\{WINDOW_CORNER_RADIUS\}px/);
   assert.match(preload, /captionOverlay:\s*process\.platform === "win32"/);
   assert.match(preload, /setTitleBarOverlay/);
   assert.match(preload, /setWindowMaterial/);

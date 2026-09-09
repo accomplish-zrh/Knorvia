@@ -18,11 +18,10 @@ from __future__ import annotations
 from typing import Any
 
 from knorvia.core.agentic.usage import UsageTracker
-from knorvia.core.stream_bus import StreamBus
 
 
 async def emit_capability_result(
-    stream: StreamBus,
+    stream: Any,
     payload: dict[str, Any],
     *,
     source: str,

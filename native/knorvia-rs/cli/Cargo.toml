@@ -1,0 +1,23 @@
+[package]
+name = "knorvia-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Public knorvia CLI. Does not install or overwrite a codex command."
+
+[[bin]]
+name = "knorvia"
+path = "src/main.rs"
+
+[lib]
+name = "knorvia_cli"
+path = "src/lib.rs"
+
+[dependencies]
+knorvia-platform-paths = { workspace = true }
+knorvia-protocol = { workspace = true }
+knorvia-control = { workspace = true }
+knorvia-daemon = { path = "../daemon" }
+clap = { workspace = true }
+serde_json = { workspace = true }

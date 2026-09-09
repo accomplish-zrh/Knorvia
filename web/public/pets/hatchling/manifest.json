@@ -1,0 +1,7 @@
+{
+  "schemaVersion": 1,
+  "id": "knorvia-hatchling",
+  "displayName": "Hatchling",
+  "description": "Built-in placeholder companion. Self-generated solid-color atlas conforming to the official 8x9 hatch-pet layout; no third-party material.",
+  "spritesheetPath": "spritesheet.png"
+}

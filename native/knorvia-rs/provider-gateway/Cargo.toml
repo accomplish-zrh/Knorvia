@@ -1,0 +1,14 @@
+[package]
+name = "knorvia-provider-gateway"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Model-neutral capability negotiation, request translation, and live execution. Never silently drops tools/images/structured output."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+getrandom = "0.2"
+ureq = { version = "2", default-features = false, features = ["tls"] }

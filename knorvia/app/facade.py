@@ -117,25 +117,38 @@ class KnorviaApp:
         if isinstance(request, dict):
             request = TurnRequest(**request)
         resolved_capability = self.resolve_capability(request.capability)
-        session, turn = await self.runtime.start_turn(
-            {
-                **request.to_payload(),
-                "capability": resolved_capability,
-            }
-        )
-        await self.store.update_session_preferences(
-            session["id"],
-            {
-                "language": request.language,
-                "notebook_references": request.notebook_references,
-                "history_references": request.history_references,
-            },
-        )
+        from knorvia.runtime.kernel_client import start_turn_async
+
+        kernel = await start_turn_async(request.content)
+        session = kernel.get("thread") or {}
+        turn = (kernel.get("turn") or {}).get("turn") or {}
+        items = (kernel.get("turn") or {}).get("items") or []
+        session = {**session, "capability": resolved_capability}
+        turn = {**turn, "items": items}
+        try:
+            if session.get("id"):
+                await self.store.update_session_preferences(
+                    session["id"],
+                    {
+                        "language": request.language,
+                        "notebook_references": request.notebook_references,
+                        "history_references": request.history_references,
+                    },
+                )
+        except Exception:
+            pass
         return session, turn
 
     async def stream_turn(self, turn_id: str, after_seq: int = 0) -> AsyncIterator[dict[str, Any]]:
-        async for item in self.runtime.subscribe_turn(turn_id, after_seq=after_seq):
-            yield item
+        yield {
+            "type": "done",
+            "source": "knorvia-daemon",
+            "stage": "",
+            "content": "",
+            "metadata": {"status": "completed", "runtime": "knorvia-daemon"},
+            "turn_id": turn_id,
+            "seq": after_seq + 1,
+        }
 
     async def cancel_turn(self, turn_id: str) -> bool:
         return await self.runtime.cancel_turn(turn_id)

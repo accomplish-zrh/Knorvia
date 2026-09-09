@@ -1,0 +1,12 @@
+short_description: "Open an Office source or create a new artifact in an isolated draft; lifecycle, undo/redo, and ready-for-review."
+when_to_use: "Entry point for office work on attachments, library entries, workspace files, or a fresh xlsx/docx/pptx. Use before office_read/office_apply; the strict edit pair is loaded via load_tools."
+input_format: |
+  {"action": "open", "source": "attachment:att_123"}
+  {"action": "open", "source": "library:lib_entry_abc"}
+  {"action": "open", "source": "workspace:report.xlsx"}
+  {"action": "create", "filename": "report.xlsx", "kind": "xlsx"}
+  {"action": "status", "draft_id": "abcd1234"}
+  {"action": "undo", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "redo", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "ready", "draft_id": "abcd1234"}
+guideline: "Source refs are opaque - never construct file paths. open/create return a draft_id + artifact_id used by office_read/office_apply. Only XLSX supports strict edits; docx/pptx drafts are view/export only. Call ready when done so the user can review the diff and merge; the user merges, never you."

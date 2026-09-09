@@ -10,7 +10,7 @@ import pytest
 from knorvia.agents.chat.agentic_pipeline import AgenticChatPipeline
 from knorvia.core.agentic.tool_dispatch import DispatchOutcome
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 from knorvia.core.tool_protocol import ToolResult
 from knorvia.tools.office_document import DRAFT_ACTIONS, execute_office_document
 
@@ -109,7 +109,9 @@ def test_lifecycle_without_draft_id_fails(tmp_path: Path) -> None:
     assert "draft_id" in result.content.lower()
 
 
-def test_draft_xlsx_is_public_output(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+def test_draft_xlsx_uses_the_revision_content_endpoint(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
     from knorvia.services.path_service import PathService
 
     service = PathService(workspace_root=tmp_path)
@@ -121,8 +123,9 @@ def test_draft_xlsx_is_public_output(monkeypatch: pytest.MonkeyPatch, tmp_path: 
     draft_file = task_dir / "office_drafts" / draft_id / "report.xlsx"
     assert service.is_public_output_path(draft_file)
     url = str(result.metadata["office_draft"]["files"][0]["url"])
-    assert url.startswith("/api/outputs/")
+    assert url.startswith("/api/v1/chat/office-drafts/")
     assert draft_id in url
+    assert url.endswith("/content?revision=0")
 
 
 def test_pipeline_injects_task_dir_and_draft_id(monkeypatch, tmp_path: Path) -> None:
@@ -167,3 +170,38 @@ async def test_pipeline_publishes_office_draft_metadata() -> None:
     await pipeline._publish_office_draft_metadata(context, outcome, bus)
     assert context.metadata["office_draft"]["draft_id"] == "abcd1234"
     assert any((event.metadata or {}).get("trace_kind") == "office_draft" for event in bus._history)
+
+
+def test_legacy_write_actions_fail_closed_on_imported_artifacts(tmp_path: Path) -> None:
+    from knorvia.services.office_artifacts.adapters import xlsx_adapter
+    from knorvia.services.office_artifacts.service import OfficeArtifactService
+
+    service = OfficeArtifactService(
+        task_dir=tmp_path,
+        workspace_dir=tmp_path / "exec",
+    )
+    import hashlib
+
+    draft_id = service.store.create_draft()
+    data = xlsx_adapter.create_generated_xlsx("Data")
+    service.store.add_artifact(
+        draft_id,
+        filename="imported.xlsx",
+        mime="",
+        kind="xlsx",
+        origin_kind="attachment",
+        origin_ref="attachment:x",
+        origin_base_hash=hashlib.sha256(data).hexdigest(),
+        data=data,
+    )
+
+    result = _run(
+        tmp_path,
+        action="write_cells",
+        file="imported.xlsx",
+        draft_id=draft_id,
+        cells={"A1": "nope"},
+    )
+
+    assert result.success is False
+    assert "office_apply" in result.content

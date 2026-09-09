@@ -124,9 +124,8 @@ async def _execute_chat_job(job: CronJob) -> tuple[str, str | None]:
     """Run one chat turn in the owner's scope and append the exchange to the
     originating session, so the result is waiting in their chat history."""
     from knorvia.core.context import UnifiedContext
-    from knorvia.core.stream import StreamEventType
     from knorvia.multi_user.paths import user_context
-    from knorvia.runtime.orchestrator import ChatOrchestrator
+    from knorvia.runtime.kernel_client import stream_legacy_events
     from knorvia.services.session import get_sqlite_session_store
 
     user, account_error = _resolve_chat_owner(job.owner.user_id)
@@ -163,12 +162,12 @@ async def _execute_chat_job(job: CronJob) -> tuple[str, str | None]:
 
         final_text = ""
         errors: list[str] = []
-        async for event in ChatOrchestrator().handle(context):
-            meta: dict[str, Any] = event.metadata or {}
-            if event.type == StreamEventType.RESULT and event.source == "chat":
-                final_text = str(meta.get("response") or "")
-            elif event.type == StreamEventType.ERROR and event.content:
-                errors.append(event.content)
+        async for event in stream_legacy_events(prompt):
+            meta: dict[str, Any] = event.get("metadata") or {}
+            if event.get("type") == "content" and event.get("content"):
+                final_text = str(event.get("content") or "")
+            elif event.get("type") == "error" and event.get("content"):
+                errors.append(str(event.get("content")))
 
         if not final_text.strip():
             return "error", (errors[-1] if errors else "turn produced no answer")

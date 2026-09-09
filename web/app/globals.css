@@ -22,6 +22,8 @@
      and against the terracotta primary. Inspired by Claude's chrome:
      keep bg essentially white, save the visible warmth for accents. */
   :root {
+    --font-sans: "Segoe UI", "Microsoft YaHei UI", "PingFang SC", system-ui, sans-serif;
+    --font-serif: Georgia, "Noto Serif SC", serif;
     color-scheme: light;
     --background: #fdfcf9;
     --foreground: #1c1816;
@@ -996,12 +998,12 @@ html[data-window-frost] .dt-tooltip-content {
   -webkit-backdrop-filter: blur(28px) saturate(170%);
 }
 
-html[data-desktop-chrome] input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="hidden"]),
-html[data-desktop-chrome] textarea,
-html[data-desktop-chrome] select,
-html[data-window-frost] input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="hidden"]),
-html[data-window-frost] textarea,
-html[data-window-frost] select {
+html[data-desktop-chrome]:not(:has(.nw-root)) input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="hidden"]),
+html[data-desktop-chrome]:not(:has(.nw-root)) textarea,
+html[data-desktop-chrome]:not(:has(.nw-root)) select,
+html[data-window-frost]:not(:has(.nw-root)) input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]):not([type="hidden"]),
+html[data-window-frost]:not(:has(.nw-root)) textarea,
+html[data-window-frost]:not(:has(.nw-root)) select {
   -webkit-appearance: none !important;
   appearance: none !important;
   background-clip: padding-box;
@@ -1009,10 +1011,10 @@ html[data-window-frost] select {
 
 /* Windows paints an opaque Edit rectangle for `transparent`. A zero-alpha
    RGB color is what actually punches the native fill. */
-html[data-desktop-chrome] textarea.bg-transparent,
-html[data-desktop-chrome] input.bg-transparent,
-html[data-window-frost] textarea.bg-transparent,
-html[data-window-frost] input.bg-transparent {
+html[data-desktop-chrome]:not(:has(.nw-root)) textarea.bg-transparent,
+html[data-desktop-chrome]:not(:has(.nw-root)) input.bg-transparent,
+html[data-window-frost]:not(:has(.nw-root)) textarea.bg-transparent,
+html[data-window-frost]:not(:has(.nw-root)) input.bg-transparent {
   background-color: rgb(0 0 0 / 0%) !important;
   background-image: none !important;
   box-shadow: none;

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -28,6 +29,47 @@ def _fake_persona_service() -> SimpleNamespace:
         load_for_context=lambda name: (
             f"## Active Persona\n### Persona: {name}\n\nbody" if name else ""
         )
+    )
+
+
+def _patch_kernel_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    captured: dict[str, object],
+    items: list[tuple[str, str, dict[str, Any] | None]],
+) -> None:
+    """Script the Kernel turn for the WS turn runtime.
+
+    Replaces the old ChatOrchestrator double: the production turn runtime
+    calls ``start_turn_async`` and projects the daemon result through
+    ``iter_legacy_events``. *items* are (kind, text, metadata) tuples; each
+    becomes a daemon item whose payload metadata flows into the event.
+    """
+    captured["kernel_calls"] = []
+
+    async def fake_start_turn(content: str, **_kwargs):
+        captured["kernel_calls"].append(content)
+        return {
+            "thread": {"id": "thr_test"},
+            "turn": {
+                "turn": {"id": "turn_test", "status": "completed"},
+                # No item seq: the runtime assigns its own event sequence —
+                # scripted seqs would collide with the runtime's session event.
+                "items": [
+                    {
+                        "kind": kind,
+                        "payload": {
+                            "text": text,
+                            **({"metadata": meta} if meta else {}),
+                        },
+                        "turnId": "turn_test",
+                    }
+                    for kind, text, meta in items
+                ],
+            },
+        }
+
+    monkeypatch.setattr(
+        "knorvia.runtime.kernel_client.start_turn_async", fake_start_turn
     )
 
 
@@ -85,8 +127,10 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
     original_publish = runtime._publish_live_event
 
     async def publish_with_status_capture(execution, event):
-        publish_order.append(event.type.value)
-        if event.type == StreamEventType.DONE:
+        publish_order.append(
+            event.type.value if hasattr(event.type, "value") else str(event.type)
+        )
+        if str(getattr(event.type, "value", event.type)) == "done":
             persisted_turn = await store.get_turn(execution.turn_id)
             captured["turn_status_when_done_published"] = (persisted_turn or {}).get("status")
         return await original_publish(execution, event)
@@ -121,25 +165,15 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, context):
-            captured["user_message"] = context.user_message
-            captured["metadata"] = context.metadata
-            captured["source_manifest"] = context.source_manifest
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="chat",
-                stage="responding",
-                content="Hello Frank",
-                metadata={"call_kind": "llm_final_response"},
-            )
-            yield StreamEvent(type=StreamEventType.DONE, source="chat")
-
     monkeypatch.setattr("knorvia.services.llm.config.get_llm_config", lambda: SimpleNamespace())
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+    _patch_kernel_turn(
+        monkeypatch,
+        captured,
+        items=[("agentMessage", "Hello Frank", {"call_kind": "llm_final_response"})],
+    )
     monkeypatch.setattr(
         "knorvia.book.context.build_book_context",
         lambda *_args, **_kwargs: SimpleNamespace(
@@ -188,11 +222,16 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
 
     # session_meta may arrive after `done` from the title generator —
     # filter it out so the timing race doesn't flake the assertion.
+    # The Kernel stream projects session → content → result → done (the
+    # result event carries the turn's final agentMessage text).
     assert [e["type"] for e in events if e["type"] != "session_meta"] == [
         "session",
         "content",
+        "result",
         "done",
     ]
+    # The WS turn hands the raw user message to the Kernel.
+    assert captured["kernel_calls"] == ["hello, i'm frank"]
     done_event = next(e for e in events if e["type"] == "done")
     assert done_event["metadata"]["status"] == "completed"
     assert captured["turn_status_when_done_published"] == "completed"
@@ -212,24 +251,9 @@ async def test_turn_runtime_replays_events_and_materializes_messages(
         {"book_id": "book-1", "page_ids": ["page-1"]}
     ]
     assert detail["messages"][0]["metadata"]["request_snapshot"]["masteryPathId"] == "path-1"
-    # Chat capability now routes attached sources through the manifest +
-    # ``read_source`` tool instead of inlining ``[Book Context]`` into the
-    # user message. The raw user message stays raw; the book payload
-    # surfaces in ``context.source_manifest`` and ``metadata.source_index``.
-    assert str(captured["user_message"]) == "hello, i'm frank"
-    manifest = str(captured.get("source_manifest") or "")
-    assert "[Attached Sources]" in manifest
-    # Book source id is now per-book (``bk-{book_id}``) so multi-book
-    # sessions can read_source each independently. The mocked book has id
-    # "book-1".
-    assert "bk-book-1" in manifest
-    source_index = (captured.get("metadata") or {}).get("source_index") or {}
-    assert "bk-book-1" in source_index
-    assert "A selected page." in source_index["bk-book-1"]
-    assert captured["metadata"] and captured["metadata"]["book_references"] == [
-        {"book_id": "book-1", "page_ids": ["page-1"]}
-    ]
-    assert captured["metadata"]["mastery_path_id"] == "path-1"
+    # The Kernel turn receives the raw user message; book sources ride the
+    # request snapshot (bookReferences) and the chat capability's read_source
+    # path — the plain WS turn does not inline a source manifest.
     assert detail["messages"][1]["content"] == "Hello Frank"
     assert detail["preferences"] == {
         "capability": "chat",
@@ -270,17 +294,11 @@ async def test_turn_runtime_persists_llm_selection_in_turn_snapshot(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, context):
-            captured["metadata"] = context.metadata
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="chat",
-                stage="responding",
-                content="Alt reply",
-                metadata={"call_kind": "llm_final_response"},
-            )
-            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+    _patch_kernel_turn(
+        monkeypatch,
+        captured,
+        items=[("agentMessage", "Alt reply", {"call_kind": "llm_final_response"})],
+    )
 
     def fake_activate(selection):
         captured["activated_selection"] = selection
@@ -303,7 +321,6 @@ async def test_turn_runtime_persists_llm_selection_in_turn_snapshot(
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
     monkeypatch.setattr(
         "knorvia.services.memory.get_memory_store",
         lambda: SimpleNamespace(
@@ -339,10 +356,9 @@ async def test_turn_runtime_persists_llm_selection_in_turn_snapshot(
     assert detail["messages"][0]["metadata"]["request_snapshot"]["llmSelection"] == selection
     assert captured["activated_selection"] == selection
     assert captured["builder_llm_config"].model == "anthropic/claude-sonnet-4"
-    assert captured["metadata"]["llm_selection"] == selection
-    assert captured["metadata"]["llm_model"] == "anthropic/claude-sonnet-4"
-    assert captured["metadata"]["llm_provider"] == "openrouter"
     assert captured["reset_called"] is True
+    # The Kernel turn receives the raw user message.
+    assert captured["kernel_calls"] == ["use the alt model"]
 
 
 @pytest.mark.asyncio
@@ -368,22 +384,15 @@ async def test_turn_runtime_session_persona_persists_falls_back_and_clears(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, context):
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="chat",
-                stage="responding",
-                content="ok",
-                metadata={"call_kind": "llm_final_response"},
-            )
-            yield StreamEvent(type=StreamEventType.DONE, source="chat")
-
     monkeypatch.setattr("knorvia.services.llm.config.get_llm_config", lambda: SimpleNamespace())
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+    _patch_kernel_turn(
+        monkeypatch,
+        {},
+        items=[("agentMessage", "ok", {"call_kind": "llm_final_response"})],
+    )
     monkeypatch.setattr(
         "knorvia.services.memory.get_memory_store",
         lambda: SimpleNamespace(read_l3_concat=lambda: "", emit=_noop_async),
@@ -483,24 +492,37 @@ async def test_turn_runtime_allows_model_switching_within_same_session(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, context):
-            metadata_seen.append(context.metadata)
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="chat",
-                stage="responding",
-                content=f"Reply from {context.metadata['llm_model']}",
-                metadata={"call_kind": "llm_final_response"},
-            )
-            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+    # The scripted Kernel reply reflects the model the turn ran with: the
+    # selection activation sets the current model before the kernel call.
+    current_model = {"value": "gpt-4o-mini"}
+
+    async def fake_start_turn(content: str, **_kwargs):
+        return {
+            "thread": {"id": "thr_test"},
+            "turn": {
+                "turn": {"id": "turn_test", "status": "completed"},
+                "items": [
+                    {
+                        "kind": "agentMessage",
+                        "payload": {
+                            "text": f"Reply from {current_model['value']}",
+                            "metadata": {"call_kind": "llm_final_response"},
+                        },
+                        "turnId": "turn_test",
+                    }
+                ],
+            },
+        }
 
     def fake_activate(selection):
         activated.append(dict(selection or {}))
         is_alt = (selection or {}).get("profile_id") == "p-alt"
+        current_model["value"] = (
+            "anthropic/claude-sonnet-4" if is_alt else "gpt-4o-mini"
+        )
         return (
             SimpleNamespace(
-                model="anthropic/claude-sonnet-4" if is_alt else "gpt-4o-mini",
+                model=current_model["value"],
                 provider_name="openrouter" if is_alt else "openai",
             ),
             object(),
@@ -521,7 +543,9 @@ async def test_turn_runtime_allows_model_switching_within_same_session(
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
+    monkeypatch.setattr(
+        "knorvia.runtime.kernel_client.start_turn_async", fake_start_turn
+    )
     monkeypatch.setattr(
         "knorvia.services.memory.get_memory_store",
         lambda: SimpleNamespace(
@@ -574,8 +598,12 @@ async def test_turn_runtime_allows_model_switching_within_same_session(
     assert detail is not None
     assert detail["preferences"]["llm_selection"] == second_selection
     assert activated == [first_selection, second_selection]
-    assert metadata_seen[0]["llm_model"] == "gpt-4o-mini"
-    assert metadata_seen[1]["llm_model"] == "anthropic/claude-sonnet-4"
+    # Each turn's reply reflects the model that turn ran with.
+    assistant_messages = [
+        message for message in detail["messages"] if message["role"] == "assistant"
+    ]
+    assert assistant_messages[0]["content"] == "Reply from gpt-4o-mini"
+    assert assistant_messages[1]["content"] == "Reply from anthropic/claude-sonnet-4"
     user_messages = [message for message in detail["messages"] if message["role"] == "user"]
     assert user_messages[0]["metadata"]["request_snapshot"]["llmSelection"] == first_selection
     assert user_messages[1]["metadata"]["request_snapshot"]["llmSelection"] == second_selection
@@ -652,25 +680,21 @@ async def test_turn_runtime_bootstraps_question_followup_context_once(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, context):
-            captured["conversation_history"] = context.conversation_history
-            captured["config_overrides"] = context.config_overrides
-            captured["metadata"] = context.metadata
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="chat",
-                stage="responding",
-                content="Let's discuss this question.",
-                metadata={"call_kind": "llm_final_response"},
+    _patch_kernel_turn(
+        monkeypatch,
+        captured,
+        items=[
+            (
+                "agentMessage",
+                "Let's discuss this question.",
+                {"call_kind": "llm_final_response"},
             )
-            yield StreamEvent(type=StreamEventType.DONE, source="chat")
-
+        ],
+    )
     monkeypatch.setattr("knorvia.services.llm.config.get_llm_config", lambda: SimpleNamespace())
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
     monkeypatch.setattr(
         "knorvia.services.memory.get_memory_store",
         lambda: SimpleNamespace(
@@ -723,6 +747,7 @@ async def test_turn_runtime_bootstraps_question_followup_context_once(
     assert [e["type"] for e in events if e["type"] != "session_meta"] == [
         "session",
         "content",
+        "result",
         "done",
     ]
     detail = await store.get_session_with_messages(session["id"])
@@ -731,9 +756,11 @@ async def test_turn_runtime_bootstraps_question_followup_context_once(
     assert "Question Follow-up Context" in detail["messages"][0]["content"]
     assert "Which criterion best describes density?" in detail["messages"][0]["content"]
     assert "User answer: B" in detail["messages"][0]["content"]
-    assert captured["conversation_history"][0]["role"] == "system"
-    assert "followup_question_context" not in captured["config_overrides"]
-    assert captured["metadata"]["question_followup_context"]["question_id"] == "q_2"
+    # The follow-up context rides the persisted request snapshot; the Kernel
+    # turn receives the raw user message.
+    snapshot = detail["messages"][1]["metadata"]["request_snapshot"]
+    assert "followup_question_context" not in (snapshot.get("config") or {})
+    assert captured["kernel_calls"] == ["Why is my answer wrong?"]
 
 
 @pytest.mark.asyncio
@@ -780,22 +807,21 @@ async def test_turn_runtime_persists_deep_research_session_preference(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, _context):
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="deep_research",
-                stage="reporting",
-                content="Research report ready.",
-                metadata={"call_kind": "llm_final_response"},
+    _patch_kernel_turn(
+        monkeypatch,
+        {},
+        items=[
+            (
+                "agentMessage",
+                "Research report ready.",
+                {"call_kind": "llm_final_response"},
             )
-            yield StreamEvent(type=StreamEventType.DONE, source="deep_research")
-
+        ],
+    )
     monkeypatch.setattr("knorvia.services.llm.config.get_llm_config", lambda: SimpleNamespace())
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
     monkeypatch.setattr(
         "knorvia.services.memory.get_memory_store",
         lambda: SimpleNamespace(
@@ -832,6 +858,7 @@ async def test_turn_runtime_persists_deep_research_session_preference(
     assert [e["type"] for e in events if e["type"] != "session_meta"] == [
         "session",
         "content",
+        "result",
         "done",
     ]
     detail = await store.get_session_with_messages(session["id"])
@@ -862,37 +889,31 @@ async def test_turn_runtime_injects_memory_and_refreshes_after_completion(
                 budget=0,
             )
 
-    class FakeOrchestrator:
-        async def handle(self, context):
-            captured["conversation_history"] = context.conversation_history
-            captured["memory_context"] = context.memory_context
-            captured["conversation_context_text"] = context.metadata.get(
-                "conversation_context_text"
-            )
-            yield StreamEvent(
-                type=StreamEventType.CONTENT,
-                source="chat",
-                stage="responding",
-                content="Stored reply",
-                metadata={"call_kind": "llm_final_response"},
-            )
-            yield StreamEvent(type=StreamEventType.DONE, source="chat")
+    _patch_kernel_turn(
+        monkeypatch,
+        captured,
+        items=[("agentMessage", "Stored reply", {"call_kind": "llm_final_response"})],
+    )
 
     emit_calls: list[object] = []
+    memory_reads: list[str] = []
 
     async def fake_emit(event):
         emit_calls.append(event)
         return None
 
+    def fake_read_l3_concat():
+        memory_reads.append("l3")
+        return "## Memory\n## Preferences\n- Prefer concise answers."
+
     monkeypatch.setattr("knorvia.services.llm.config.get_llm_config", lambda: SimpleNamespace())
     monkeypatch.setattr(
         "knorvia.services.session.context_builder.ContextBuilder", FakeContextBuilder
     )
-    monkeypatch.setattr("knorvia.runtime.orchestrator.ChatOrchestrator", FakeOrchestrator)
     monkeypatch.setattr(
         "knorvia.services.memory.get_memory_store",
         lambda: SimpleNamespace(
-            read_l3_concat=lambda: "## Memory\n## Preferences\n- Prefer concise answers.",
+            read_l3_concat=fake_read_l3_concat,
             emit=fake_emit,
         ),
     )
@@ -917,6 +938,7 @@ async def test_turn_runtime_injects_memory_and_refreshes_after_completion(
     async for _event in runtime.subscribe_turn(turn["id"], after_seq=0):
         pass
 
-    assert captured["memory_context"] == "## Memory\n## Preferences\n- Prefer concise answers."
-    assert captured["conversation_history"] == []
-    assert captured["conversation_context_text"] == "Recent chat summary"
+    # The turn reads the memory L3 for context; the refresh is the
+    # write_memory tool's job (Kernel/pack side), not a post-turn hook here.
+    assert memory_reads == ["l3"]
+    assert captured["kernel_calls"] == ["hello, i'm frank"]

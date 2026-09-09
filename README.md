@@ -1,132 +1,135 @@
+<p align="center"><img src="web/public/logo.png" width="88" alt="Knorvia"></p>
+
 # Knorvia
 
-Knorvia is a private AI learning and knowledge workspace. It brings chat,
-research, guided learning, writing, visualization, reusable skills, and local
-knowledge bases into one extensible application.
+**你的个人 AI 工作台。连接模型、资料与工具，把想法做成作品。**
 
-## Product identity
+[产品网站](https://knorvia.xyz) · [公开下载](https://github.com/accomplish-zrh/Knorvia/releases/latest) · [更新记录](CHANGELOG.md) · [参与贡献](CONTRIBUTING.md)
 
-- Product: **Knorvia**
-- Python package: `knorvia`
-- Command line: `knorvia`
-- Runtime home: `KNORVIA_HOME`
-- Desktop protocol: `knorvia://`
+Knorvia brings conversations, projects, personal files, image/video creation,
+Bots, memory and extensible tools into one local-first workspace.
+The current desktop uses a **Rust control plane and a private Codex-derived
+App Server**, with Electron and a Next.js workbench. Python domain services
+remain available for optional capabilities and legacy migrations.
 
-Knorvia does not publish compatibility aliases for earlier package, command,
-protocol, or environment-variable names. Existing desktop workspaces and
-browser preferences are migrated once when the new application starts.
+The source tree is the **1.1.0 development line**. Public stable downloads
+remain **v1.0.0** until a separate desktop release is published. Screens below
+show the current development workbench with local demonstration data.
 
-Knorvia is maintained as an independent codebase. It contains no automatic
-upstream source synchronizer, Git remote, or desktop update feed; releases are
-adopted only through Knorvia's own review and distribution process.
+![Knorvia personal library](product-site/assets/library-1440.webp)
 
-Knorvia versioning is independent (current release: **1.0.0**). The version
-is defined once in `knorvia/__version__.py` and is followed by the Python
-package, the desktop shell, installer artifact names and the in-app version
-badge. DeepTutor remains a code reference only and does not decide Knorvia's
-version. See [CHANGELOG.md](CHANGELOG.md).
+## What is here
 
-## Requirements
+- **Conversations and projects:** persistent tasks, tool activity, approvals,
+  goals inside conversations, archives, workspaces and a right-side preview panel.
+- **Personal library:** import, preview, edit and organize files and outputs;
+  Agent and CLI access share the same scoped operations.
+- **Creation studio:** image references, video first/last frames, tail-frame
+  extraction, shot queues, shared prompts and image/video workflow continuity.
+  Optional composition, subtitles, article-video and Remotion workflows extend
+  the studio without replacing its normal image/video flow.
+- **Bots:** roles, Soul configuration, direct conversations and group rooms,
+  with persistent session identity and separate context per room.
+- **Models and usage:** saved provider profiles, Responses / Chat Completions /
+  Anthropic Messages adapters, media-provider adapters and usage/cache reporting.
+  Availability depends on the connected model or locally installed CLI.
+- **Memory and extensions:** inspectable memory; learning, research and creation
+  methods delivered through Skills and plugins; compatibility checks and CLI access.
+- **Desktop:** themes, optional acrylic, custom backgrounds, terminal, SSH,
+  Git/worktrees, turn notifications and a pet workflow.
 
-- Python 3.11–3.13
-- Node.js 20 or newer
-- Windows, macOS, or Linux for source development
+Connections use your own provider configuration. Online models and tools receive
+the content needed for those requests and may incur provider charges. Knorvia
+does not supply a built-in model allowance or subscription wallet.
 
-## Install from source
+## Use the app
 
-```bash
-python -m venv .venv
-python -m pip install --upgrade pip
-python -m pip install -e ".[app]"
+Download a published Windows installer or portable archive from
+[Releases](https://github.com/accomplish-zrh/Knorvia/releases).
+For the portable version, extract the complete archive before opening
+`Knorvia.exe`. Add your provider in Settings, choose a workspace and start a task.
+Read that release's notes for the exact included features.
+
+## Develop the native desktop
+
+Requirements: Node.js 22 or newer, Rust with the 2024 edition, Windows C/C++
+build tools, and the pinned execution engine described in [native/README.md](native/README.md).
+This update was checked on Windows with Node 26 and Rust 1.97.
+
+Build the checked-in Knorvia runtime:
+
+```sh
+cargo build --manifest-path native/knorvia-rs/Cargo.toml --release --locked
+```
+
+Build the web workbench and install desktop dependencies:
+
+```sh
 cd web
 npm ci --legacy-peer-deps
-cd ..
-knorvia init
-knorvia start --dev
-```
-
-For a production-style local run:
-
-```bash
-knorvia start
-```
-
-The default frontend is available at `http://127.0.0.1:3782`. Runtime data is
-stored below the current workspace, or below the directory selected with
-`KNORVIA_HOME` or `knorvia start --home`.
-
-## Main areas
-
-- Chat and agent-assisted problem solving
-- Knowledge bases with pluggable retrieval engines
-- Guided learning, quizzes, books, and question notebooks
-- Co-Writer and document workflows
-- Image Studio projects with generation, multi-image editing, inpainting,
-  persistent task history, and authenticated asset export
-- Video Studio projects with validated reference uploads, storyboards, durable
-  asynchronous jobs, local output archival, and resumable progress
-- Video workbench composition: local FFmpeg stitching into watermark-free MP4s
-  with crossfades, burned subtitles, per-shot narration, and BGM ducking;
-  three-view character cards, camera controls, seed rerolls with variant
-  history, a shot timeline, 12 board templates, optional per-model cost
-  estimates, and a same-origin 3D Director Desk view for staging cameras and
-  blocking (`web/lib/director-desk/README.md`)
-- Memory, personas, partners, MCP services, and CLI apps
-- Local skills plus optional imports from ClawHub
-- Desktop and browser interfaces backed by the same Python runtime
-
-## Common commands
-
-```bash
-knorvia init
-knorvia start
-knorvia run "Explain Bayesian updating"
-knorvia skill list
-```
-
-Run `knorvia --help` for the complete command reference.
-
-## Installation profiles
-
-The default `pip install knorvia` is the lightweight agent/CLI runtime. Add
-only the product surfaces required by the deployment:
-
-```bash
-pip install "knorvia[providers]"  # additional model providers
-pip install "knorvia[rag]"        # LlamaIndex + FAISS retrieval
-pip install "knorvia[documents]"  # Office/PDF ingestion
-pip install "knorvia[media]"      # image/media primitives
-pip install "knorvia[server]"     # FastAPI/WebSocket service
-pip install "knorvia[app]"        # complete browser/desktop product
-```
-
-Provider auth (`openai-codex` OAuth login; `github-copilot` validates an existing Copilot auth session; `codebuddy` validates CodeBuddy SDK auth and starts login when needed)
-is available through `knorvia provider login <provider>`.
-
-Container deployments, including the
-[temporary local Codex OAuth bridge](CONTAINERIZATION.md#temporary-local-codex-oauth-bridge),
-are documented in the container guide.
-
-Image models reuse provider connections from Settings, while their models,
-capabilities, defaults, and multi-user grants are governed separately from chat
-models. Set `KNORVIA_IMAGE_STUDIO_ENABLED=false` before starting Knorvia to
-disable all Image Studio HTTP and WebSocket endpoints as a release rollback.
-Video models follow the same shared-connection and per-user-grant design while
-keeping video-specific operations and limits in their own catalog capability;
-set `KNORVIA_VIDEO_STUDIO_ENABLED=false` for the equivalent Video Studio
-rollback.
-
-## Development checks
-
-```bash
-python -m pytest
-python -m ruff check knorvia knorvia_cli tests
-cd web
-npm run lint
 npm run build
+cd ../desktop
+npm ci
 ```
 
-## License and attribution
+Then, from `desktop`, set the runtime paths in PowerShell:
 
-Knorvia is distributed under the Apache License 2.0. Third-party software and
-upstream attribution are documented in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+```powershell
+$project = (Resolve-Path ..).Path
+$env:KNORVIA_DAEMON_BIN = Join-Path $project 'native/knorvia-rs/target/release/knorvia-daemon.exe'
+$env:KNORVIA_KERNEL_BIN = 'PATH_TO_ENGINE/codex-rs/target/release/codex-app-server.exe'
+$env:KNORVIA_WEB_DIR = Join-Path $project 'web'
+npm start
+```
+
+Replace `PATH_TO_ENGINE` with the checkout built from the documented upstream
+commit. The desktop starts its own sidecar and does not attach to your running
+Codex application. See [desktop/README.md](desktop/README.md) for packaging,
+runtime discovery, credential storage and browser-development details.
+
+The native CLI is built from `native/knorvia-rs/cli`. Run `knorvia --help` for
+its commands. For creation tools exposed to another Agent or CLI, see
+[desktop/creative-cli.README.md](desktop/creative-cli.README.md).
+
+## Source layout
+
+| Directory | Responsibility |
+| --- | --- |
+| `native/knorvia-rs` | Knorvia protocol, durable store, control, daemon, CLI, provider gateway and execution adapter |
+| `web/app/workbench`, `web/components/native` | Current product workbench |
+| `desktop` | Electron, host tools, media workflows, extensions and scoped bridges |
+| `desktop/builtin-skills` | Bundled domain skills |
+| `product-site` | Static product website, original Three.js scenes and browser checks |
+| `knorvia`, `knorvia_cli` | Optional Python domains and legacy entry points |
+
+Do not route the native workbench back through the legacy Python chat loop.
+Learning methods extend the workbench as Skills/plugins. Existing legacy data
+is retained for migration rather than reset during development.
+
+## Validation
+
+```sh
+cargo test --manifest-path native/knorvia-rs/Cargo.toml --workspace --locked
+cd web
+npm run test:node
+npx tsc --noEmit
+npm run build
+cd ../desktop
+npm test
+```
+
+Live Kernel tests use isolated loopback model fixtures. Tests requiring native
+binaries or staged packages are environment-gated. A local fixture pass is not
+evidence of compatibility with a paid live provider or every operating system.
+Website build and Chrome checks are documented in [product-site/README.md](product-site/README.md).
+
+Build caches, installations, runtime homes, personal media, credentials and local
+acceptance screenshots are excluded from Git. The checked-in native source is
+the public source of the custom runtime; the upstream App Server is pinned rather
+than copied with its entire repository history.
+
+## License
+
+Knorvia is distributed under **Apache-2.0**. Upstream and third-party notices,
+including optional media engines and UI resources, are in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

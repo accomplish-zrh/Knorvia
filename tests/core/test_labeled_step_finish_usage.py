@@ -9,7 +9,7 @@ import pytest
 import knorvia.core.agentic.labeled_step as labeled_step_module
 from knorvia.core.agentic.labeled_step import run_labeled_step
 from knorvia.core.agentic.usage import UsageTracker
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 
 def _chunk(

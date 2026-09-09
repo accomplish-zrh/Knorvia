@@ -145,6 +145,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.warning(f"Failed to start cron service: {e}")
 
+    try:
+        from knorvia.services.classroom.jobs import get_classroom_job_store
+
+        get_classroom_job_store().recover_interrupted()
+    except Exception as e:
+        logger.warning(f"Failed to recover classroom generation jobs: {e}")
+
     # Ping PocketBase if configured — logs a warning (not an error) if unreachable
     try:
         from knorvia.services.pocketbase_client import ping_pocketbase
@@ -228,14 +235,6 @@ async def lifespan(app: FastAPI):
         logger.info("LLM provider pool closed")
     except Exception as e:
         logger.warning(f"Failed to close LLM provider pool: {e}")
-
-    try:
-        from knorvia.core.agentic.client import close_agentic_client_pool
-
-        await close_agentic_client_pool()
-        logger.info("Agentic LLM client pool closed")
-    except Exception as e:
-        logger.warning(f"Failed to close agentic LLM client pool: {e}")
 
     # Stop EventBus
     try:
@@ -337,7 +336,6 @@ from knorvia.api.routers import (
     auth,
     book,
     capabilities_settings,
-    chat,
     classroom,
     co_writer,
     creative_library,
@@ -358,14 +356,12 @@ from knorvia.api.routers import (
     question,
     question_notebook,
     quiz_judge,
-    sessions,
     settings,
     skills,
     space_cli_apps,
     space_mcp,
     subagents,
     system,
-    unified_ws,
     video_studio,
     voice,
     workspace_bundle,
@@ -396,7 +392,6 @@ app.include_router(
     dependencies=_auth,
 )
 
-app.include_router(chat.router, prefix="/api/v1", tags=["chat"], dependencies=_auth)
 app.include_router(
     office_drafts.router,
     prefix="/api/v1",
@@ -450,9 +445,6 @@ app.include_router(
     prefix="/api/v1/capabilities",
     tags=["capabilities"],
     dependencies=_auth,
-)
-app.include_router(
-    sessions.router, prefix="/api/v1/sessions", tags=["sessions"], dependencies=_auth
 )
 app.include_router(
     question_notebook.router,
@@ -534,12 +526,9 @@ app.include_router(
     dependencies=_auth,
 )
 
-# Unified WebSocket endpoint — auth is checked inside the handler (WebSockets
-# cannot use FastAPI dependencies in the standard way)
-app.include_router(unified_ws.router, prefix="/api/v1", tags=["unified-ws"])
-
-# Quiz AI-judge WebSocket — same caveat as unified_ws above; auth is checked
-# inside the handler so the WS upgrade isn't rejected by an HTTP-style dep.
+# Quiz AI-judge WebSocket — auth is checked inside the handler so the WS
+# upgrade isn't rejected by an HTTP-style dep. Agent Thread/Turn is owned by
+# knorvia-daemon, not FastAPI.
 app.include_router(quiz_judge.router, prefix="/api/v1", tags=["quiz-judge"])
 
 

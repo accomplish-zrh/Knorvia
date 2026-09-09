@@ -1,0 +1,17 @@
+# This standalone Knorvia workspace is not the upstream codex-rs workspace.
+set windows-shell := ["powershell.exe", "-NoProfile", "-Command"]
+
+test *args:
+    cargo test {{args}}
+
+fmt:
+    cargo fmt --all
+
+check *args:
+    cargo check {{args}}
+
+build *args:
+    cargo build {{args}}
+
+clippy *args:
+    cargo clippy {{args}}

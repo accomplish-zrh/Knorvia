@@ -11,7 +11,10 @@ data/
 run_code_workspace/
 knorvia/agents/question/reference_papers/
 knorvia/services/rag/eg_only_for_analysis/
-/docs/
+/docs/*
+!/docs/architecture/
+/docs/architecture/*
+!/docs/architecture/KN-ADR-002-general-agent-workbench.md
 /site/
 .claude
 .agents/
@@ -77,6 +80,7 @@ node_modules/
 .next/
 web/.next/
 web/.next-knorvia/
+web/.next-*/
 out/
 web/out/
 .vercel/
@@ -92,6 +96,11 @@ dist/
 web/dist/
 build/
 web/build/
+# App identity assets are source inputs for Electron packaging.
+!/desktop/build/
+/desktop/build/*
+!/desktop/build/icon.ico
+!/desktop/build/logo.png
 .open-next/
 **/.open-next/
 .wrangler/
@@ -103,6 +112,12 @@ web/build/
 release/
 
 # Local debug/acceptance scratch output
+/work/
+/native/**/target/
+/native/codex/
+/.tmp-video-*/
+/update-ckpt*.cjs
+/web/move-effect.cjs
 _debug_*.txt
 desktop-data/
 **/.vite/

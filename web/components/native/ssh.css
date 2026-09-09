@@ -1,0 +1,27 @@
+.nw-ssh-settings { display:grid; gap:20px; min-width:0; }
+.nw-ssh-settings h2 { display:flex; align-items:center; gap:8px; }
+.nw-ssh-hosts { display:grid; gap:8px; }
+.nw-ssh-host { display:flex; gap:12px; align-items:center; padding:14px; border:1px solid var(--nw-line); border-radius:14px; }
+.nw-ssh-host>div { flex:1; min-width:0; display:grid; gap:4px; }
+.nw-ssh-host small { color:var(--nw-muted); overflow:hidden; text-overflow:ellipsis; }
+.nw-ssh-live { display:flex; gap:10px; align-items:center; }
+.nw-ssh-live>span { flex:1; }
+.nw-ssh-dialog { max-width:520px; width:calc(100vw - 32px); max-height:85vh; overflow:auto; padding:24px; }
+.nw-ssh-dialog header { display:flex; align-items:center; justify-content:space-between; }
+.nw-ssh-dialog form { display:grid; gap:14px; }
+.nw-ssh-form { display:grid; gap:14px; }
+.nw-ssh-columns { display:grid; grid-template-columns:1fr 100px; gap:12px; }
+.nw-ssh-trust { display:grid; gap:10px; padding:16px; margin:14px 0; border:1px solid var(--nw-line); border-radius:12px; }
+.nw-ssh-trust code { overflow-wrap:anywhere; font-size:12px; }
+.nw-ssh-files { display:grid; gap:8px; padding:12px; border-top:1px solid var(--nw-line); }
+.nw-ssh-files pre { max-height:220px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+.nw-ssh-files header { display:flex; gap:8px; align-items:center; min-width:0; }
+.nw-ssh-files header strong { flex:1; font-size:12px; overflow-wrap:anywhere; }
+.nw-ssh-file-list { display:grid; max-height:240px; overflow:auto; }
+.nw-ssh-file-list>button { display:flex; align-items:center; gap:8px; padding:9px; border:0; border-radius:8px; background:transparent; color:inherit; text-align:left; cursor:pointer; }
+.nw-ssh-file-list>button:hover,.nw-ssh-file-list>button.is-active { background:var(--nw-hover); }
+.nw-ssh-file-list>button>span { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.nw-ssh-file-list small { color:var(--nw-muted); font-size:10px; }
+.nw-ssh-preview { border:1px solid var(--nw-line); border-radius:10px; padding:10px; }
+.nw-ssh-transfer { display:grid; gap:10px; padding-top:12px; }
+@media(max-width:540px) { .nw-ssh-host { flex-wrap:wrap; }.nw-ssh-host>div { min-width:65%; }.nw-ssh-columns { grid-template-columns:1fr; } }

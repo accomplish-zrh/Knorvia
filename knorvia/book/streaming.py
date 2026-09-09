@@ -2,17 +2,17 @@
 Book Engine streaming helpers
 =============================
 
-Thin wrapper around ``StreamBus`` that fixes ``source="book_engine"`` and
-defines book-specific event metadata schemas.
+Thin duck-typed wrapper that fixes ``source="book_engine"`` and defines
+book-specific event metadata schemas. The wrapped emitter may be the daemon's
+StreamBus (LegacyViewAdapter path) or the router's local bridge — the surface
+is stage/content/thinking/progress/result/error/emit.
 """
 
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from types import SimpleNamespace
 from typing import Any
-
-from knorvia.core.stream import StreamEvent, StreamEventType
-from knorvia.core.stream_bus import StreamBus
 
 SOURCE = "book_engine"
 
@@ -30,10 +30,15 @@ STAGE_BLOCK = "block"
 STAGE_INTERACTION = "interaction"
 
 
-class BookStream:
-    """High-level helpers around a ``StreamBus`` for the BookEngine."""
+def _event(**kwargs: Any) -> Any:
+    """Build a duck-typed stream event (attribute surface of StreamEvent)."""
+    return SimpleNamespace(**kwargs)
 
-    def __init__(self, bus: StreamBus) -> None:
+
+class BookStream:
+    """High-level helpers around a duck-typed stream for the BookEngine."""
+
+    def __init__(self, bus: Any) -> None:
         self.bus = bus
 
     @asynccontextmanager
@@ -85,9 +90,9 @@ class BookStream:
     ) -> None:
         await self.bus.error(message, source=SOURCE, stage=stage, metadata=metadata)
 
-    async def emit(self, event_type: StreamEventType, **kwargs: Any) -> None:
+    async def emit(self, event_type: str, **kwargs: Any) -> None:
         kwargs.setdefault("source", SOURCE)
-        await self.bus.emit(StreamEvent(type=event_type, **kwargs))
+        await self.bus.emit(_event(type=event_type, **kwargs))
 
     # ── Book-specific events ────────────────────────────────────────────
 
@@ -108,8 +113,8 @@ class BookStream:
             }
         """
         await self.bus.emit(
-            StreamEvent(
-                type=StreamEventType.PROGRESS,
+            _event(
+                type="progress",
                 source=SOURCE,
                 stage=stage,
                 content=kind,

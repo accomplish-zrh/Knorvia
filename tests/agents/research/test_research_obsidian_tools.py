@@ -31,7 +31,7 @@ from knorvia.agents.research.pipeline import (
 from knorvia.agents.research.utils.citation_manager import CitationManager
 from knorvia.core.agentic.tool_dispatch import DispatchOutcome
 from knorvia.core.context import UnifiedContext
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 OBSIDIAN_TOOLS = ("obsidian_search", "obsidian_read", "obsidian_list")
 ALL_TOOLS = frozenset(

@@ -1,0 +1,195 @@
+GOV-001 read-only inventory
+Captured: 2026-09-04T19:52:02+08:00 (local) / continued 2026-09-04T19:55+08:00
+Runner: Windows x86_64, PowerShell, user 17018
+Scratch: C:\Users\17018\AppData\Local\Temp\grok-goal-aeb1b788aa7f\implementer
+Action: IDENTIFY ONLY. No reset/clean/stash/overwrite of dirty Office/Creative Library files.
+
+================================================================================
+1. CHARTER FILE HASHES (SHA-256, certutil / Get-FileHash)
+================================================================================
+File: C:\Users\17018\Desktop\Knorvia-超级工作台-Codex内核换代-最终定案与执行总纲.md
+SHA256: 4927efbca0dbe0ac61837a942490a479eef43c89f932cfdac4377c200c2154d2
+Decision-id: KN-ADR-001  version 2.0  ACCEPTED/GO  dated 2026-09-04
+Pinned upstream: openai/codex@8e6a44b428e31f91b21edc97904fcdf4f0931ade
+
+File: C:\Users\17018\Desktop\Knorvia-超级工作台-指导GOAL.md
+SHA256: 23efd4fcfb1151dc904cd8a66682da94d226315e90928132c266f94f5e7bbb35
+Goal-id: KN-GOAL-SUPER-WORKBENCH-001  ACTIVE / 尚未动工
+
+================================================================================
+2. D:\tools\Knorvia  (product repo)
+================================================================================
+Exists: YES
+Git: yes (inside work tree)
+HEAD: 5827b20d1cde742b22597c8c7f25c76eeacf2247
+Subject: Office artifact runtime v2: merge is one critical section with proven writes
+Author: 17018 <17018@users.noreply.local>
+Date: 2026-09-04 13:01:13 +0800
+Branch: main  (tracking origin/main, ahead 9, behind 0)
+Remote origin: https://github.com/accomplish-zrh/Knorvia.git (fetch+push)
+Version: 1.1.0-dev (knorvia/__version__.py)
+
+Dirty / uncommitted (MUST NOT reset/clean/stash/overwrite without owner handoff):
+ M knorvia/services/creative_library/store.py
+ M knorvia/services/office_artifacts/ARCHITECTURE.md
+ M knorvia/services/office_artifacts/merge_coordinator.py
+ M knorvia/services/office_artifacts/migration.py
+ M knorvia/services/office_artifacts/store.py
+ M knorvia/services/office_artifacts/store_io.py
+ M tests/services/office_artifacts/test_merge_coordinator.py
+ M tests/services/office_artifacts/test_store_transactions.py
+ M tests/services/test_creative_library.py
+ M tests/tools/test_office_document_draft.py
+ M web/components/chat/home/OfficeDraftCard.tsx
+ M web/lib/office-draft.ts
+ M web/tests/office-draft-card.test.ts
+ M web/tests/office-review-selection.test.ts
+?? knorvia/services/office_artifacts/publication.py
+
+Protection rule: any later Work Package must use non-overlapping paths, a
+separate worktree, or explicit owner handoff. GOV-002+ only writes docs/
+architecture, docs/migration, and AGENTS.md freeze banner.
+
+Public CLI entry (old production):
+  pyproject.toml [project.scripts] knorvia = "knorvia_cli.main:main"
+  knorvia_cli/main.py  Typer app name=knorvia
+  Requires-python: >=3.11,<3.14
+  Current runner python: 3.13.14 (import knorvia from default interpreter: FAIL —
+  ModuleNotFoundError; product is source-tree, not installed into this python)
+
+Old production Agent Runtime (to be deleted after cutover, still live now):
+  knorvia/runtime/orchestrator.py          ChatOrchestrator
+  knorvia/core/agentic/*                   loop.py, client.py, tool_dispatch.py, ...
+  knorvia/core/stream.py, stream_bus.py    StreamEvent public protocol
+  knorvia/api/*                            FastAPI public control plane
+  knorvia/api/routers/unified_ws.py        Unified WebSocket
+  knorvia/api/routers/chat.py, sessions.py Thread/Turn-ish HTTP
+  knorvia/services/session/*               Session store
+  knorvia/runtime/providers/*              Provider control
+  knorvia/services/llm/*                   LLM adapters
+  desktop/main.js                          Electron spawns python -m knorvia.desktop.ipc_bridge
+                                           with KNORVIA_HOME=workspace (desktop-data in dev)
+  web/                                     Next.js knorvia-web 1.1.0-dev
+
+AGENTS.md: describes ChatOrchestrator as the architecture center. Charter
+requires freeze of old-runtime expansion in first phase (GOV-002).
+
+ARCHITECTURE.md: modular monolith; orchestrator/turns/registries as application
+runtime. Same freeze applies.
+
+Build / test entry:
+  python -m pytest   (pyproject [tool.pytest.ini_options] testpaths tests + knorvia/learning/tests)
+  web: npm run lint:ci ; npm run test:node ; npm run build
+  desktop: npm test  (node --test tests/*.test.js)
+  desktop dist: npm run dist (electron-builder --win nsis) output ../release
+  scripts/build_windows_desktop.ps1
+  packaging/ present
+  Docker: Dockerfile, docker-compose.yml, compose.yaml
+
+Data homes (current product, not Codex):
+  D:\tools\Knorvia\data                    exists (1918 files; settings JSON/YAML, jsonl, png, pdf)
+  D:\tools\Knorvia\data\user\settings\     agents.yaml auth.json document_parsing.json
+                                           graphrag.json integrations.json interface.json
+                                           lightrag.json llamaindex.json main.yaml
+                                           model_catalog.json pageindex.json system.json
+  D:\tools\Knorvia\desktop-data            exists (dev Electron workspace)
+  D:\tools\data                            exists (workspace sibling)
+  knorvia/runtime/home.py                  KNORVIA_HOME env; else cwd; data under <home>/data
+  C:\Users\17018\.knorvia                  ABSENT
+  C:\Users\17018\AppData\Roaming\knorvia   ABSENT
+  C:\Users\17018\AppData\Local\knorvia     ABSENT
+
+Keep-value domains present under knorvia/:
+  services/rag, services/memory, services/office_artifacts, services/office_draft.py
+  services/creative_library, services/image_studio, services/video_studio
+  services/imagegen, services/videogen, services/voice
+  services/mcp, services/skill, services/cron, services/partners
+  services/embedding, services/parsing, services/sandbox, services/search
+  services/session, learning/, knowledge/, book/, partners/, classroom/
+  tools/office_*, rag_tool, web_search, exec_tool, ...
+  capabilities/ (mastery, solve, explore_context, obsidian, subagent)
+  agents/chat, research, question, visualize, math_animator, notebook, vision_solver
+
+Release / install:
+  desktop/package.json name=knorvia-desktop appId=ai.knorvia.desktop productName=Knorvia
+  pyproject name=knorvia Apache-2.0
+  knorvia_web packaged Next build
+  release/, dist/, knorvia-dist/ sibling trees exist (large)
+
+================================================================================
+3. D:\tools\knorvia-kernel  (target kernel repo)
+================================================================================
+Exists: NO (ABSENT at GOV-001). FORK-001 must full-history git clone, not zip.
+
+Pinned baseline: 8e6a44b428e31f91b21edc97904fcdf4f0931ade
+Upstream URL: https://github.com/openai/codex.git
+Network probe at inventory time:
+  git ls-remote https://github.com/openai/codex.git HEAD
+    -> 9d253c885cb7cc48aeb749a82e31e2070e14f73e  HEAD
+  Invoke-WebRequest HEAD https://github.com/openai/codex -> 200
+  (HEAD is NEWER than pinned baseline; clone must still pin 8e6a44b..., not HEAD)
+
+================================================================================
+4. TOOLCHAIN
+================================================================================
+OS: Windows
+git: 2.54.0.windows.1   git-lfs 3.7.1
+rustc: 1.97.0 (2d8144b78 2026-07-07)  host x86_64-pc-windows-msvc
+cargo: 1.97.0 (c980f4866 2026-06-30)
+  rustc.exe: C:\Program Files\Rust stable MSVC 1.97\bin\rustc.exe
+  rustup: NOT on PATH (standalone rustc install)
+  CARGO_HOME / RUSTUP_HOME: unset (use user/system defaults; do not redirect to scratch)
+just: NOT installed
+python: 3.13.14
+node: v26.3.0   npm 12.0.2   path D:\node-v26.3.0-win-x64
+gh: NOT installed
+Disk: C: 73.03 / 300.01 GB free; D: 113.39 / 652.87 GB free
+
+================================================================================
+5. OFFICIAL CODEX ON THIS MACHINE (coexistence baseline)
+================================================================================
+`codex` command IS present:
+  D:\node-v26.3.0-win-x64\codex.ps1
+  -> node_modules/@openai/codex/bin/codex.js  (npm-installed official Codex CLI)
+
+CODEX_HOME env: unset
+KNORVIA_HOME env: unset
+USERPROFILE: C:\Users\17018
+C:\Users\17018\.codex : EXISTS (live official Codex home)
+  Typical contents: config.toml, auth.json, sessions/, sqlite/, skills/, plugins/,
+  logs_2.sqlite, thread_history_1.sqlite, goals_1.sqlite, installation_id,
+  .codex-global-state.json, process_manager/, ...
+  Last writes observed during inventory (sqlite, config.toml, models_cache.json
+  around 2026-09-04 19:50–19:52) — official Codex is actively used on this box.
+
+Hard gate: Knorvia must never create/overwrite a `codex` command, never
+default-read/write `.codex`, never reuse Codex credentials/IPC/locks/logs/
+update/telemetry identity. Coexistence tests must watch both homes.
+
+================================================================================
+6. RISKS RECORDED AT INVENTORY
+================================================================================
+- Uncommitted Office/Creative Library work in D:\tools\Knorvia; overlapping
+  edits without owner handoff violate the Goal.
+- knorvia-kernel absent; FORK-001 needs network git. Probe succeeded this
+  session (ls-remote + HTTP 200). Clone failure must be captured, not faked
+  with a zip snapshot.
+- Pinned SHA 8e6a44b... may not build on rustc 1.97 / Windows MSVC; changing
+  SHA requires ADR, not a silent bump.
+- `just` missing; Kernel docs may assume `just`. Use cargo directly if needed.
+- rustup missing; rustc/cargo present as standalone MSVC toolchain.
+- Default python 3.13 cannot import knorvia (not installed); pytest must use
+  the product venv or PYTHONPATH if later needed. Do not install over user env
+  casually.
+- Official Codex is live on this machine with a real ~/.codex; coexistence
+  tests must not mutate it.
+- AGENTS.md still documents ChatOrchestrator as the center; freeze in GOV-002
+  before later agents treat it as long-term architecture.
+
+================================================================================
+7. NEXT ATOMIC ACTION
+================================================================================
+GOV-002: copy charters into D:\tools\Knorvia\docs\architecture\ with source
+hashes; freeze old Agent Runtime expansion in AGENTS.md; create Migration
+Ledger, Legacy Inventory, ADR/risk/evidence dirs. No production traffic
+change. Then FORK-001 full-history clone to D:\tools\knorvia-kernel.

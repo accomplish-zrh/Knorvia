@@ -1,0 +1,12 @@
+[package]
+name = "knorvia-platform-paths"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+description = "Single path-resolution entry for Knorvia Home. Never reads or writes Codex paths."
+
+[dependencies]
+
+[dev-dependencies]
+serde_json = { workspace = true }

@@ -16,9 +16,17 @@ from knorvia.services.prompt.language import append_language_directive
 
 
 def outlines_prompt(
-    topic: str, minutes: int, language: str, grounding: str = ""
+    topic: str,
+    minutes: int,
+    language: str,
+    grounding: str = "",
+    style_directive: str = "",
 ) -> tuple[str, str]:
-    """Stage 1 — topic → SceneOutline list (reviewable intermediate)."""
+    """Stage 1 — topic → SceneOutline list (reviewable intermediate).
+
+    *style_directive* — a teaching-style skill pack's pedagogy text plus its
+    machine-checkable constraint summary (empty for the default behavior).
+    """
     system = append_language_directive(
         "You are a curriculum designer who turns one topic into a tight, interactive micro-lesson.",
         language,
@@ -34,19 +42,38 @@ invent conflicting content). If it is thin, cover the topic generally:
 {grounding[:6000]}
 </kb_grounding>
 """
+    style_block = ""
+    if style_directive.strip():
+        style_block = f"""
+Follow this teaching style exactly:
+
+<teaching_style>
+{style_directive}
+</teaching_style>
+"""
     user = f"""Design a micro-lesson (about {minutes} minutes) on the topic below.
-{grounding_block}
+{grounding_block}{style_block}
 Return ONLY a JSON object (no markdown fences):
 {{
   "title": "lesson title",
   "outlines": [
     {{
       "id": "s1",
-      "type": "slide" | "quiz" | "discussion",
+      "type": "slide" | "quiz" | "discussion" | "interactive",
       "title": "scene title",
       "key_points": ["3-5 key points this scene teaches"],
       "objective": "what the learner can do after this scene",
-      "minutes": 3
+      "minutes": 3,
+      // ONLY for "interactive" scenes — the structured widget spec:
+      "widget": {{
+        "widget_type": "simulation" | "diagram",
+        "concept": "what the learner manipulates and observes",
+        // simulation requires >= 2 variables the learner can drag/input:
+        "key_variables": ["variable1", "variable2"],
+        // diagram requires a type and >= 3 nodes:
+        "diagram_type": "flow" | "hierarchy",
+        "nodes": [{{"label": "step name", "parent_id": ""}}]
+      }}
     }}
   ]
 }}
@@ -54,6 +81,10 @@ Return ONLY a JSON object (no markdown fences):
 Rules (from the OpenMAIC classroom discipline):
 - 4 to 7 scenes total. Open with a slide, close with a slide that summarizes.
 - At most {2} quiz scenes and at most {1} discussion scene in the whole lesson.
+- At most 2 interactive scenes; an interactive outline MUST carry a complete
+  "widget" object (a simulation with >= 2 key_variables, or a diagram with
+  >= 3 nodes). Do not use interactive for plain explanations — use it only
+  when manipulating variables or walking a structure truly helps.
 - A quiz outline must say in "objective" what the quiz checks.
 - A discussion outline's "objective" is the seed question for the class debate.
 - Progress from foundations to application; no scene repeats another's points.
@@ -94,6 +125,10 @@ Return ONLY a JSON object:
   "title": "scene title",
   "key_points": ["3-5 rendered key points"],
   "objective": "scene objective",
+  // ONLY for interactive scenes: the self-contained widget + narration.
+  // The HTML is rendered in a sandboxed iframe — inline CSS/JS only.
+  "html": "<div>… complete widget markup …</div>",
+  "narration": ["teacher narration line 1", "teacher narration line 2"],
   "questions": [ // ONLY when the outline type is "quiz"
     {{
       "id": "q1",
@@ -122,6 +157,18 @@ Rules:
   never say "on this slide".
 - Quiz questions test exactly the outline's objective; exactly 3-4 questions.
 - The last action of a discussion scene is its discussion trigger.
+- For interactive scenes, the "html" field MUST be one self-contained widget:
+  inline CSS/JS only — no external <script src>, no network calls of any kind
+  (no fetch / XMLHttpRequest / WebSocket / dynamic import), no
+  window.top/window.parent, no localStorage, no <form action>, no
+  javascript: URIs. Keep it under 6000 characters.
+  * widget_type "simulation": every key_variables entry gets a REAL, draggable
+    slider or input bound to the redraw; changing a variable updates the
+    canvas/SVG visualization immediately.
+  * widget_type "diagram": nodes are clickable; clicking a node highlights
+    its path (parents/children) per diagram_type.
+  For interactive scenes output "narration" (2-4 teacher lines) instead of
+  speech actions.
 """
     return system, user
 

@@ -1,0 +1,201 @@
+/* Learning classroom styles (KNORVIA-NIGHT B14). Independent stylesheet for
+   the opt-in learning components: theme via shared variables, narrow-window
+   safe, keyboard focus visible, and fully static under reduced motion. */
+
+.lc-classroom {
+  --lc-surface: var(--surface, #fff);
+  --lc-surface-muted: color-mix(in srgb, var(--surface, #fff) 92%, var(--foreground, #111));
+  --lc-border: color-mix(in srgb, var(--foreground, #111) 14%, transparent);
+  --lc-accent: var(--primary, #4b5ae4);
+  --lc-radius: 12px;
+  color: var(--foreground, #111);
+  background: var(--lc-surface);
+  border: 1px solid var(--lc-border);
+  border-radius: var(--lc-radius);
+  padding: 20px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.lc-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+}
+
+.lc-heading h2 {
+  margin: 0;
+  font-size: 1.15rem;
+  line-height: 1.3;
+}
+
+.lc-topic {
+  margin: 2px 0 0;
+  font-size: 0.85rem;
+  opacity: 0.75;
+}
+
+.lc-evidence-badge {
+  margin-inline-start: auto;
+  font-size: 0.78rem;
+  padding: 3px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--lc-border);
+  white-space: nowrap;
+}
+
+.lc-evidence-badge[data-status='current'] { color: var(--lc-accent); }
+.lc-evidence-badge[data-status='superseded'] { color: #b45309; border-color: color-mix(in srgb, #b45309 45%, transparent); }
+.lc-evidence-badge[data-status='missing'] { color: #b3261e; border-color: color-mix(in srgb, #b3261e 45%, transparent); }
+
+.lc-body {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 260px;
+  gap: 18px;
+}
+
+.lc-sections {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.lc-module h3 {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0 0 2px;
+  font-size: 0.95rem;
+}
+
+.lc-lesson {
+  margin: 0 0 6px;
+  font-size: 0.82rem;
+  opacity: 0.72;
+}
+
+.lc-blocks {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.lc-block {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 7px 9px;
+  border-radius: 9px;
+  border: 1px solid transparent;
+}
+
+.lc-block:focus-visible {
+  outline: 2px solid var(--lc-accent);
+  outline-offset: 1px;
+}
+
+.lc-block[data-done] { opacity: 0.55; }
+.lc-block[data-done] .lc-text { text-decoration: line-through; }
+
+.lc-block-done { display: inline-flex; padding-top: 2px; }
+.lc-block-done input { accent-color: var(--lc-accent); }
+
+.lc-text { margin: 0; font-size: 0.92rem; line-height: 1.55; min-width: 0; }
+
+.lc-quote {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  flex-wrap: wrap;
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1.5;
+  color: inherit;
+  background: var(--lc-surface-muted);
+  border: 1px solid var(--lc-border);
+  border-radius: 8px;
+  padding: 4px 9px;
+  cursor: pointer;
+  text-align: start;
+}
+
+.lc-quote small { opacity: 0.65; }
+.lc-quote:hover { border-color: var(--lc-accent); }
+
+.lc-ref {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85rem;
+  opacity: 0.85;
+  overflow-wrap: anywhere;
+}
+
+.lc-citations {
+  border-inline-start: 1px solid var(--lc-border);
+  padding-inline-start: 14px;
+  min-width: 0;
+}
+
+.lc-citations h3 {
+  margin: 0 0 8px;
+  font-size: 0.88rem;
+}
+
+.lc-citation-empty { font-size: 0.82rem; opacity: 0.7; margin: 0; }
+
+.lc-citation-active {
+  margin: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.lc-citation-active blockquote {
+  margin: 0;
+  padding: 8px 10px;
+  border-inline-start: 3px solid var(--lc-accent);
+  background: var(--lc-surface-muted);
+  border-radius: 8px;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.lc-citation-active figcaption { font-size: 0.78rem; opacity: 0.72; }
+
+.lc-close {
+  align-self: flex-start;
+  font: inherit;
+  font-size: 0.8rem;
+  border: 1px solid var(--lc-border);
+  background: transparent;
+  color: inherit;
+  border-radius: 8px;
+  padding: 3px 10px;
+  cursor: pointer;
+}
+
+.lc-missing summary { cursor: pointer; font-size: 0.82rem; color: #b3261e; }
+.lc-missing ul { font-size: 0.8rem; overflow-wrap: anywhere; }
+
+@media (max-width: 720px) {
+  .lc-body { grid-template-columns: minmax(0, 1fr); }
+  .lc-citations { border-inline-start: 0; border-top: 1px solid var(--lc-border); padding-inline-start: 0; padding-block-start: 12px; }
+  .lc-evidence-badge { white-space: normal; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .lc-classroom, .lc-classroom * {
+    animation: none !important;
+    transition: none !important;
+    scroll-behavior: auto !important;
+  }
+}

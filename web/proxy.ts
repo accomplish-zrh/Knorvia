@@ -42,6 +42,37 @@ function redirectToLogin(
 export function proxy(req: NextRequest): NextResponse {
   const { pathname, search } = req.nextUrl;
 
+  if (pathname === "/api/knorvia/native" || pathname === "/api/knorvia/native/session") {
+    // Explicit loopback development bridge. Desktop uses its origin-checked
+    // preload transport and never depends on this HTTP endpoint.
+    const configured = process.env.KNORVIA_NATIVE_GATEWAY_URL;
+    if (!configured) return NextResponse.json({ error: "Native gateway is not configured" }, { status: 503 });
+    const localHosts = new Set(["localhost", "127.0.0.1", "[::1]"]);
+    // Next's internal URL can normalize 127.0.0.1 to localhost. Match the
+    // browser against the validated public Host rather than that alias.
+    let publicUrl: URL;
+    try { publicUrl = new URL(`${req.nextUrl.protocol}//${req.headers.get("host") ?? req.nextUrl.host}`); }
+    catch { return NextResponse.json({ error: "Invalid host" }, { status: 403 }); }
+    const sourceOrigin = req.headers.get("origin");
+    const declaredOrigin = req.headers.get("x-knorvia-native-origin");
+    if (!localHosts.has(publicUrl.hostname) || req.headers.get("sec-fetch-site") === "cross-site"
+      || (sourceOrigin && sourceOrigin !== publicUrl.origin)
+      || (declaredOrigin && declaredOrigin !== publicUrl.origin)) {
+      return NextResponse.json({ error: "Forbidden origin" }, { status: 403 });
+    }
+    let gateway: URL;
+    try { gateway = new URL(configured); } catch {
+      return NextResponse.json({ error: "Invalid native gateway URL" }, { status: 503 });
+    }
+    if (gateway.protocol !== "http:" || !localHosts.has(gateway.hostname) || gateway.username || gateway.password) {
+      return NextResponse.json({ error: "Native gateway must use loopback HTTP" }, { status: 503 });
+    }
+    const headers = new Headers(req.headers);
+    headers.set("x-knorvia-native-origin", publicUrl.origin);
+    const destination = new URL(pathname.replace("/api/knorvia", "/knorvia") + search, gateway);
+    return NextResponse.rewrite(destination, { request: { headers } });
+  }
+
   if (isCodexCallbackPath(pathname)) {
     return NextResponse.rewrite(
       new URL(CODEX_CALLBACK_API_PATH + search, API_BASE_URL),

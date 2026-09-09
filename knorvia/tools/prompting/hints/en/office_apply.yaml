@@ -1,0 +1,14 @@
+short_description: "Apply ONE atomic, strictly-typed operation batch to a draft XLSX at a known revision."
+when_to_use: "After office_read gave you current values and a base_revision. Loaded on demand via load_tools; use it for precise, verifiable edits to imported or generated workbooks."
+input_format: |
+  {"draft_id": "abcd1234", "artifact_id": "art_1", "base_revision": 3,
+   "operations": [
+     {"op": "set_cell", "sheet": "Data", "cell": "B2", "number": 42},
+     {"op": "set_cell", "sheet": "Data", "cell": "C2", "text": "Total"},
+     {"op": "set_formula", "sheet": "Data", "cell": "D2", "formula": "=SUM(B2:C2)"},
+     {"op": "clear_cells", "sheet": "Data", "cells": ["E2", "E3"]},
+     {"op": "set_range", "sheet": "Data", "range": "A10:B11", "rows": [["a", 1], ["b", 2]]},
+     {"op": "copy_style", "sheet": "Data", "source": "A1", "targets": ["A2", "A3"]},
+     {"op": "merge_cells", "sheet": "Data", "range": "A1:D1"}
+   ]}
+guideline: "One batch = one atomic transaction: all ops apply or none. base_revision must match your last read or you get a conflict (re-read, then retry). set_cell takes exactly one of text/number/boolean/value_date/value_datetime/empty; dates on imported files usually fail-closed (cached format ambiguity) - prefer text or a formula. Formulas must start with '='. Ops outside the user's selected sheet/range are rejected - stay in scope. The result includes a semantic diff and verification; report it, then call office_artifact ready for user review."

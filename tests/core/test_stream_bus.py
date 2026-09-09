@@ -8,7 +8,7 @@ import json
 import pytest
 
 from knorvia.core.stream import StreamEvent, StreamEventType
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 # ---------------------------------------------------------------------------
 # Basic emit / subscribe

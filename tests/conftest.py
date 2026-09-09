@@ -11,7 +11,7 @@ import pytest
 
 from knorvia.core.capability_protocol import BaseCapability, CapabilityManifest
 from knorvia.core.context import Attachment, UnifiedContext
-from knorvia.core.stream_bus import StreamBus
+from tests._harness.stream_bus import StreamBus
 
 # ---------------------------------------------------------------------------
 # Multi-user legacy migration guard

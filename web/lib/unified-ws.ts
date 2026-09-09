@@ -79,6 +79,15 @@ export interface StartTurnMessage {
   mastery_path_id?: string;
   persona?: string;
   llm_selection?: LLMSelection | null;
+  /** Spreadsheet selection frozen for the whole turn; agent office batches
+   *  must stay inside it. Taken from the draft-card preview on send. */
+  office_selection?: {
+    draft_id: string;
+    artifact_id: string;
+    sheet: string;
+    range: string;
+    revision: number;
+  };
   /** Edit-branching: when present (even as ``null``) the new user message
    *  attaches at this exact parent — creating a sibling rather than
    *  appending to the session tail. */

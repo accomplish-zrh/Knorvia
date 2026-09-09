@@ -167,8 +167,8 @@ export interface DirectorDeskEmbedOptions {
  * 应用四档主题（light/dark/glass/snow，见 `lib/theme.ts`）映射为导演台
  * 二值主题：dark 与以 dark 为底的 glass → 'dark'；light 与 snow → 'light'。
  */
-export function directorDeskTheme(appTheme: 'light' | 'dark' | 'glass' | 'snow'): 'light' | 'dark' {
-  return appTheme === 'dark' || appTheme === 'glass' ? 'dark' : 'light'
+export function directorDeskTheme(appTheme: 'light' | 'dark' | 'glass' | 'snow' | 'jade' | 'dusk'): 'light' | 'dark' {
+  return appTheme === 'dark' || appTheme === 'glass' || appTheme === 'dusk' ? 'dark' : 'light'
 }
 
 export interface DirectorSessionMessage {

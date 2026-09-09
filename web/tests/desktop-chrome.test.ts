@@ -21,23 +21,23 @@ function read(rel: string) {
 test("titleBarOverlayForTheme matches each canvas, not a separate caption color", () => {
   assert.deepEqual(titleBarOverlayForTheme("snow"), {
     color: "#ffffff",
-    symbolColor: "#0d0d0d",
+    symbolColor: "#242528",
   });
   assert.deepEqual(titleBarOverlayForTheme("light"), {
-    color: "#fdfcf9",
-    symbolColor: "#1c1816",
+    color: "#fcfaf6",
+    symbolColor: "#322e28",
   });
   assert.deepEqual(titleBarOverlayForTheme("dark"), {
-    color: "#1a1918",
-    symbolColor: "#e8e4de",
+    color: "#212121",
+    symbolColor: "#ececec",
   });
   assert.deepEqual(titleBarOverlayForTheme("glass"), {
-    color: "#eaf2f8",
-    symbolColor: "#10151c",
+    color: "#f8fbff",
+    symbolColor: "#25364a",
   });
   assert.deepEqual(titleBarOverlayForTheme("dark", true), {
     color: "#00000000",
-    symbolColor: "#e8e4de",
+    symbolColor: "#ececec",
   });
   assert.equal(DESKTOP_TITLEBAR_HEIGHT, 36);
   assert.equal(WINDOW_CORNER_RADIUS, 16);
@@ -55,7 +55,7 @@ test("window frost uses acrylic on any colour theme", () => {
     vibrancy: "under-window",
   });
   assert.equal(windowMaterialForTheme("glass", "win32").material, "none");
-  assert.equal(windowMaterialForTheme("dark", "win32").backgroundColor, "#1a1918");
+  assert.equal(windowMaterialForTheme("dark", "win32").backgroundColor, "#212121");
 });
 
 test("frostMix raises see-through and plate solidity independently", () => {
@@ -79,12 +79,18 @@ test("sidebar header is a desktop drag region so the rail reaches the top edge",
   assert.match(source, /data-sidebar-header="collapsed"/);
 });
 
-test("root layout mounts DesktopChrome and ThemeScript stamps data-desktop-chrome", () => {
+test("both product shells retain DesktopChrome and ThemeScript stamps data-desktop-chrome", () => {
   const layout = read("app/layout.tsx");
+  const productRoot = read("components/layout/ProductRoot.tsx");
+  const native = read("components/native/NativeWorkbenchProvider.tsx");
+  const legacy = read("components/layout/LegacyRootProviders.tsx");
   const theme = read("components/ThemeScript.tsx");
   const chrome = read("components/layout/DesktopChrome.tsx");
-  assert.match(layout, /DesktopChrome/);
-  assert.match(layout, /WallpaperLayer/);
+  assert.match(layout, /ProductRoot/);
+  assert.match(productRoot, /LegacyRootProviders/);
+  assert.match(native, /<DesktopChrome\s*\/>/);
+  assert.match(legacy, /<DesktopChrome\s*\/>/);
+  assert.match(legacy, /WallpaperLayer/);
   assert.match(theme, /data-desktop-chrome/);
   assert.match(theme, /setTitleBarOverlay/);
   assert.match(theme, /setWindowMaterial/);

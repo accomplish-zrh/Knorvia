@@ -1,0 +1,10 @@
+short_description: "Read-only inspection of a draft artifact: overview, ranges, find, semantic diff, revision history."
+when_to_use: "Before EVERY office_apply batch - you need fresh values and the base_revision. Also for checking what changed between revisions or what a file contains."
+input_format: |
+  {"action": "overview", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "range", "draft_id": "abcd1234", "artifact_id": "art_1", "sheet": "Data", "range": "A1:C10"}
+  {"action": "find", "draft_id": "abcd1234", "artifact_id": "art_1", "query": "total", "scope": "Data!A1:F200"}
+  {"action": "features", "draft_id": "abcd1234", "artifact_id": "art_1"}
+  {"action": "diff", "draft_id": "abcd1234", "artifact_id": "art_1", "from_revision": 2}
+  {"action": "history", "draft_id": "abcd1234", "artifact_id": "art_1"}
+guideline: "overview lists supported/unsupported features and allowed operations - read it first on imported files. The range read returns value + formula + cached value + style + merges. Diff defaults to comparing the latest revision against its parent. Never guess cell contents: read, then apply against the revision you read."

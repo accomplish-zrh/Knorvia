@@ -1,0 +1,70 @@
+.nw-extension-manager { display:grid; gap:18px; min-width:0; }
+.nw-extension-manager h2 { display:flex; align-items:center; gap:8px; }
+.nw-extension-empty { display:grid; justify-items:center; gap:10px; padding:30px 18px; color:var(--nw-muted); border:1px dashed var(--nw-line); border-radius:16px; text-align:center; }
+.nw-extension-entry { border:1px solid var(--nw-line); border-radius:16px; overflow:hidden; }
+.nw-extension-entry>header { display:flex; align-items:center; gap:12px; padding:16px; }
+.nw-extension-entry>header>div { display:grid; flex:1; gap:4px; min-width:0; }
+.nw-extension-entry small { color:var(--nw-muted); font-size:12px; }
+.nw-extension-entry>details>summary { display:flex; align-items:center; justify-content:space-between; list-style:none; cursor:pointer; padding:12px 16px; color:var(--nw-muted); border-top:1px solid var(--nw-line); }
+.nw-extension-entry>details[open]>summary>svg { transform:rotate(180deg); }
+.nw-extension-entry>footer { display:flex; align-items:center; gap:8px; padding:10px 16px; border-top:1px solid var(--nw-line); }
+.nw-extension-entry>footer>.nw-icon { margin-left:auto; }
+.nw-extension-components { display:grid; padding:4px 16px 12px; gap:10px; }
+.nw-extension-components>div { display:grid; grid-template-columns:minmax(0,1fr) auto; gap:5px 10px; padding:10px 0; }
+.nw-extension-components>div>span:first-child { display:grid; gap:4px; overflow-wrap:anywhere; }
+.nw-extension-components strong { font-size:13px; font-weight:500; }
+.nw-extension-components details { grid-column:1/-1; font-size:12px; color:var(--nw-muted); overflow-wrap:anywhere; }
+.nw-extension-status { color:var(--nw-muted); font-size:11px; padding:4px 8px; border:1px solid var(--nw-line); border-radius:99px; align-self:start; }
+.nw-extension-status[data-status=unsupported] { color:var(--nw-red,#b05252); }
+.nw-extension-status[data-status=loadable] { color:var(--nw-green); }
+.nw-extension-import { display:grid; gap:14px; }
+.nw-extension-import .nw-tabs button { display:flex; align-items:center; gap:7px; }
+.nw-extension-notice { display:flex; align-items:center; gap:8px; color:var(--nw-green); font-size:13px; }
+@media(max-width:540px) { .nw-extension-entry>header { flex-wrap:wrap; }.nw-extension-entry>header>div { min-width:60%; }.nw-extension-components { padding-inline:10px; } }
+
+/* The extension library uses the same page hierarchy as the rest of Workbench.
+   Discovery remains a secondary, keyboard-operable disclosure below installs. */
+.nw-root .nw-extensions-page .nw-extension-manager { gap: 24px; }
+.nw-root .nw-extensions-page .nw-page-heading { margin-bottom: 0; }
+.nw-root .nw-extensions-page .nw-extension-manager > .nw-page-heading { align-items: flex-start; }
+.nw-root .nw-extension-manager > .nw-page-heading p { font-size: 14px; margin-top: 10px; }
+.nw-root .nw-extension-empty { min-height: 240px; padding: 44px 24px; gap: 12px; align-content: center; background: var(--nw-soft); border: 1px solid var(--nw-line); }
+.nw-extension-empty strong { color: var(--nw-ink); font-size: 16px; font-weight: 550; line-height: 1.5; }
+.nw-extension-empty p { margin: 0; max-width: 46ch; font-size: 14px; line-height: 1.8; }
+.nw-root .nw-extension-discovered { margin-top: 32px; border-block: 1px solid var(--nw-line); }
+.nw-root .nw-extension-discovered > summary { display: flex; align-items: center; gap: 12px; min-height: 64px; padding: 16px 4px; list-style: none; color: var(--nw-ink); font-size: 14px; font-weight: 500; cursor: pointer; border-radius: 10px; }
+.nw-extension-discovered > summary::-webkit-details-marker { display: none; }
+.nw-extension-discovered > summary > span { flex: 1; min-width: 0; }
+.nw-extension-discovered > summary > svg { flex-shrink: 0; color: var(--nw-muted); }
+.nw-extension-discovered > summary > svg:last-child { transition: transform 180ms ease; }
+.nw-extension-discovered[open] > summary > svg:last-child { transform: rotate(90deg); }
+.nw-extension-discovered > summary:focus-visible { outline: 2px solid var(--nw-action); outline-offset: 3px; }
+.nw-extension-discovery-content { min-width: 0; padding: 8px 4px 24px; }
+.nw-root .nw-extension-discovery-content .nw-page-heading h2 { font-size: 18px; font-weight: 550; margin: 0; }
+.nw-root .nw-extension-discovery-content .nw-page-heading p { font-size: 13px; color: var(--nw-muted); line-height: 1.8; margin-top: 8px; }
+.nw-root .nw-extension-discovery-content .nw-extension-note { margin: 20px 0; padding: 16px 0; background: transparent; border: 0; box-shadow: none; }
+.nw-extension-discovery-content .nw-extension-note strong { font-size: 14px; }
+.nw-extension-discovery-content .nw-extension-note p { font-size: 13px; }
+.nw-extension-discovery-content :is(.nw-skill-row, .nw-pack) { min-width: 0; }
+.nw-extension-discovery-content .nw-skill-row > div, .nw-extension-discovery-content .nw-pack > button > span:nth-child(2) { min-width: 0; }
+.nw-extension-discovery-content :is(.nw-skill-row strong, .nw-pack strong) { font-size: 14px; overflow-wrap: anywhere; }
+.nw-extension-discovery-content :is(.nw-skill-row p, .nw-pack small) { font-size: 13px; overflow-wrap: anywhere; line-height: 1.7; }
+.nw-extension-discovery-content :is(.nw-skill-row > span, .nw-pack-version, .nw-pack-detail, .nw-pack-detail code) { font-size: 12px; }
+.nw-extension-discovery-content .nw-pack > button { border-radius: 10px; }
+.nw-extension-discovery-content .nw-pack > button > svg:last-child { flex-shrink: 0; transition: transform 180ms ease; }
+.nw-extension-discovery-content .nw-pack > button[aria-expanded="true"] > svg:last-child { transform: rotate(90deg); }
+.nw-extension-entry > details > summary:focus-visible, .nw-extension-components summary:focus-visible { outline: 2px solid var(--nw-action); outline-offset: -3px; }
+.nw-extension-components summary { min-height: 30px; padding-block: 5px; cursor: pointer; }
+.nw-extension-components details p { line-height: 1.7; margin-top: 8px; }
+@media (hover: hover) { .nw-root .nw-extension-discovered > summary:hover { background: var(--nw-hover); } }
+@media (max-width: 540px) {
+  .nw-root .nw-extension-empty { min-height: 210px; padding: 28px 18px; }
+  .nw-root .nw-extension-discovered { margin-top: 24px; }
+  .nw-extension-discovery-content .nw-skill-row { gap: 10px; flex-wrap: wrap; }
+  .nw-extension-discovery-content .nw-skill-row > div { flex-basis: calc(100% - 40px); }
+  .nw-extension-discovery-content .nw-skill-row > span { margin-left: 29px; }
+  .nw-extension-discovery-content .nw-pack > button { gap: 10px; flex-wrap: wrap; }
+  .nw-extension-discovery-content .nw-pack-version { display: none; }
+}
+@media (prefers-reduced-motion: reduce) { .nw-extension-discovered > summary > svg:last-child, .nw-extension-discovery-content .nw-pack > button > svg:last-child { transition: none; } }
+[data-reduce-motion="true"] :is(.nw-extension-discovered > summary > svg:last-child, .nw-extension-discovery-content .nw-pack > button > svg:last-child) { transition: none; }

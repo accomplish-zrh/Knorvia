@@ -17,6 +17,9 @@ type DesktopTitleBarOverlay = {
 };
 
 type DesktopWindowMaterial = {
+  reducedMotion?: boolean;
+  theme?: string;
+  frost?: boolean;
   material: "none" | "mica" | "acrylic" | "tabbed" | "auto";
   backgroundColor: string;
   vibrancy: "under-window" | null;
@@ -44,6 +47,7 @@ type DesktopWallpaperPreset = {
 
 type DesktopChrome = {
   platform: string;
+  backdropSupported?: boolean;
   captionOverlay: boolean;
   trafficLights: boolean;
   setTitleBarOverlay(overlay: DesktopTitleBarOverlay): void;
@@ -63,6 +67,10 @@ interface Window {
     wsClose(id: string): void;
     onWsEvent(id: string, callback: (event: { type: string; data?: string; error?: string }) => void): () => void;
     chrome?: DesktopChrome;
+    notifications?: {
+      setPreferences(prefs: { enabled: boolean; completed: boolean; failed: boolean; cancelled: boolean; interrupted: boolean }): void;
+      onOpenThread(callback: (threadId: string) => void): () => void;
+    };
     wallpaper?: {
       getState(): Promise<{ id: string; src: string | null; builtins?: { id: string; title: string; src: string }[] }>;
       setBuiltin(id: string): Promise<{ id: string; src: string | null }>;

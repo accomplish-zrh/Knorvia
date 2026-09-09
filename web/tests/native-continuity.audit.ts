@@ -1,0 +1,101 @@
+import { expect, test } from '@playwright/test';
+import fs from 'node:fs/promises';
+import path from 'node:path';
+import http from 'node:http';
+
+const workspace = process.env.KNORVIA_UI_FIXTURE_WORKSPACE;
+test.skip(!workspace, 'Requires isolated native fixture');
+test.use({ locale: 'zh-CN', screenshot: 'only-on-failure' });
+
+test('conversation find, resizable sidebar and per-task workspace survive navigation and refresh without replay', async ({ page, baseURL }, info) => {
+  test.setTimeout(150_000); page.setDefaultTimeout(12_000);
+  expect(workspace!.replaceAll('\\', '/')).toContain('/isolated-home/workspace');
+  expect(new URL(baseURL!).hostname).toBe('127.0.0.1');
+  const title = `连续工作验收 ${Date.now()}`, folder = `continuity-${Date.now()}`;
+  await fs.mkdir(path.join(workspace!, folder), { recursive: true });
+  await fs.writeFile(path.join(workspace!, folder, '阅读.md'), '# 持续阅读\n\n' + Array.from({ length: 80 }, (_, i) => `第 ${i + 1} 段：切换任务后还在这里。\n\n`).join(''));
+  const methods: string[] = []; page.on('websocket', socket => socket.on('framesent', event => { try { const request = JSON.parse(String(event.payload)); if (request.method) methods.push(request.method); } catch {} }));
+  const errors: string[] = []; page.on('pageerror', error => errors.push(error.message));
+  const server = http.createServer((req, res) => { res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' }); res.end(`<h1>本地预览 ${req.url}</h1>`); });
+  await new Promise<void>(resolve => server.listen(0, '127.0.0.1', resolve));
+  const address = server.address(); const url = `http://127.0.0.1:${typeof address === 'object' && address ? address.port : 0}`;
+  try {
+    await page.addInitScript(() => { if (window === window.top) localStorage.setItem('knorvia-language', 'zh'); });
+    await page.setViewportSize({ width: 1600, height: 1000 }); await page.goto('/workbench');
+    await expect(page.locator('.nw-connection')).toHaveClass(/is-connected/);
+    await page.getByRole('link', { name: '自动化', exact: true }).click(); await expect(page.getByRole('heading', { name: '自动化', exact: true })).toBeVisible();
+    await page.getByRole('link', { name: '新对话', exact: true }).click(); await expect(page).toHaveURL(/\/workbench$/); await expect(page.getByRole('textbox', { name: '任务描述', exact: true })).toBeVisible();
+    const resize = page.getByRole('separator', { name: '调整左侧栏宽度' });
+    await resize.focus(); await page.keyboard.press('End'); await expect(resize).toHaveAttribute('aria-valuenow', '400');
+    await page.reload(); await expect(page.locator('.nw-sidebar')).toHaveCSS('width', '400px');
+    await resize.dblclick(); await expect(resize).toHaveAttribute('aria-valuenow', '260');
+    const bounds = await resize.boundingBox(); await page.mouse.move(bounds!.x + 3, bounds!.y + 200); await page.mouse.down(); await page.mouse.move(bounds!.x + 63, bounds!.y + 200); await page.mouse.up();
+    await expect(resize).toHaveAttribute('aria-valuenow', '320'); await resize.dblclick();
+    await page.getByRole('button', { name: '新建项目', exact: true }).click();
+    await page.getByLabel('项目名称', { exact: true }).fill(title); await page.getByLabel('本地文件夹（可选）').first().fill(workspace!);
+    await page.getByRole('button', { name: '创建项目', exact: true }).click(); await expect(page.locator('dialog')).toHaveCount(0);
+    await page.getByRole('textbox', { name: '任务描述', exact: true }).fill(title);
+    await page.getByRole('button', { name: '发送任务', exact: true }).click();
+    const completed = page.locator('.nw-task-heading [data-status="completed"]'); await expect(completed).toBeVisible({ timeout: 25_000 });
+    const taskURL = page.url();
+    for (const [index, marker] of ['定位甲 Needle', '定位乙 needle', '定位丙'].entries()) {
+      await page.locator('.nw-task-composer textarea').first().fill(`${marker}\n` + `第 ${index} 段阅读内容。\n`.repeat(32));
+      await page.locator('.nw-task-composer').getByRole('button', { name: '发送任务', exact: true }).click();
+      await expect(page.locator('.nw-user-message')).toHaveCount(index + 2); await expect(completed).toBeVisible({ timeout: 25_000 });
+    }
+    const messageCount = await page.locator('.nw-user-message').count();
+    await page.locator('.nw-task-composer textarea').first().fill('保留主对话草稿');
+    await page.keyboard.press('Control+f'); const search = page.getByRole('search', { name: '在对话中查找' });
+    await search.getByRole('textbox').fill('NEEDLE'); await expect(search.getByRole('status')).toHaveText('1 / 2');
+    await expect(page.locator('[data-find-current]')).toContainText('定位甲'); await page.keyboard.press('Enter'); await expect(page.locator('[data-find-current]')).toContainText('定位乙');
+    await page.keyboard.press('Shift+Enter'); await expect(page.locator('[data-find-current]')).toContainText('定位甲');
+    await search.getByRole('textbox').fill('不存在的[正则]'); await expect(search.getByRole('status')).toHaveText('无匹配');
+    await page.keyboard.press('Escape'); await expect(search).toHaveCount(0);
+    await page.getByRole('button', { name: '对话目录', exact: true }).click();
+    await page.locator('.nw-outline-list').getByRole('button', { name: /定位乙/ }).click();
+    const scroller = page.locator('.nw-task-scroll'); const scrollTop = await scroller.evaluate(el => el.scrollTop); expect(scrollTop).toBeGreaterThan(300);
+    await page.getByRole('button', { name: '右侧工作面板', exact: true }).click();
+    const panel = page.getByRole('complementary', { name: '右侧工作面板', exact: true });
+    await panel.locator('.nw-panel-launch-actions').getByRole('button', { name: /^文件/ }).click();
+    await panel.getByRole('button', { name: folder, exact: true }).click(); await panel.getByRole('button', { name: '阅读.md', exact: true }).click();
+    await expect(panel.getByRole('heading', { name: '持续阅读' })).toBeVisible();
+    await panel.locator('.nw-preview-reading').evaluate(el => { el.scrollTop = 480; });
+    await expect.poll(() => panel.locator('.nw-preview-reading').evaluate(el => el.scrollTop)).toBe(480);
+    await panel.getByRole('button', { name: '打开工作区入口' }).click(); await panel.locator('.nw-panel-launch-actions').getByRole('button', { name: /^浏览器/ }).click();
+    for (const part of ['/one', '/two']) { await panel.getByRole('textbox', { name: '网页地址' }).fill(url + part); await panel.getByRole('button', { name: '打开网页', exact: true }).click(); }
+    await panel.getByRole('button', { name: '打开工作区入口' }).click(); await panel.locator('.nw-panel-launch-actions').getByRole('button', { name: /^侧边聊天/ }).click();
+    await panel.getByRole('textbox', { name: '任务描述', exact: true }).fill('连续验收侧边聊天'); await panel.getByRole('button', { name: '发送任务', exact: true }).click();
+    await expect(panel.locator('.nw-turn-end')).toBeVisible({ timeout: 25_000 });
+    const sideLink = panel.getByRole('link', { name: '打开完整对话' }); const sideHref = await sideLink.getAttribute('href');
+    await panel.getByRole('textbox', { name: '任务描述', exact: true }).fill('保留侧边草稿');
+    await panel.getByRole('tab', { name: '阅读.md', exact: true }).click();
+    const executionsBeforeRestore = methods.filter(method => ['thread/start', 'turn/start', 'terminal/open', 'goal/run'].includes(method)).length;
+    await panel.getByRole('button', { name: '加入任务', exact: true }).click();
+    await page.getByRole('link', { name: '设置', exact: true }).click();
+    await page.getByRole('link', { name: '返回应用', exact: true }).first().click();
+    await expect(page).toHaveURL(taskURL); await expect(panel).toBeVisible();
+    await expect(panel.getByRole('tab', { name: '阅读.md', exact: true })).toHaveAttribute('aria-selected', 'true');
+    await expect.poll(() => panel.locator('.nw-preview-reading').evaluate(el => el.scrollTop)).toBe(480);
+    expect(Math.abs(await scroller.evaluate(el => el.scrollTop) - scrollTop)).toBeLessThan(5);
+    await page.reload(); await expect(panel).toBeVisible(); await expect(panel.getByRole('heading', { name: '持续阅读' })).toBeVisible();
+    await expect.poll(() => panel.locator('.nw-preview-reading').evaluate(el => el.scrollTop)).toBe(480);
+    await fs.writeFile(info.outputPath('restored-state.json'), JSON.stringify(await page.evaluate(() => ({ view: Object.fromEntries(Object.entries(sessionStorage).filter(([key]) => key.startsWith('knorvia-task-view'))), side: document.querySelector('.nw-side-chat')?.textContent })), null, 2));
+    await expect(page.locator('.nw-task-content .nw-user-message')).toHaveCount(messageCount);
+    await panel.getByRole('button', { name: '查看源文' }).click(); await page.reload(); await expect(panel.getByRole('button', { name: '显示预览' })).toBeVisible();
+    await panel.getByRole('button', { name: '显示预览' }).click();
+    await panel.getByRole('tab', { name: '侧边聊天', exact: true }).click();
+    await expect(sideLink).toHaveAttribute('href', sideHref!); await expect(panel.locator('.nw-user-message')).toHaveCount(1);
+    await expect(panel.getByRole('textbox', { name: '任务描述', exact: true })).toHaveValue('保留侧边草稿');
+    await panel.getByRole('tab', { name: '浏览器', exact: true }).click(); await expect(panel.getByRole('textbox', { name: '网页地址' })).toHaveValue(url + '/two');
+    await panel.getByRole('button', { name: '后退网页' }).click(); await expect(panel.getByRole('textbox', { name: '网页地址' })).toHaveValue(url + '/one');
+    await panel.getByRole('tab', { name: '文件', exact: true }).click(); await expect(panel.getByRole('button', { name: '阅读.md', exact: true })).toBeVisible();
+    await panel.getByRole('button', { name: '关闭工作面板', exact: true }).click(); await expect(page.locator('.nw-task-composer textarea').first()).toHaveValue('保留主对话草稿');
+    expect(methods.filter(method => ['thread/start', 'turn/start', 'terminal/open', 'goal/run'].includes(method)).length).toBe(executionsBeforeRestore);
+    await expect(page.locator('.nw-task-composer')).toContainText('阅读.md');
+    await page.getByRole('button', { name: '在对话中查找', exact: true }).click(); await page.getByRole('textbox', { name: '查找对话内容' }).fill('needle');
+    await page.screenshot({ path: info.outputPath('conversation-find.png'), fullPage: true });
+    for (const width of [900, 390, 320]) { await page.setViewportSize({ width, height: 844 }); expect(await page.evaluate(() => document.body.scrollWidth <= innerWidth && document.body.scrollHeight <= innerHeight + 1)).toBe(true); }
+    await page.screenshot({ path: info.outputPath('conversation-320.png'), fullPage: true });
+    expect(errors).toEqual([]);
+  } finally { await new Promise<void>(resolve => server.close(() => resolve())); }
+});

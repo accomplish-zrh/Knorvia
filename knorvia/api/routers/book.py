@@ -23,11 +23,34 @@ from knorvia.book import (
 )
 from knorvia.book.models import ContentType
 from knorvia.book.streaming import SOURCE as BOOK_SOURCE
-from knorvia.core.stream import StreamEventType
-from knorvia.core.stream_bus import StreamBus
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+
+class _BookEventBus:
+    """Local WebSocket bridge for the book engine.
+
+    Duck-typed stand-in for the legacy stream bus: the engine emits events
+    (via BookStream), this class fans them out to the forward task. Local to
+    this router — the book worker migration replaces the whole bridge.
+    """
+
+    def __init__(self) -> None:
+        self._subscribers: list[asyncio.Queue[Any]] = []
+
+    async def emit(self, event: Any) -> None:
+        for queue in self._subscribers:
+            await queue.put(event)
+
+    def subscribe(self) -> asyncio.Queue[Any]:
+        queue: asyncio.Queue[Any] = asyncio.Queue()
+        self._subscribers.append(queue)
+        return queue
+
+    def unsubscribe(self, queue: asyncio.Queue[Any]) -> None:
+        if queue in self._subscribers:
+            self._subscribers.remove(queue)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -551,18 +574,28 @@ async def book_websocket(ws: WebSocket) -> None:
         except Exception:
             closed = True
 
-    async def stream_into_socket(bus: StreamBus) -> asyncio.Task:
+    async def stream_into_socket(bus: Any) -> asyncio.Task:
         async def _forward() -> None:
-            async for event in bus.subscribe():
-                if event.source != BOOK_SOURCE:
-                    continue
-                await send(_serialize_event(event))
-                if event.type == StreamEventType.STAGE_END and event.stage in {
-                    "ideation",
-                    "spine",
-                    "compilation",
-                }:
-                    pass  # keep streaming – multiple stages per task
+            queue = bus.subscribe()
+            try:
+                while True:
+                    event = await queue.get()
+                    if event is None:
+                        return
+                    if event.source != BOOK_SOURCE:
+                        continue
+                    await send(_serialize_event(event))
+                    if (
+                        str(getattr(event.type, "value", event.type)) == "stage_end"
+                        and event.stage in {
+                            "ideation",
+                            "spine",
+                            "compilation",
+                        }
+                    ):
+                        pass  # keep streaming – multiple stages per task
+            finally:
+                bus.unsubscribe(queue)
 
         return asyncio.create_task(_forward())
 
@@ -582,7 +615,7 @@ async def book_websocket(ws: WebSocket) -> None:
                 await send({"type": "error", "content": "Missing 'type' field"})
                 continue
 
-            bus = StreamBus()
+            bus = _BookEventBus()
             forward_task = await stream_into_socket(bus)
 
             try:
@@ -678,7 +711,7 @@ async def book_websocket(ws: WebSocket) -> None:
                 logger.error(f"book ws action {msg_type} failed: {exc}", exc_info=True)
                 await send({"type": "error", "content": str(exc)})
             finally:
-                await bus.close()
+                await bus.emit(None)
                 forward_task.cancel()
                 try:
                     await forward_task

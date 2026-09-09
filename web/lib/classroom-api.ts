@@ -27,25 +27,38 @@ export type ClassroomAction =
   | { type: "quiz_trigger" }
   | { type: "discussion"; prompt?: string };
 
+/** Structured spec of an interactive widget (fixed at outline time). */
+export interface ClassroomWidget {
+  widget_type: "simulation" | "diagram";
+  concept: string;
+  key_variables?: string[];
+  diagram_type?: "flow" | "hierarchy";
+  nodes?: { id: string; label: string; parent_id?: string }[];
+}
+
 export interface ClassroomScene {
   id: string;
   order: number;
-  type: "slide" | "quiz" | "discussion";
+  type: "slide" | "quiz" | "discussion" | "interactive";
   title: string;
   key_points: string[];
   objective?: string;
   actions: ClassroomAction[];
   questions?: ClassroomQuizQuestion[];
+  html?: string;
+  narration?: string[];
+  widget?: ClassroomWidget | null;
 }
 
 export interface ClassroomOutline {
   id: string;
-  type: "slide" | "quiz" | "discussion";
+  type: "slide" | "quiz" | "discussion" | "interactive";
   title: string;
   key_points: string[];
   objective?: string;
   minutes?: number;
   order: number;
+  widget?: ClassroomWidget | null;
 }
 
 export interface ClassroomDocument {
@@ -55,9 +68,19 @@ export interface ClassroomDocument {
   language: string;
   created_at: number;
   version: number;
+  style_id?: string;
   agent_profiles: ClassroomAgentProfile[];
   outlines: ClassroomOutline[];
   scenes: ClassroomScene[];
+}
+
+/** Teaching-style skill pack entry from GET /api/v1/classroom/styles. */
+export interface ClassroomStyle {
+  id: string;
+  title: string;
+  description: string;
+  title_en?: string;
+  description_en?: string;
 }
 
 export interface ClassroomCard {
@@ -75,11 +98,18 @@ export interface GenerationProgress {
     | "initializing"
     | "generating_outlines"
     | "generating_scenes"
+    | "outline_repaired"
+    | "scene_degraded"
     | "completed"
     | "error";
   message?: string;
   scenes_generated?: number;
   total_scenes?: number;
+  diagnostics?: string[];
+  remaining?: string[];
+  scene_id?: string;
+  scene_title?: string;
+  reason?: string;
 }
 
 export interface DiscussionState {
@@ -124,11 +154,51 @@ export async function listClassrooms(): Promise<ClassroomCard[]> {
   return data.classrooms;
 }
 
+/** Teaching-style skill packs selectable at generation time. */
+export async function fetchClassroomStyles(): Promise<ClassroomStyle[]> {
+  const data = await json<{ styles: ClassroomStyle[] }>(
+    await apiFetch(apiUrl("/api/v1/classroom/styles"), { cache: "no-store" }),
+  );
+  return data.styles;
+}
+
 export async function getClassroom(id: string): Promise<ClassroomDocument> {
   return json(
     await apiFetch(
       apiUrl(`/api/v1/classroom/${encodeURIComponent(id)}`),
       { cache: "no-store" },
+    ),
+  );
+}
+
+/** Conditional refresh: returns {unchanged:true} when revision matches. */
+export async function getClassroomIfChanged(
+  id: string,
+  revision: number,
+): Promise<ClassroomDocument | { id: string; version: number; unchanged: true }> {
+  return json(
+    await apiFetch(
+      apiUrl(
+        `/api/v1/classroom/${encodeURIComponent(id)}?revision=${revision}`,
+      ),
+      { cache: "no-store" },
+    ),
+  );
+}
+
+/** Apply one atomic edit transaction; resolves with the updated document. */
+export async function patchClassroom(
+  classroomId: string,
+  ops: Record<string, unknown>[],
+): Promise<ClassroomDocument> {
+  return json(
+    await apiFetch(
+      apiUrl(`/api/v1/classroom/${encodeURIComponent(classroomId)}`),
+      {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ops }),
+      },
     ),
   );
 }
@@ -171,41 +241,127 @@ async function* readSse(response: Response): AsyncGenerator<{ event: string; dat
   }
 }
 
-/** POST /generate and surface OpenMAIC-style progress + the done payload. */
-export async function generateClassroom(
+/** POST /generate — creates a durable job, returns its id immediately. */
+export interface ClassroomJobEvent {
+  ts: number;
+  type: "progress" | "done" | "error";
+  data: Record<string, unknown>;
+}
+
+export interface ClassroomJobSnapshot {
+  job_id: string;
+  status: "pending" | "running" | "done" | "failed";
+  topic: string;
   payload: {
-    topic: string;
-    minutes: number;
-    language: string;
-    /** Organic tie-ins: ground in a KB, seat saved personas as classmates. */
+    topic?: string;
+    minutes?: number;
+    language?: string;
     kb_name?: string;
     persona_names?: string[];
-  },
+    style_id?: string;
+  };
+  events: ClassroomJobEvent[];
+  result_classroom_id?: string;
+  error?: string;
+  created_at: number;
+  updated_at: number;
+}
+
+export async function startClassroomGeneration(payload: {
+  topic: string;
+  minutes: number;
+  language: string;
+  /** Organic tie-ins: ground in a KB, seat saved personas as classmates. */
+  kb_name?: string;
+  persona_names?: string[];
+  /** Teaching-style skill pack (""/undefined = default behavior). */
+  style_id?: string;
+}): Promise<{ job_id: string }> {
+  return json(
+    await apiFetch(apiUrl("/api/v1/classroom/generate"), {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    }),
+  );
+}
+
+export async function getClassroomJob(
+  jobId: string,
+): Promise<ClassroomJobSnapshot> {
+  return json(
+    await apiFetch(
+      apiUrl(`/api/v1/classroom/jobs/${encodeURIComponent(jobId)}`),
+      { cache: "no-store" },
+    ),
+  );
+}
+
+/**
+ * Follow one generation job to completion: snapshot first (replays every
+ * stored event — this is also the reconnect path after refresh/error),
+ * then the live SSE stream (skipping already-applied replay), retrying
+ * transient stream drops up to three times. Resolves with the done payload.
+ */
+export async function followClassroomJob(
+  jobId: string,
   onProgress: (progress: GenerationProgress) => void,
   signal?: AbortSignal,
 ): Promise<{ id: string; title: string }> {
-  const response = await fetch(apiUrl("/api/v1/classroom/generate"), {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(payload),
-    signal,
-  });
-  if (!response.ok) {
-    throw new Error(`Generation failed: ${response.status}`);
-  }
   let result: { id: string; title: string } | null = null;
-  for await (const block of readSse(response)) {
-    if (block.event === "progress") {
-      onProgress(JSON.parse(block.data) as GenerationProgress);
-    } else if (block.event === "done") {
-      result = JSON.parse(block.data) as { id: string; title: string };
-    } else if (block.event === "error") {
-      const err = JSON.parse(block.data) as { message?: string };
-      throw new Error(err.message || "Generation failed");
+  let failure = "";
+  const apply = (type: string, data: Record<string, unknown>) => {
+    if (type === "progress") {
+      onProgress(data as unknown as GenerationProgress);
+    } else if (type === "done") {
+      result = data as unknown as { id: string; title: string };
+    } else if (type === "error") {
+      failure = String((data as { message?: string }).message || "Generation failed");
     }
+  };
+
+  for (let attempt = 0; attempt < 3 && !result && !failure; attempt += 1) {
+    if (attempt > 0) {
+      await new Promise((resolve) => setTimeout(resolve, 600 * attempt));
+    }
+    // Snapshot: the authoritative event history so far (reconnect-safe).
+    const snapshot = await getClassroomJob(jobId);
+    for (const event of snapshot.events) {
+      apply(event.type, event.data);
+    }
+    if (result || failure) break;
+    if (snapshot.status === "failed") {
+      failure = snapshot.error || "Generation failed";
+      break;
+    }
+    if (snapshot.status === "done") {
+      failure = "Generation ended without a result";
+      break;
+    }
+
+    const response = await fetch(
+      apiUrl(`/api/v1/classroom/jobs/${encodeURIComponent(jobId)}/events`),
+      { signal },
+    );
+    if (!response.ok) continue; // transient — resync via snapshot next loop
+    const replayed = snapshot.events.length;
+    let consumed = 0;
+    try {
+      for await (const block of readSse(response)) {
+        consumed += 1;
+        if (consumed <= replayed) continue; // server replays from the start
+        const data = JSON.parse(block.data) as Record<string, unknown>;
+        apply(block.event, data);
+        if (block.event === "done" || block.event === "error") break;
+      }
+    } catch {
+      // Stream dropped mid-generation — the retry loop resyncs.
+      if (signal?.aborted) throw new Error("Aborted");
+    }
+    // Stream ended without a terminal event: loop around and resync.
   }
-  if (!result) throw new Error("Generation ended without a result");
-  return result;
+  if (result) return result;
+  throw new Error(failure || "Generation ended without a result");
 }
 
 /**

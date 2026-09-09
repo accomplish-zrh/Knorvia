@@ -1,4 +1,4 @@
-const { app, BrowserWindow, dialog, ipcMain, protocol, nativeTheme, shell } = require("electron");
+const { app, BrowserWindow, dialog, ipcMain, protocol, nativeTheme, safeStorage, shell } = require("electron");
 const { spawn, spawnSync } = require("child_process");
 const fs = require("fs");
 const http = require("http");
@@ -11,7 +11,6 @@ const {
   isDesktopDirectFilePath,
 } = require("./protocol-stream");
 const {
-  TITLEBAR_HEIGHT,
   WINDOW_CORNER_RADIUS,
   browserWindowChrome,
   sanitizeOverlay,
@@ -20,12 +19,57 @@ const {
   fromMainWindow,
 } = require("./window-chrome");
 const { applyWindowCornerRegion } = require("./win32-corners");
+const { nativeBackdropSupported, readAppearance, saveAppearance, validAppearance, palettes } = require("./window-appearance");
+const { startupScreen } = require("./startup-screen");
 const wallpaper = require("./wallpaper");
 const updateCheck = require("./update-check");
+const { isAgentApiPath } = require("./kernel-engine");
+const { createNativeRpcRouter, errorResponse } = require("./native-rpc-router");
+const { createNativeRuntime } = require("./native-runtime");
+const { createWorkspacePreview } = require("./workspace-preview");
+const { createPersonalLibrary } = require("./personal-library");
+const { createMediaStudio } = require("./media-studio");
+const { createTurnNotifier } = require("./turn-notifications");
+const { createExtensionManager, extensionConnectionHandlers } = require("./extension-manager");
+const { createSshSessions } = require("./ssh-session");
+const { createWorktreeSnapshots } = require("./worktree-snapshots");
+const { createCliBackendHandlers } = require("./cli-backends");
+const { createLearningPack } = require("./learning-pack");
+const { createCuratedCatalog } = require("./curated-catalog");
+const { createStudioMcp } = require("./studio-mcp");
+const { createCreativeCliService } = require("./creative-cli-service");
+const { createOpenmaicCourse } = require("./openmaic-course");
+const { createLibraryImageOps } = require("./library-image-ops");
+const { keepWindowInBackground } = require("./window-lifecycle");
+const { createCliDispatchBridge } = require("./cli-dispatch");
+const { createWorkspaceTerminal } = require("./workspace-terminal");
+const { createEncryptedConnectionStore } = require("./connection-config");
+const { createDesktopPathActions } = require("./desktop-path-actions");
+const { resolveNodeLauncher, resolveWebRenderer } = require("./web-renderer");
 
 let mainWindow;
 let engine;
+let kernelEngine;
+let nativeRuntime;
+let nativeRpc;
+let workspaceTerminals;
+let mediaStudio;
+let studioMcp;
+let extensionManager;
+let sshSessions;
+let worktreeSnapshots;
+let cliBackendHost;
+let cliDispatch;
+let learningPack;
+let curatedCatalog;
+let creativeCliService;
+let shutdownPromise;
+let removeNativeRpcNotification;
+let turnNotifier;
+let removeRuntimeEngine;
+let domainWorker;
 let frontend;
+const kernelSockets = new Set();
 let shuttingDown = false;
 let requestSequence = 0;
 let recentOutput = "";
@@ -103,13 +147,16 @@ function ensureDesktopDefaults(root) {
       theme: "snow",
       language: "zh",
       response_language: "zh",
-      sidebar_description: "Knorvia 智能学习与知识工作台",
+      sidebar_description: "Knorvia 通用 Agent 工作台",
     }, null, 2), "utf8");
   } else {
     try {
       const settings = JSON.parse(fs.readFileSync(interfaceFile, "utf8"));
-      if (settings.sidebar_description === "Knorvia 智能学习助手") {
-        settings.sidebar_description = "Knorvia 智能学习与知识工作台";
+      if (
+        settings.sidebar_description === "Knorvia 智能学习助手"
+        || settings.sidebar_description === "Knorvia 智能学习与知识工作台"
+      ) {
+        settings.sidebar_description = "Knorvia 通用 Agent 工作台";
         fs.writeFileSync(interfaceFile, JSON.stringify(settings, null, 2), "utf8");
       }
     } catch (error) {
@@ -128,11 +175,15 @@ function readInterfaceSettings() {
 }
 
 function storedUiTheme() {
+  const appearance = readAppearance(app.getPath("userData"));
+  if (appearance) return appearance.theme;
   const parsed = readInterfaceSettings();
   return parsed && typeof parsed.theme === "string" ? parsed.theme : null;
 }
 
 function storedUiFrost() {
+  const appearance = readAppearance(app.getPath("userData"));
+  if (appearance) return appearance.frost;
   const parsed = readInterfaceSettings();
   if (!parsed) return false;
   if (typeof parsed.window_frost === "boolean") return parsed.window_frost;
@@ -141,100 +192,10 @@ function storedUiFrost() {
 
 function loadingPage(glass) {
   const logo = fs.readFileSync(path.join(__dirname, "build", "logo.png")).toString("base64");
-  // Palette mirrors globals.css cream / warm dark. Choreography mirrors
-  // BootSplash v4 (web/components/common/BootSplash.tsx): mint/lavender aura,
-  // squircle hairline, one glass sheen, tracking wordmark, centre-grown rule.
-  // No breathe, motes, or dual spinners. Frost keeps the canvas transparent
-  // so DWM acrylic / macOS vibrancy show through. Restored windows clip
-  // to 16px here too.
-  const html = `<!doctype html><meta charset="utf-8"><title>Knorvia</title>
-  <style>
-    :root { --bg:#fdfcf9; --fg:#1c1816; --muted:#6d645a; --halo:#8bb8c4; }
-    @media (prefers-color-scheme: dark) {
-      :root { --bg:#1a1918; --fg:#e8e4de; --muted:#9b9590; --halo:#a8c8d4; }
-    }
-    * { box-sizing:border-box; }
-    html, body { border-radius:${WINDOW_CORNER_RADIUS}px; overflow:hidden; clip-path:inset(0 round ${WINDOW_CORNER_RADIUS}px); }
-    body { margin:0; background:${glass ? "transparent" : "var(--bg)"}; color:var(--fg); font:15px system-ui,-apple-system,"Segoe UI",sans-serif;
-           display:flex; flex-direction:column; align-items:center; justify-content:center; height:100vh; overflow:hidden; user-select:none; }
-    .chrome { position:fixed; top:0; left:0; right:0; height:${TITLEBAR_HEIGHT}px; -webkit-app-region:drag; z-index:10; }
-    .chrome .caption { position:absolute; top:0; right:0; height:100%; display:none; -webkit-app-region:no-drag; }
-    .chrome .caption button { width:46px; height:100%; border:0; background:transparent; color:var(--fg); font-size:12px; }
-    .chrome .caption button:hover { background:rgba(127,127,127,.18); }
-    .chrome .caption button.close:hover { background:#e81123; color:#fff; }
-    .emblem { position:relative; width:136px; height:136px; display:grid; place-items:center; }
-    .aura { position:absolute; left:50%; top:50%; width:420px; height:280px; margin-left:-210px; margin-top:-140px;
-      border-radius:50%; pointer-events:none; filter:blur(16px);
-      background: radial-gradient(circle at 34% 38%, rgba(143,212,200,.34), transparent 48%),
-                  radial-gradient(circle at 68% 62%, rgba(183,182,227,.3), transparent 50%),
-                  radial-gradient(circle at 50% 50%, rgba(186,206,214,.16), transparent 58%);
-      animation:auraIn 1.4s cubic-bezier(.16,1,.3,1) both; }
-    @media (prefers-color-scheme: dark) {
-      .aura { filter:blur(18px);
-              background: radial-gradient(circle at 34% 38%, rgba(143,212,200,.48), transparent 48%),
-                          radial-gradient(circle at 68% 62%, rgba(183,182,227,.44), transparent 50%),
-                          radial-gradient(circle at 50% 50%, rgba(186,206,214,.22), transparent 60%); }
-    }
-    .halo { position:absolute; inset:0; width:136px; height:136px; color:var(--halo); pointer-events:none; }
-    .halo rect { fill:none; stroke:currentColor; stroke-width:1.15; stroke-linecap:round; stroke-dasharray:150 432;
-                 opacity:.7; animation:draw 1.15s .22s cubic-bezier(.22,1,.36,1) both, orbit 28s 1.4s linear infinite; }
-    .mark { position:relative; z-index:2; width:100px; height:100px; overflow:hidden; border-radius:22px; }
-    .mark img { width:100px; height:100px; object-fit:contain; display:block;
-                animation:arrive .95s .1s cubic-bezier(.16,1,.3,1) both; }
-    .sheen { position:absolute; inset:-30%; pointer-events:none;
-             background:linear-gradient(115deg, transparent 36%, rgba(255,255,255,.55) 50%, transparent 64%);
-             animation:sheen 1.15s .4s cubic-bezier(.22,1,.36,1) both; }
-    @media (prefers-color-scheme: dark) {
-      .sheen { background:linear-gradient(115deg, transparent 36%, rgba(255,255,255,.28) 50%, transparent 64%); }
-    }
-    h1 { font-size:21px; font-weight:600; margin:28px 0 0; letter-spacing:.06em;
-         font-family:Georgia,'Times New Roman',serif;
-         animation:word .9s .48s cubic-bezier(.16,1,.3,1) both; }
-    .muted { color:var(--muted); font-size:12px; line-height:1; margin:10px 0 0;
-             animation:statusIn .7s .64s cubic-bezier(.16,1,.3,1) both; }
-    .rule { margin-top:28px; width:56px; height:1px; overflow:hidden; }
-    .rule i { display:block; height:100%; width:100%; transform-origin:center;
-              background:linear-gradient(90deg, #8fd4c8, #b7b6e3);
-              animation:ruleIn .85s .78s cubic-bezier(.22,1,.36,1) both; }
-    @keyframes auraIn { from{opacity:0;transform:scale(.78)} to{opacity:1;transform:scale(1)} }
-    @keyframes arrive { from{opacity:0;transform:translateY(10px) scale(.94);filter:blur(8px)}
-                        to{opacity:1;transform:none;filter:blur(0)} }
-    @keyframes sheen { from{transform:translateX(-130%);opacity:0} 18%{opacity:1} to{transform:translateX(130%);opacity:0} }
-    @keyframes draw { from{stroke-dashoffset:150;opacity:0} to{stroke-dashoffset:0;opacity:.7} }
-    @keyframes orbit { to { stroke-dashoffset:-432 } }
-    @keyframes word { from{opacity:0;transform:translateY(6px);letter-spacing:.2em}
-                      to{opacity:1;transform:none;letter-spacing:.06em} }
-    @keyframes statusIn { from{opacity:0;transform:translateY(4px)} to{opacity:1;transform:none} }
-    @keyframes ruleIn { from{transform:scaleX(0);opacity:0} to{transform:scaleX(1);opacity:1} }
-    @media (prefers-reduced-motion: reduce) {
-      .aura,.mark img,.sheen,.halo rect,h1,.muted,.rule i { animation:none !important; }
-      .mark img,.halo rect,h1,.muted,.rule i { opacity:1 !important; transform:none !important; filter:none !important; }
-      .aura { opacity:1 !important; transform:none !important; }
-      .sheen { opacity:0 !important; }
-      .halo rect { stroke-dashoffset:0 !important; }
-    }
-  </style>
-  <div class="chrome"><div class="caption" id="caption"></div></div>
-  <div class="emblem">
-    <span class="aura"></span>
-    <svg class="halo" viewBox="0 0 136 136" fill="none"><rect x="8" y="8" width="120" height="120" rx="28" ry="28"/></svg>
-    <div class="mark"><img src="data:image/png;base64,${logo}" alt=""><span class="sheen"></span></div>
-  </div>
-  <h1>Knorvia</h1>
-  <div class="muted">正在启动桌面 AI 引擎…</div>
-  <div class="rule"><i></i></div>
-  <script>
-    (function () {
-      var chrome = window.knorviaDesktop && window.knorviaDesktop.chrome;
-      if (!chrome || chrome.captionOverlay || chrome.trafficLights) return;
-      var el = document.getElementById("caption");
-      el.style.display = "flex";
-      el.innerHTML = '<button id="min" aria-label="Minimize">&#x2013;</button><button id="max" aria-label="Maximize">&#x25A1;</button><button id="cls" class="close" aria-label="Close">&#x2715;</button>';
-      document.getElementById("min").onclick = function () { chrome.windowMinimize(); };
-      document.getElementById("max").onclick = function () { chrome.windowMaximize(); };
-      document.getElementById("cls").onclick = function () { chrome.windowClose(); };
-    })();
-  </script>`;
+  const selected = storedUiTheme();
+  const theme = Object.hasOwn(palettes, selected) ? selected : nativeTheme.shouldUseDarkColors ? "dark" : "snow";
+  const appearance = readAppearance(app.getPath("userData"));
+  const html = startupScreen({ logo, theme, frost: glass, reducedMotion: appearance?.reducedMotion === true });
   return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
 }
 
@@ -260,7 +221,9 @@ function refreshWindowShape() {
 
 function createWindow() {
   const theme = storedUiTheme();
-  const frost = storedUiFrost();
+  const backdropSupported = nativeBackdropSupported(process.platform, os.release());
+  const frost = storedUiFrost() && backdropSupported;
+  if (theme && Object.hasOwn(palettes, theme)) nativeTheme.themeSource = palettes[theme].dark ? "dark" : "light";
   const chrome = browserWindowChrome(process.platform, {
     dark: nativeTheme.shouldUseDarkColors,
     theme,
@@ -274,6 +237,7 @@ function createWindow() {
     webPreferences: {
       preload: path.join(__dirname, "preload.js"), contextIsolation: true,
       nodeIntegration: false, sandbox: true,
+      additionalArguments: [`--knorvia-backdrop-supported=${backdropSupported}`],
     },
   });
   liveBackdrop = frost;
@@ -306,6 +270,7 @@ function createWindow() {
   });
 
   setupTray();
+  keepWindowInBackground(mainWindow, () => Boolean(tray) && !shuttingDown && !process.env.KNORVIA_DESKTOP_SMOKE);
   setupGlobalHotkey();
   scheduleUpdateChecks();
 }
@@ -318,9 +283,9 @@ function setupTray() {
     const iconPath = path.join(__dirname, "build", "icon.ico");
     if (!fs.existsSync(iconPath)) return;
     tray = new Tray(nativeImage.createFromPath(iconPath));
-    tray.setToolTip("Knorvia");
+    tray.setToolTip("Knorvia · 关闭窗口后任务继续运行");
     tray.setContextMenu(Menu.buildFromTemplate([
-      { label: "Open Knorvia", click: () => {
+      { label: "打开 Knorvia", click: () => {
           if (!mainWindow) return;
           if (mainWindow.isMinimized()) mainWindow.restore();
           mainWindow.show(); mainWindow.focus();
@@ -328,7 +293,7 @@ function setupTray() {
       { type: "separator" },
       { label: "检查更新…", click: () => { void runUpdateCheck(true); } },
       { type: "separator" },
-      { label: "Quit", click: () => app.quit() },
+      { label: "退出并停止后台任务", click: () => app.quit() },
     ]));
     tray.on("click", () => {
       if (!mainWindow) return;
@@ -471,7 +436,13 @@ function openAllowedExternal(rawUrl) {
 }
 
 function capture(chunk) {
-  recentOutput = (recentOutput + chunk.toString("utf8")).slice(-12000);
+  // Never retain a provider credential in the in-memory diagnostics shown by
+  // the crash dialog. The native connection code does not log keys; this is a
+  // defense-in-depth scrub for child-process diagnostics we do not control.
+  const text = String(chunk || "")
+    .replace(/(KNORVIA_PROVIDER_API_KEY\s*[=:]\s*)[^\s"']+/gi, "$1[redacted]")
+    .replace(/(authorization\s*:\s*bearer\s+)[^\s"']+/gi, "$1[redacted]");
+  recentOutput = (recentOutput + text).slice(-12000);
 }
 
 // Packaged Windows applications do not own a console. Electron or a dependency
@@ -542,20 +513,29 @@ function installRendererProtocol(pipeName) {
 }
 
 function sendBridge(message) {
-  if (shuttingDown || !engine?.stdin?.writable || engine.stdin.destroyed) return false;
+  const worker = domainWorker;
+  if (shuttingDown || !worker?.stdin?.writable || worker.stdin.destroyed) return false;
   try {
-    engine.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
-      if (error && error.code !== "EPIPE") capture(`AI engine write failed: ${error.message}\n`);
+    worker.stdin.write(`${JSON.stringify(message)}\n`, (error) => {
+      if (error && error.code !== "EPIPE") capture(`Domain worker write failed: ${error.message}\n`);
     });
     return true;
   } catch (error) {
-    if (error?.code !== "EPIPE") capture(`AI engine write failed: ${error.message}\n`);
+    if (error?.code !== "EPIPE") capture(`Domain worker write failed: ${error.message}\n`);
     return false;
   }
 }
 
 function installIpcHandlers() {
-  const trusted = (event) => event.senderFrame.url.startsWith("knorvia://app/");
+  const trusted = (event) => {
+    if (!fromMainWindow(event, mainWindow)) return false;
+    try {
+      const source = new URL(event.senderFrame?.url || "");
+      return source.protocol === "knorvia:" && source.hostname === "app";
+    } catch {
+      return false;
+    }
+  };
   ipcMain.on("knorvia:titlebar-overlay", (event, payload) => {
     if (!fromMainWindow(event, mainWindow) || process.platform !== "win32") return;
     const overlay = sanitizeOverlay(payload);
@@ -566,6 +546,10 @@ function installIpcHandlers() {
   });
   ipcMain.on("knorvia:window-material", (event, payload) => {
     if (!fromMainWindow(event, mainWindow) || !mainWindow || mainWindow.isDestroyed()) return;
+    if (validAppearance(payload)) {
+      nativeTheme.themeSource = palettes[payload.theme].dark ? "dark" : "light";
+      try { saveAppearance(app.getPath("userData"), payload); } catch (error) { capture(`Window appearance save failed: ${error.message}\n`); }
+    }
     liveBackdrop = payload?.material === "acrylic" || payload?.vibrancy === "under-window";
     try { applyWindowMaterial(mainWindow, process.platform, payload); } catch (error) {
       capture(`Window material update failed: ${error.message}\n`);
@@ -611,111 +595,264 @@ function installIpcHandlers() {
     return wallpaper.clear();
   });
   ipcMain.handle("knorvia:update-check", () => runUpdateCheck(true));
+  ipcMain.handle("knorvia:native-request", (event, message) => {
+    if (!trusted(event)) {
+      return errorResponse(message?.id, -32001, "Native request source is not trusted");
+    }
+    if (!nativeRpc) {
+      return errorResponse(message?.id, -32000, "Knorvia native runtime is not ready");
+    }
+    return nativeRpc.handle(message);
+  });
   ipcMain.handle("knorvia:fetch", (event, request) => {
     if (!trusted(event)) return encodedHttpError(403, "请求来源不受信任");
     if (typeof request?.path !== "string" || !request.path.startsWith("/api/"))
       return encodedHttpError(400, "无效的桌面接口路径");
+    if (kernelEngine && isAgentApiPath(request.path)) {
+      return kernelEngine.handleHttp(request);
+    }
     const id = String(++requestSequence);
     return new Promise((resolve) => {
       pendingRequests.set(id, { resolve });
       if (!sendBridge({ ...request, kind: "http", id })) {
         pendingRequests.delete(id);
-        resolve({ id, ...encodedHttpError(503, "AI 引擎正在关闭或尚未就绪") });
+        resolve({ id, ...encodedHttpError(503, "领域 Worker 尚未就绪") });
       }
     });
   });
-  for (const [channel, kind] of [
-    ["knorvia:ws-open", "ws_open"], ["knorvia:ws-send", "ws_send"],
-    ["knorvia:ws-close", "ws_close"],
-  ]) ipcMain.on(channel, (event, payload) => {
+  ipcMain.on("knorvia:ws-open", (event, payload) => {
     if (!trusted(event)) return;
-    if (!sendBridge({ ...payload, kind }) && kind === "ws_open") {
+    const wsPath = String(payload?.path || "");
+    if (kernelEngine && isAgentApiPath(wsPath)) {
+      kernelSockets.add(payload?.id);
+      kernelEngine.handleWsOpen(payload).then((open) => {
+        if (open?.type === "error") {
+          kernelSockets.delete(payload?.id);
+          event.sender.send(`knorvia:ws-event:${payload?.id}`, {
+            type: "close", error: open.error || "Legacy chat bridge is unavailable",
+          });
+          return;
+        }
+        event.sender.send(`knorvia:ws-event:${payload?.id}`, open);
+      }).catch((error) => {
+        event.sender.send(`knorvia:ws-event:${payload?.id}`, {
+          type: "close", error: error.message,
+        });
+      });
+      return;
+    }
+    if (!sendBridge({ ...payload, kind: "ws_open" })) {
       event.sender.send(`knorvia:ws-event:${payload?.id}`, {
-        type: "close", error: "AI 引擎正在关闭或尚未就绪",
+        type: "close", error: "领域 Worker 尚未就绪",
       });
     }
+  });
+  ipcMain.on("knorvia:ws-send", (event, payload) => {
+    if (!trusted(event)) return;
+    if (kernelEngine && kernelSockets.has(payload?.id)) {
+      const send = (msg) => event.sender.send(`knorvia:ws-event:${payload?.id}`, msg);
+      kernelEngine.handleWsSend(payload, send);
+      return;
+    }
+    sendBridge({ ...payload, kind: "ws_send" });
+  });
+  ipcMain.on("knorvia:ws-close", (event, payload) => {
+    if (!trusted(event)) return;
+    if (kernelEngine && kernelSockets.has(payload?.id)) {
+      kernelEngine.handleWsClose(payload || {});
+      kernelSockets.delete(payload?.id);
+      return;
+    }
+    sendBridge({ ...payload, kind: "ws_close" });
   });
 }
 
 async function startKnorvia() {
   const runtime = runtimeRoot();
-  const python = path.join(runtime, "python", "python.exe");
-  const node = path.join(runtime, "node", "node.exe");
-  if (!fs.existsSync(python) || !fs.existsSync(node))
-    throw new Error("桌面运行时不完整，请重新构建应用。");
-
   const workspace = workspaceRoot();
   ensureDesktopDefaults(workspace);
+  // Prefer a current source Next standalone build when requested. The staged
+  // Python package remains a release-layout fallback only.
+  const renderer = resolveWebRenderer({ webDir: process.env.KNORVIA_WEB_DIR, runtimeRoot: runtime });
+  const nodeLauncher = resolveNodeLauncher({ runtimeRoot: runtime, env: process.env, electronExecPath: process.execPath });
+  const python = path.join(runtime, "python", "python.exe");
   const home = process.env.USERPROFILE || process.env.HOME || os.homedir();
   const linkRoots = [home, workspace].filter(Boolean).join(path.delimiter);
   const env = {
     ...process.env,
-    PATH: `${path.dirname(node)};${process.env.PATH || ""}`,
+    PATH: `${path.dirname(nodeLauncher.command)};${process.env.PATH || ""}`,
     PYTHONUTF8: "1", PYTHONIOENCODING: "utf-8:replace",
     KNORVIA_HOME: workspace, KNORVIA_DESKTOP: "1", UI_LANGUAGE: "zh",
     KNORVIA_LINKED_FOLDER_ROOTS: process.env.KNORVIA_LINKED_FOLDER_ROOTS || linkRoots,
   };
-  engine = spawn(python, ["-m", "knorvia.desktop.ipc_bridge"], {
-    cwd: workspace, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+
+  const connectionStore = createEncryptedConnectionStore({
+    filePath: path.join(workspace, "data", "user", "settings", "model-connection.json"),
+    safeStorage,
   });
-  engine.stderr.on("data", capture);
-  engine.stdin.on("error", (error) => {
-    if (error.code !== "EPIPE") capture(`AI engine input failed: ${error.message}\n`);
+  let personalLibrary;
+  // Learning/catalog packs are constructed lazily on first tool use: the
+  // library, media studio and extension manager are created below.
+  studioMcp = await createStudioMcp({
+    getStudio: () => mediaStudio,
+    getLibrary: () => personalLibrary,
+    getLearning: () => (learningPack ??= createLearningPack({ home: workspace, library: personalLibrary, studio: mediaStudio, rpc: nativeRuntime.rpc })),
+    getCatalog: () => (curatedCatalog ??= createCuratedCatalog({ home: workspace, library: personalLibrary, studio: mediaStudio, extensionManager, rpc: nativeRuntime.rpc })),
+    home: workspace,
   });
+  Object.assign(env, studioMcp.env);
+  nativeRuntime = await createNativeRuntime({
+    home: workspace,
+    env,
+    runtimeRoot: runtime,
+    packaged: app.isPackaged,
+    version: DESKTOP_VERSION,
+    legacyChatBridge: env.KNORVIA_ENABLE_LEGACY_CHAT_BRIDGE === "1",
+    mode: "desktop",
+    connectionStore,
+    capabilities: { selectFolder: true, openPath: true, revealPath: true },
+  });
+  const desktopPaths = createDesktopPathActions({
+    rpc: nativeRuntime.rpc,
+    dialog,
+    shell,
+    getWindow: () => mainWindow,
+  });
+  personalLibrary = createPersonalLibrary({ home: workspace, rpc: nativeRuntime.rpc });
+  mediaStudio = createMediaStudio({ home: workspace, rpc: nativeRuntime.rpc, library: personalLibrary, safeStorage });
+  workspaceTerminals = createWorkspaceTerminal({ rpc: nativeRuntime.rpc, env });
+  sshSessions = createSshSessions({ home: workspace, safeStorage, rpc: nativeRuntime.rpc });
+  worktreeSnapshots = createWorktreeSnapshots({ home: workspace, rpc: nativeRuntime.rpc });
+  extensionManager = createExtensionManager({ home: workspace, rpc: nativeRuntime.rpc });
+  await extensionManager.restore();
+  learningPack ??= createLearningPack({ home: workspace, library: personalLibrary, studio: mediaStudio, rpc: nativeRuntime.rpc });
+  curatedCatalog ??= createCuratedCatalog({ home: workspace, library: personalLibrary, studio: mediaStudio, extensionManager, rpc: nativeRuntime.rpc });
+  creativeCliService = createCreativeCliService({ home: workspace, rpc: nativeRuntime.rpc, library: personalLibrary, studio: mediaStudio, extensionManager, learning: learningPack, catalog: curatedCatalog, course: createOpenmaicCourse({ library: personalLibrary }), imageOps: createLibraryImageOps({ library: personalLibrary }), version: DESKTOP_VERSION });
+  await creativeCliService.listen();
+  cliBackendHost = createCliBackendHandlers({ env });
+  cliDispatch = createCliDispatchBridge({ rpc: nativeRuntime.rpc, handlers: cliBackendHost.handlers, backendIds: () => cliBackendHost.host.availableBackendIds() });
+  void cliDispatch.start();
+  nativeRpc = createNativeRpcRouter({
+    rpc: nativeRuntime.rpc,
+    onNotification: nativeRuntime.onNotification,
+    handlers: {
+      "connection/read": nativeRuntime.connectionRead,
+      "connection/provider/save": nativeRuntime.providerSave,
+      "connection/provider/delete": nativeRuntime.providerDelete,
+      "connection/provider/activate": nativeRuntime.providerActivate,
+      "connection/update": nativeRuntime.connectionUpdate,
+      "connection/test": nativeRuntime.connectionTest,
+      "notifications/read": () => turnNotifier.handlers["notifications/read"](),
+      "notifications/update": params => turnNotifier.handlers["notifications/update"](params),
+      ...extensionManager.handlers,
+      ...extensionConnectionHandlers(nativeRuntime, extensionManager),
+      ...sshSessions.handlers,
+      ...worktreeSnapshots.handlers,
+      ...desktopPaths.handlers,
+      ...createWorkspacePreview({ rpc: nativeRuntime.rpc }),
+      ...personalLibrary.handlers,
+      ...mediaStudio.handlers,
+      ...workspaceTerminals.handlers,
+      ...cliBackendHost.handlers,
+      ...learningPack.commands,
+    },
+  });
+  turnNotifier = createTurnNotifier({
+    home: workspace,
+    // The user is actively looking at the app while its window is focused and
+    // visible; banners would only interrupt. Background completion still
+    // notifies, and with no window at all the app is effectively background.
+    deliverability: () => {
+      if (!mainWindow || mainWindow.isDestroyed()) return true;
+      return !mainWindow.isVisible() || !mainWindow.isFocused() || mainWindow.isMinimized();
+    },
+    onClick: (threadId) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+      mainWindow.webContents.send("knorvia:open-thread", threadId);
+    },
+  });
+  removeNativeRpcNotification = nativeRpc.subscribe((notification) => {
+    try { turnNotifier?.handle(notification); } catch { /* notification failures never break streaming */ }
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    mainWindow.webContents.send("knorvia:native-notification", notification);
+  });
+  removeRuntimeEngine = nativeRuntime.onEngineChange((next) => {
+    kernelEngine = next;
+    engine = next?.child;
+    if (!next?.child) return;
+    capture(`Agent Runtime: knorvia-daemon (${next.daemonBin})\n`);
+    const failCurrentEngine = () => {
+      // A planned provider restart deliberately terminates this child. Only a
+      // failure of the currently bound engine is fatal to the desktop shell.
+      if (shuttingDown || nativeRuntime?.restarting || nativeRuntime?.engine !== next) return;
+      resolvePendingRequests(503, "AI 引擎已断开");
+      assetStreamBroker?.failAll(new Error("Knorvia engine disconnected"));
+      if (!fatalErrorShown) {
+        fatalErrorShown = true;
+        dialog.showErrorBox("Knorvia 已停止", `knorvia-daemon 意外退出。\n\n${recentOutput.slice(-3000)}`);
+        app.quit();
+      }
+    };
+    // Do not copy daemon stderr into the desktop diagnostic buffer: provider
+    // implementations may include request headers in their own diagnostics.
+    next.child.stderr?.resume?.();
+    next.child.on("error", failCurrentEngine);
+    next.child.on("exit", failCurrentEngine);
+  });
+
   assetStreamBroker = new DesktopAssetStreamBroker(sendBridge);
-  const lines = readline.createInterface({ input: engine.stdout });
-  let markReady;
-  const ready = new Promise((resolve) => { markReady = resolve; });
-  lines.on("line", (line) => {
-    let message;
-    try { message = JSON.parse(line); } catch { return; }
-    if (message.kind === "ready") markReady();
-    else if (message.kind?.startsWith("http_stream_") || (message.kind === "error" && assetStreamBroker.pending.has(message.id))) {
-      assetStreamBroker.handle(message);
-    } else if (message.kind === "http_response" || (message.kind === "error" && pendingRequests.has(message.id))) {
-      const pending = pendingRequests.get(message.id);
-      if (!pending) return; // late/duplicate response after timeout or shutdown
-      pendingRequests.delete(message.id);
-      message.kind === "error"
-        ? pending.resolve({ id: message.id, ...encodedHttpError(502, message.error || "AI 引擎请求失败") })
-        : pending.resolve(message);
-    } else if (message.kind?.startsWith("ws_")) {
-      mainWindow?.webContents.send(`knorvia:ws-event:${message.id}`, {
-        type: message.kind.slice(3), data: message.data, error: message.error,
-      });
-    }
-  });
-  engine.on("error", (error) => {
-    capture(`AI engine process failed: ${error.message}\n`);
-    resolvePendingRequests(503, "AI 引擎已断开");
-    assetStreamBroker?.failAll(new Error("Knorvia engine disconnected"));
-    if (!shuttingDown && !fatalErrorShown) {
-      fatalErrorShown = true;
-      dialog.showErrorBox("Knorvia 已停止", `桌面 AI 引擎无法运行。\n\n${recentOutput.slice(-3000)}`);
-      app.quit();
-    }
-  });
-  engine.on("exit", (code) => {
-    resolvePendingRequests(503, "AI 引擎已断开");
-    assetStreamBroker?.failAll(new Error("Knorvia engine disconnected"));
-    if (!shuttingDown && !fatalErrorShown) {
-      fatalErrorShown = true;
-      dialog.showErrorBox("Knorvia 已停止", `桌面 AI 引擎意外退出（代码 ${code}）。\n\n${recentOutput.slice(-3000)}`);
-      app.quit();
-    }
-  });
-  const webRoot = path.join(runtime, "python", "Lib", "site-packages", "knorvia_web");
-  if (!fs.existsSync(webRoot))
-    throw new Error(`桌面渲染器资源缺失：${webRoot}`);
+  const legacyDomainWorker = env.KNORVIA_ENABLE_LEGACY_DOMAIN_WORKER === "1";
+  if (legacyDomainWorker && fs.existsSync(python)) {
+    domainWorker = spawn(python, ["-m", "knorvia.desktop.ipc_bridge"], {
+      cwd: workspace, env, windowsHide: true, stdio: ["pipe", "pipe", "pipe"],
+    });
+    domainWorker.stderr.on("data", capture);
+    domainWorker.stdin.on("error", (error) => {
+      if (error.code !== "EPIPE") capture(`Domain worker input failed: ${error.message}\n`);
+    });
+    const lines = readline.createInterface({ input: domainWorker.stdout });
+    lines.on("line", (line) => {
+      let message;
+      try { message = JSON.parse(line); } catch { return; }
+      if (message.kind?.startsWith("http_stream_") || (message.kind === "error" && assetStreamBroker.pending.has(message.id))) {
+        assetStreamBroker.handle(message);
+      } else if (message.kind === "http_response" || (message.kind === "error" && pendingRequests.has(message.id))) {
+        const pending = pendingRequests.get(message.id);
+        if (!pending) return;
+        pendingRequests.delete(message.id);
+        message.kind === "error"
+          ? pending.resolve({ id: message.id, ...encodedHttpError(502, message.error || "领域 Worker 请求失败") })
+          : pending.resolve(message);
+      } else if (message.kind?.startsWith("ws_")) {
+        mainWindow?.webContents.send(`knorvia:ws-event:${message.id}`, {
+          type: message.kind.slice(3), data: message.data, error: message.error,
+        });
+      }
+    });
+  } else if (legacyDomainWorker) {
+    capture("Legacy domain worker was requested but its Python runtime is absent.\n");
+  } else {
+    capture("Legacy Python domain worker disabled; native workbench uses knorvia-daemon directly.\n");
+  }
+  const webRoot = renderer.webRoot;
   const frontendHost = app.isPackaged
     ? path.join(process.resourcesPath, "desktop", "frontend-host.js")
     : path.join(__dirname, "frontend-host.js");
   if (!fs.existsSync(frontendHost))
     throw new Error(`桌面渲染器入口缺失：${frontendHost}`);
   const pipeName = `\\\\.\\pipe\\knorvia-ui-${process.pid}`;
-  frontend = spawn(node, [frontendHost], {
+  frontend = spawn(nodeLauncher.command, [frontendHost], {
     cwd: webRoot, windowsHide: true, stdio: ["ignore", "pipe", "pipe"],
-    env: { ...env, KNORVIA_WEB_ROOT: webRoot, KNORVIA_UI_PIPE: pipeName, KNORVIA_NEXT_DIST_DIR: ".next-knorvia" },
+    env: {
+      ...env,
+      ...(nodeLauncher.useElectronAsNode ? { ELECTRON_RUN_AS_NODE: "1" } : {}),
+      KNORVIA_WEB_ROOT: webRoot,
+      KNORVIA_UI_PIPE: pipeName,
+      KNORVIA_NEXT_DIST_DIR: renderer.distDir,
+    },
   });
   // A spawn failure (bad cwd, missing node.exe) surfaces as an async 'error'
   // event, NOT through 'exit' — without a listener it is an uncaught
@@ -760,60 +897,83 @@ async function startKnorvia() {
   await mainWindow.loadURL("knorvia://app/");
   if (process.env.KNORVIA_DESKTOP_SMOKE === "1") {
     const result = await mainWindow.webContents.executeJavaScript(`(async () => {
-      const response = await window.knorviaDesktop.fetch({
-        method: "GET", path: "/api/v1/system/status", headers: {}
+      const health = await window.knorviaDesktop.native.request({
+        jsonrpc: "2.0", id: "desktop-smoke", method: "system/health", params: {}
       });
-      const body = JSON.parse(new TextDecoder().decode(
-        Uint8Array.from(atob(response.body), c => c.charCodeAt(0))
-      ));
-      const socketId = crypto.randomUUID();
-      const pong = await new Promise((resolve, reject) => {
-        const timeout = setTimeout(() => reject(new Error("IPC chat timeout")), 5000);
-        const remove = window.knorviaDesktop.onWsEvent(socketId, (event) => {
-          if (event.type === "open") window.knorviaDesktop.wsSend(socketId, JSON.stringify({ type: "ping" }));
-          if (event.type === "message" && JSON.parse(event.data).type === "pong") {
-            clearTimeout(timeout); remove(); window.knorviaDesktop.wsClose(socketId); resolve("pong");
-          }
-        });
-        window.knorviaDesktop.wsOpen(socketId, "/api/v1/ws");
-      });
-      return { url: location.href, status: response.status, backend: body.backend?.status, chat: pong };
+      return { url: location.href, native: health.result?.ok === true, server: health.result?.server, error: health.error?.message };
     })()`);
     process.stdout.write(`DESKTOP_SMOKE=${JSON.stringify(result)}\n`, () => {});
     setTimeout(() => app.quit(), 250);
   }
-  // The interface can paint while the heavier AI engine continues warming up.
-  // Requests are safely buffered by the child-process pipe until ASGI is ready.
-  void ready;
 }
 
 function stopKnorvia() {
-  if (shuttingDown) return;
+  if (shuttingDown) return shutdownPromise;
   shuttingDown = true;
+  shutdownPromise = stopServices();
+  return shutdownPromise;
+}
+
+async function stopServices() {
+  try { await cliDispatch?.close(); } catch {}
+  cliDispatch = undefined;
+  try { await creativeCliService?.close(); } catch {}
+  creativeCliService = undefined;
+  // Stop accepting media tools before closing their worker. The worker must
+  // settle while the durable daemon is still available.
+  try { await studioMcp?.close(); } catch {}
+  studioMcp = undefined;
+  try { await mediaStudio?.close(); } catch {}
+  mediaStudio = undefined;
+  workspaceTerminals?.dispose();
+  workspaceTerminals = undefined;
+  for (const runId of cliBackendHost?.host.activeRuns() ?? []) {
+    cliBackendHost.host.cancel({ runId });
+  }
+  cliBackendHost = undefined;
+  sshSessions?.dispose(); sshSessions = undefined;
+  try { await worktreeSnapshots?.close(); } catch {}
+  worktreeSnapshots = undefined;
+  try { await extensionManager?.close(); } catch {}
+  extensionManager = undefined;
+  const enginePid = engine?.pid;
+  const workerPid = domainWorker?.pid;
   resolvePendingRequests(503, "Knorvia 正在关闭");
   assetStreamBroker?.failAll(new Error("Knorvia is shutting down"));
-  if (engine?.stdin?.writable && !engine.stdin.destroyed) {
-    try { engine.stdin.write(`${JSON.stringify({ kind: "shutdown" })}\n`, () => {}); } catch {}
+  try { removeNativeRpcNotification?.(); } catch {}
+  try { nativeRpc?.dispose(); } catch {}
+  try { removeRuntimeEngine?.(); } catch {}
+  nativeRpc = undefined;
+  removeNativeRpcNotification = undefined;
+  removeRuntimeEngine = undefined;
+  const runtime = nativeRuntime;
+  nativeRuntime = undefined;
+  try { await runtime?.close?.(); } catch {}
+  if (!runtime) {
+    try { kernelEngine?.kill?.(); } catch {}
+  }
+  if (domainWorker?.stdin?.writable && !domainWorker.stdin.destroyed) {
+    try { domainWorker.stdin.write(`${JSON.stringify({ kind: "shutdown" })}\n`, () => {}); } catch {}
   }
   // The renderer is stateless — kill it right away.
   if (frontend?.pid) spawnSync("taskkill", ["/pid", String(frontend.pid), "/t", "/f"], { windowsHide: true });
   // The engine gets a short grace window to process the shutdown message and
   // flush SQLite writes; it is force-killed only after the window elapses or
   // the child exits on its own first.
-  const enginePid = engine?.pid;
   const killEngine = () => {
     if (enginePid) spawnSync("taskkill", ["/pid", String(enginePid), "/t", "/f"], { windowsHide: true });
+    if (workerPid) spawnSync("taskkill", ["/pid", String(workerPid), "/t", "/f"], { windowsHide: true });
   };
-  if (!enginePid) {
-    frontend = undefined; engine = undefined;
+  if (!enginePid && !workerPid) {
+    frontend = undefined; engine = undefined; domainWorker = undefined; kernelEngine = undefined;
     return;
   }
   const forceKillTimer = setTimeout(killEngine, ENGINE_SHUTDOWN_GRACE_MS);
   forceKillTimer.unref?.();
   const onExit = () => { clearTimeout(forceKillTimer); };
-  if (engine.exitCode !== null || engine.signalCode !== null) onExit();
-  else engine.once("exit", onExit);
-  frontend = undefined; engine = undefined;
+  if (engine && engine.exitCode === null && engine.signalCode === null) engine.once("exit", onExit);
+  else onExit();
+  frontend = undefined; engine = undefined; domainWorker = undefined; kernelEngine = undefined;
 }
 
 const hasSingleInstanceLock = app.requestSingleInstanceLock();
@@ -834,8 +994,14 @@ if (!hasSingleInstanceLock) {
     });
   });
 }
-app.on("before-quit", () => {
+let shutdownFinished = false;
+app.on("before-quit", (event) => {
   try { require("electron").globalShortcut.unregisterAll(); } catch {}
-  stopKnorvia();
+  if (shutdownFinished) return;
+  event.preventDefault();
+  void Promise.resolve(stopKnorvia()).finally(() => {
+    shutdownFinished = true;
+    app.quit();
+  });
 });
 app.on("window-all-closed", () => app.quit());

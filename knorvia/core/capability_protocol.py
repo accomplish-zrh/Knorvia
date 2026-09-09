@@ -14,7 +14,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .context import UnifiedContext
-from .stream_bus import StreamBus
 
 
 @dataclass
@@ -55,7 +54,7 @@ class BaseCapability(ABC):
     manifest: CapabilityManifest
 
     @abstractmethod
-    async def run(self, context: UnifiedContext, stream: StreamBus) -> None:
+    async def run(self, context: UnifiedContext, stream: Any) -> None:
         """Execute the full capability pipeline, emitting events to *stream*."""
         ...
 

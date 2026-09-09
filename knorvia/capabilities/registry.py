@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from knorvia.capabilities.explore_context import ExploreContextCapability
 from knorvia.capabilities.mastery import MasteryLoopCapability
 from knorvia.capabilities.obsidian import ObsidianCapability
 from knorvia.capabilities.protocol import LoopCapability
@@ -15,7 +14,6 @@ LOOP_CAPABILITIES: tuple[LoopCapability, ...] = (
     SolveLoopCapability(),
     ObsidianCapability(),
     SubagentCapability(),
-    ExploreContextCapability(),
 )
 
 

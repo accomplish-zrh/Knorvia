@@ -25,7 +25,7 @@ export default defineConfig({
       args: LAUNCH_ARGS,
     },
   },
-  webServer: {
+  webServer: process.env.KNORVIA_UI_FIXTURE_WORKSPACE ? undefined : {
     command: "npm run dev",
     url: BASE_URL,
     reuseExistingServer: !process.env.CI,
