@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, ChevronLeft, ChevronRight, Film, FileText, Loader2, RotateCcw, Search } from "lucide-react";
 import { displayTime, type Artifact, type Workspace } from "@/lib/native-workbench-state";
+import { clampWindowStart } from "@/lib/output-catalog-window";
 import { errorText, useWorkbench } from "./NativeWorkbenchProvider";
 import './output-catalog.css';
 
@@ -28,11 +29,7 @@ type Attempt = {
   cursor: string | null;
 };
 
-/** Clamp a window start so a full window is visible whenever rows allow. */
-export function clampWindowStart(start: number, rowCount: number, window: number): number {
-  const maxStart = Math.max(0, rowCount - window);
-  return Math.min(Math.max(0, start), maxStart);
-}
+export { clampWindowStart } from "@/lib/output-catalog-window";
 
 /**
  * P02 global output catalog: one `artifact/catalog` RPC per page regardless

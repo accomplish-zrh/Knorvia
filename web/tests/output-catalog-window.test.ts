@@ -3,7 +3,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { clampWindowStart } from "@/components/native/OutputCatalog";
+import { clampWindowStart } from "@/lib/output-catalog-window";
 
 const TOTAL = 2000;
 const PAGE_SIZE = 50;

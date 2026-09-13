@@ -53,6 +53,8 @@
 | Chrome：六个预设、跨语言搜索、个人副本、变量预览、草稿写入 | 通过 |
 | Chrome：已有任务套用内置方案，任务记录不发生执行或 Goal 变化 | 通过 |
 | TypeScript 与生产前端构建 | 通过，69 个静态页面生成完成 |
+| 本次涉及的前端文件 ESLint | 8 个文件零错误、零警告 |
+| 发布后补查完整前端 Node 测试 | 修复两处干净环境的测试依赖问题后，1,069 项全部通过 |
 
 测试入口：`desktop/tests/learning-practice.test.js`、`creative-brief.test.js`、`domain-artifacts.test.js`、`domain-tools-live-kernel.test.js`、`web/tests/native-domain-recipes.test.ts`、`web/tests/learning-creation.audit.ts`。真实运行检查需要显式设置 `KNORVIA_RUN_DOMAIN_LIVE=1` 并提供原生程序路径；浏览器检查只允许本机隔离资料目录。
 
@@ -63,3 +65,11 @@
 本次交付增强后的完整本地源码、使用说明、测试和验收记录，推送目标为现有 `origin/main`。既有未提交源码先在隔离工作区保留基线，本次文件集成前按原始内容核对，防止覆盖会话期间的新改动。合并时保留远端历史，不使用强制推送。
 
 没有生成新安装包、替换本机安装或发布稳定版；现有便携版仅被用作真实原生程序的测试依赖。线上模型、学习效果和视频成片没有在本轮验证中被冒充为已验证能力。
+
+## GitHub 发布复核
+
+完整源码已通过现有 GitHub 连接发布至 `accomplish-zrh/Knorvia` 的 `main`。初始发布提交为 `ea5e748d3c0cbb8d13ad4b38e80a179ea48ed468`，树校验值为 `6f99141253eff4dc97a26c7be99fef37000bd335`，与当时本地验收快照完全一致；原有本地提交历史保留在 `local/workbench-history-20260913`。后续补充提交包含下述前端测试修正和本记录。
+
+[首次远端整仓检查](https://github.com/accomplish-zrh/Knorvia/actions/runs/34745812261) 暴露了两处测试环境问题：前端的原生上传契约测试需要桌面模块的 `yaml` 等依赖，而作业只安装了前端依赖；资料目录窗口计算测试直接导入界面组件，触发了未复制到测试编译目录的 CSS。补充提交为测试作业安装桌面依赖（禁用安装脚本），并将原有窗口计算原样提取为纯函数模块，使测试无需加载界面。修正后本机完整前端测试 1,069 项通过。
+
+整仓 CI 仍有本轮领域改造之外的失败：Python 导入检查继续导入已明确退役的 `ChatOrchestrator`；既有 Python 文件有 23 条 Ruff 导入规范问题；全可选依赖审计在缺少 `pangocairo` 的环境中构建 `manimpango` 失败。上述检查没有在本轮被改为跳过或视为成功。领域验收与构建通过，不代表整仓 CI 已全部通过；远端复跑状态以 Actions 为准。

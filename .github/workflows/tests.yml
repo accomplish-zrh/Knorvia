@@ -116,6 +116,10 @@ jobs:
         working-directory: web
         run: npm ci --legacy-peer-deps
 
+      - name: Install desktop dependencies for shared host contract tests
+        working-directory: desktop
+        run: npm ci --ignore-scripts
+
       - name: Run frontend node tests
         working-directory: web
         run: npm run test:node
