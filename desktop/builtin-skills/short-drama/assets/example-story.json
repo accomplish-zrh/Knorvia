@@ -1,0 +1,102 @@
+{
+  "schemaVersion": 1,
+  "id": "warm-winter-tea",
+  "title": "冬日檐下暖茶",
+  "globalPrompt": "治愈系电影胶片质感，柔和温润的自然漫射光，细腻的光影明暗对比，4K精致细节，温馨静谧的情感氛围。",
+  "aspect": "16:9",
+  "characters": [
+    {
+      "id": "char-grandma-lin",
+      "name": "林奶奶",
+      "description": "年过六旬的退休长者，银发梳理得整整齐齐，眼角带和蔼笑纹，身穿米白针织开衫与深灰羊毛长裙，举手投足温文尔雅。"
+    },
+    {
+      "id": "char-courier-xiao-li",
+      "name": "小李",
+      "description": "二十多岁的年轻快递员，脸颊被寒风吹得微红，穿着整洁的深蓝工装羽绒服，眼神真诚质朴，带着几分奔波后的疲累。"
+    }
+  ],
+  "scenes": [
+    {
+      "id": "scene-flower-eaves",
+      "name": "街角花店外屋檐",
+      "description": "飘着细碎冬雪的街角，花店浅木色大门紧闭，屋檐下挂着一盏暖黄色防风马灯，石阶上落了一层薄薄的白霜。"
+    },
+    {
+      "id": "scene-living-room",
+      "name": "林奶奶家小客厅",
+      "description": "温馨朴素的老公寓客厅，碎花布艺沙发旁摆着绿植，低矮茶几上铺着格子桌布，电陶炉上温热的茶壶正飘散出白色水雾。"
+    }
+  ],
+  "props": [
+    {
+      "id": "prop-ginger-tea",
+      "name": "红糖姜茶白瓷杯",
+      "description": "质感温润的厚壁白瓷马克杯，盛着热气腾腾、色泽晶莹深红的红糖姜茶，杯面浮着薄薄两片柠檬与红枣片。"
+    },
+    {
+      "id": "prop-wool-gloves",
+      "name": "深灰羊毛手套",
+      "description": "一副保暖防滑的深灰色厚针织羊毛手套，指尖带有些微日常劳作的轻微磨痕。"
+    }
+  ],
+  "shots": [
+    {
+      "id": "shot-001",
+      "title": "檐下避风",
+      "prompt": "微雪纷飞的冬日黄昏，年轻快递员小李抱着大包裹瑟缩着躲进街角花店屋檐下避风，他摘下手套往冻红的手心呵了一口白气。",
+      "imagePrompt": "冬日黄昏街角花店屋檐下，雪花轻扬，暖黄马灯映照下，年轻快递员小李抱着纸箱站立避寒，呼出淡淡白气，画面充满冬日静谧感。",
+      "camera": "中景，平视固定机位，微雪在前中景缓慢飘落。",
+      "dialogue": "小李喃喃自语：“今天的风可真刺骨，还有最后三件得赶在天黑前送完。”",
+      "sound": "呼啸的冬日寒风声，雪花落地的轻微沙沙声，急促而微弱的呼吸呵气声。",
+      "seconds": 8,
+      "sceneId": "scene-flower-eaves",
+      "characterIds": [
+        "char-courier-xiao-li"
+      ],
+      "propIds": [
+        "prop-wool-gloves"
+      ],
+      "continuity": "none"
+    },
+    {
+      "id": "shot-002",
+      "title": "暖阁赠茶",
+      "prompt": "花店旁公寓小客厅内，林奶奶微笑着将一杯热气腾腾的红糖姜茶端到小李手中，小李有些局促地双手接过，眼眶微热。",
+      "imagePrompt": "温馨的老式小客厅里，暖色顶灯洒下柔光，和蔼的林奶奶把冒着滚滚热气的白瓷茶杯递给受宠若惊的年轻快递员，神情满是慈爱关怀。",
+      "camera": "中近景，缓速平移跟随姜茶从老人手中转移至年轻人粗糙的双手中。",
+      "dialogue": "林奶奶柔声说：“小伙子，快趁热把这杯姜茶喝了暖暖身子，大冷天的太辛苦了。”",
+      "sound": "电陶炉上陶壶轻微的咕嘟咕嘟滚水声，瓷杯与木托盘轻碰的清脆声，室内安详的钢琴独奏背景音。",
+      "seconds": 10,
+      "sceneId": "scene-living-room",
+      "characterIds": [
+        "char-grandma-lin",
+        "char-courier-xiao-li"
+      ],
+      "propIds": [
+        "prop-ginger-tea"
+      ],
+      "continuity": "none"
+    },
+    {
+      "id": "shot-003",
+      "title": "重启旅途",
+      "prompt": "客厅窗前，喝完姜茶的小李戴好手套精神饱满地向林奶奶鞠躬道谢，推开门迎向风雪，背影挺拔坚定，脸上洋溢着温暖的微笑。",
+      "imagePrompt": "老式公寓门口，门缝透出室内大片暖黄光晕，喝过热茶的年轻快递员戴好手套大步迈出门槛，回头露出充满力量与感动的灿烂笑容。",
+      "camera": "全景微仰拍，从室内暖光向室外雪景延伸，光影反差烘托人物精神状态。",
+      "dialogue": "小李洪亮回答：“谢谢奶奶！浑身都热乎起来了，我这就出发！”",
+      "sound": "关门声，沉稳踏在雪地上的咯吱咯吱脚步声，高扬温暖的弦乐渐入。",
+      "seconds": 7,
+      "sceneId": "scene-living-room",
+      "characterIds": [
+        "char-grandma-lin",
+        "char-courier-xiao-li"
+      ],
+      "propIds": [
+        "prop-ginger-tea",
+        "prop-wool-gloves"
+      ],
+      "continuity": "none"
+    }
+  ]
+}

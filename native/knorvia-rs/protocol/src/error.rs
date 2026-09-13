@@ -51,7 +51,10 @@ impl std::error::Error for ProtocolError {}
 
 impl ProtocolError {
     pub fn new(category: ErrorCategory, message: impl Into<String>) -> Self {
-        let message = message.into();
+        // Protocol errors are an RPC, logging and often persistence boundary.
+        // Apply the shared bounded sanitizer at construction so a missed
+        // caller-specific wrapper cannot expose an upstream credential.
+        let message = crate::sanitize_diagnostic(&message.into());
         let (code, retryable): (i64, bool) = match category {
             ErrorCategory::InvalidArgument => (-32602, false),
             ErrorCategory::NotInitialized => (-32000, false),

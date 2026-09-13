@@ -6,12 +6,14 @@ mod error;
 mod framing;
 mod handshake;
 mod ids;
+mod sanitize;
 mod types;
 
 pub use error::*;
 pub use framing::*;
 pub use handshake::*;
 pub use ids::*;
+pub use sanitize::*;
 pub use types::*;
 
 pub const PROTOCOL_MAJOR: u32 = 1;

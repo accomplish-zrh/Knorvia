@@ -31,7 +31,7 @@ export function TaskView({ id }: { id: string }) {
 }
 
 function TaskContent({ id }: { id: string }) {
-  const { t, snapshots, readThread, request, refresh, setError, live, connection } = useWorkbench();
+  const { t, snapshots, readThread, request, refresh, setError, live, connection, pinThread } = useWorkbench();
   const router = useRouter();
   const header = useSyncExternalStore(subscribeHeader, getHeader, noHeader);
   const thread = snapshots[id];
@@ -42,6 +42,7 @@ function TaskContent({ id }: { id: string }) {
   const openContent = (target: PanelTarget) => { setDetail(null); setPanel(current => ({ open: true, content: openPanelTab(current.content, target!) })); };
   const openPanel = (mode: PanelMode) => openContent({ kind: mode });
   const closePanel = () => setPanel(current => ({ ...current, open: false }));
+  const [canvasContext, setCanvasContext] = useState(() => readTaskView(id).canvasContext || "");
   const [contextFiles, setContextFiles] = useState<string[]>(() => readTaskView(id).contextFiles);
   const [menu, setMenu] = useState(false);
   const [renaming, setRenaming] = useState(false);
@@ -51,7 +52,9 @@ function TaskContent({ id }: { id: string }) {
   const { scroll, nearBottom, jump, pauseFollowing } = useTaskReading(id, thread ? `${thread.items.length}:${live.filter(item => item.threadId === id).map(item => item.text.length).join(',')}:${thread.pendingApprovals.length}` : undefined);
   const menuAnchor = useRef<HTMLDivElement>(null);
 
-  useEffect(() => { saveTaskView(id, { panel, contextFiles }); }, [id, panel, contextFiles]);
+  useEffect(() => { saveTaskView(id, { panel, contextFiles, canvasContext }); }, [id, panel, contextFiles, canvasContext]);
+  // B12: the visible task's session stays pinned in the bounded cache.
+  useEffect(() => pinThread(id), [id, pinThread]);
 
   useEffect(() => {
     const keyboard = (event: KeyboardEvent) => {
@@ -129,9 +132,9 @@ function TaskContent({ id }: { id: string }) {
     <div className="nw-task-center">
       <ConversationNavigation thread={thread} scroll={scroll} searching={searching} setSearching={setSearching} navigate={pauseFollowing} /><div ref={scroll} className="nw-task-scroll"><div className="nw-task-content"><TaskTimeline thread={thread} /></div></div>
 
-      <div className="nw-task-composer">{!nearBottom && <button className="nw-jump" onClick={jump}><ArrowDown size={15} />{t("回到最新", "Jump to latest")}</button>}{thread.status === "archived" ? <div className="nw-archived-notice"><Archive size={19} /><div><strong>{t("这个任务已归档", "This task is archived")}</strong><p>{t("历史记录仍可查看，恢复后可以继续。", "Your history is available. Unarchive to continue working.")}</p></div><button className="nw-button" disabled={pending} onClick={() => void action("thread/unarchive", { id })}><RotateCcw size={14} />{t("恢复任务", "Unarchive")}</button></div> : thread.goalId ? <ConversationGoal thread={thread}>{goal => <TaskComposer thread={thread} goal={goal} contextFiles={contextFiles} onRemoveContextFile={path => setContextFiles(current => current.filter(value => value !== path))} onContextFilesUsed={paths => setContextFiles(current => current.filter(value => !paths.includes(value)))} />}</ConversationGoal> : <TaskComposer thread={thread} contextFiles={contextFiles} onRemoveContextFile={path => setContextFiles(current => current.filter(value => value !== path))} onContextFilesUsed={paths => setContextFiles(current => current.filter(value => !paths.includes(value)))} />}</div>
+      <div className="nw-task-composer">{!nearBottom && <button className="nw-jump" onClick={jump}><ArrowDown size={15} />{t("回到最新", "Jump to latest")}</button>}{thread.status === "archived" ? <div className="nw-archived-notice"><Archive size={19} /><div><strong>{t("这个任务已归档", "This task is archived")}</strong><p>{t("历史记录仍可查看，恢复后可以继续。", "Your history is available. Unarchive to continue working.")}</p></div><button className="nw-button" disabled={pending} onClick={() => void action("thread/unarchive", { id })}><RotateCcw size={14} />{t("恢复任务", "Unarchive")}</button></div> : thread.goalId ? <ConversationGoal thread={thread}>{goal => <TaskComposer canvasContext={canvasContext} onCanvasContextUsed={text => setCanvasContext(current => current === text ? "" : current)} thread={thread} goal={goal} contextFiles={contextFiles} onRemoveContextFile={path => setContextFiles(current => current.filter(value => value !== path))} onContextFilesUsed={paths => setContextFiles(current => current.filter(value => !paths.includes(value)))} />}</ConversationGoal> : <TaskComposer canvasContext={canvasContext} onCanvasContextUsed={text => setCanvasContext(current => current === text ? "" : current)} thread={thread} contextFiles={contextFiles} onRemoveContextFile={path => setContextFiles(current => current.filter(value => value !== path))} onContextFilesUsed={paths => setContextFiles(current => current.filter(value => !paths.includes(value)))} />}</div>
     </div>{detail === "resources" && <TaskResources thread={thread} close={() => setDetail(null)} openFiles={(path, folder) => openContent(path ? { kind: "file", path } : { kind: "files", folder })} openOutput={artifact => openContent({ kind: "artifact", artifact })} />}
-    <TaskPanel thread={thread} open={panel.open} state={panel.content} setState={update => setPanel(current => ({ ...current, content: typeof update === "function" ? update(current.content) : update }))} openContent={openContent} close={closePanel} onUseFile={path => setContextFiles(current => current.includes(path) ? current : [...current, path].slice(-20))} />
+    <TaskPanel onUseCanvas={setCanvasContext} thread={thread} open={panel.open} state={panel.content} setState={update => setPanel(current => ({ ...current, content: typeof update === "function" ? update(current.content) : update }))} openContent={openContent} close={closePanel} onUseFile={path => setContextFiles(current => current.includes(path) ? current : [...current, path].slice(-20))} />
       {renaming && <Modal title={t("重命名任务", "Rename task")} close={() => setRenaming(false)}><form onSubmit={event => { event.preventDefault(); if (title.trim()) void action("thread/update", { id, title: title.trim(), expectedRevision: thread.revision }); }}><label className="nw-field">{t("任务名称", "Task name")}<input autoFocus value={title} onChange={event => setTitle(event.target.value)} required /></label><div className="nw-dialog-actions"><button type="button" className="nw-button" onClick={() => setRenaming(false)}>{t("取消", "Cancel")}</button><button className="nw-button nw-button-primary" disabled={pending || !title.trim()}>{t("保存", "Save")}</button></div></form></Modal>}
     </div></PanelContext.Provider>;
 }

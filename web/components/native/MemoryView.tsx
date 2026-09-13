@@ -31,53 +31,15 @@ import {
   ZoomIn,
   ZoomOut,
   ChevronRight,
+  ScanSearch,
   X,
 } from "lucide-react";
 import { errorText, useWorkbench } from "./NativeWorkbenchProvider";
+import { MemoryDuplicatesPanel } from "./MemoryDuplicatesPanel";
 import { memoryGraphLayout, memoryGraphPreview } from "@/lib/native-memory-graph";
+import type { MemoryRecord, MemoryRevisionEvent, RecallTrace } from "./memory-types";
 import type { NativeBotProfile, NativeRoom } from "@/lib/knorvia-native-types";
 import "./memory.css";
-
-type SourceRef = { kind: string; id: string; note?: string };
-type Relation = { targetId: string; relationType: string; inferred: boolean };
-
-type MemoryRecord = {
-  id: string;
-  revision: number;
-  scope: { owner: string; workspace: string; bot: string; conversation: string };
-  sharedScopes?: Array<{ owner: string; workspace: string; bot: string; conversation: string }>;
-  kind: string;
-  content: string;
-  sourceRefs: SourceRef[];
-  relation?: Relation;
-  createdAtMs: number;
-  validFromMs: number;
-  validToMs?: number | null;
-  status: string;
-  mergedInto?: string | null;
-  pinned: boolean;
-  useCount: number;
-  lastUsedAtMs?: number | null;
-  recordedAtMs: number;
-};
-
-type MemoryRevisionEvent = {
-  currentStatus?: string;
-  currentRevision?: number;
-  currentPinned?: boolean;
-  record: MemoryRecord;
-  action: string;
-  actor: string;
-  atMs: number;
-  note?: string | null;
-};
-
-type RecallTrace = {
-  id: string;
-  atMs: number;
-  query: string;
-  hits: Array<{ recordId: string; revision: number; score: number; matchedTerms: string[]; reasons: string[] }>;
-};
 
 type GraphPayload = {
   nodes: Array<{ id: string; kind: string; contentPreview: string; pinned: boolean; useCount: number; status: string; updatedAtMs: number }>;
@@ -113,7 +75,7 @@ function fmtTime(ms: number, utc: boolean) {
 
 export function MemoryView() {
   const { request, t, connection, workspaces, setNotice, theme } = useWorkbench();
-  const [tab, setTab] = useState<"timeline" | "graph" | "search">("graph");
+  const [tab, setTab] = useState<"timeline" | "graph" | "search" | "tidy">("graph");
   const [bots, setBots] = useState<NativeBotProfile[]>([]);
   const [rooms, setRooms] = useState<NativeRoom[]>([]);
   const [workspaceId, setWorkspaceId] = useState("");
@@ -419,7 +381,7 @@ export function MemoryView() {
       <label className="nw-memory-forgotten"><input type="checkbox" checked={includeForgotten} onChange={event => setIncludeForgotten(event.target.checked)} />{t("包含已遗忘", "Include forgotten")}</label>
     </div>
     <div className="nw-memory-viewbar">
-      <div className="nw-memory-tabs" role="group" aria-label={t("记忆视图", "Memory views")}>{([["graph", Network, "关系图", "Connections"], ["timeline", History, "时间线", "Timeline"], ["search", Search, "检索", "Search"]] as const).map(([id, Icon, zh, en]) => <button key={id} aria-pressed={tab === id} onClick={() => setTab(id)}><Icon size={15} />{t(zh, en)}</button>)}</div>
+      <div className="nw-memory-tabs" role="group" aria-label={t("记忆视图", "Memory views")}>{([["graph", Network, "关系图", "Connections"], ["timeline", History, "时间线", "Timeline"], ["search", Search, "检索", "Search"], ["tidy", ScanSearch, "整理", "Tidy"]] as const).map(([id, Icon, zh, en]) => <button key={id} aria-pressed={tab === id} onClick={() => setTab(id)}><Icon size={15} />{t(zh, en)}</button>)}</div>
       <span className="nw-memory-count">{loading ? <Loader2 size={14} className="nw-spin" aria-label={t("加载中", "Loading")} /> : <><strong>{nodeCount}{graph?.truncated ? "+" : ""}</strong> {t("条记忆", "memories")}<i />{graph?.edges.length ?? 0} {t("个联系", "connections")}</>}</span>
     </div>
     {error && <p className="nw-inline-error" role="alert">{error}</p>}
@@ -442,6 +404,7 @@ export function MemoryView() {
             return <article key={`${event.record.id}-${event.record.revision}-${index}`} className={`nw-mem-card nw-memory-event${status !== "active" ? " is-inactive" : ""}`}><header>{chip(event.record.kind)}<strong>{t(label.zh, label.en)}</strong><time>{fmtTime(event.atMs, utc)}</time></header><p>{event.record.content}</p><footer><button className="nw-button nw-button-small" onClick={() => void openRecord(event.record.id)}><Eye size={14} />{t("证据与历史", "Evidence & history")}</button>{status === "active" && <><button className="nw-button nw-button-small" disabled={busyId === event.record.id} onClick={() => void act(event.record.id, revision, "memory/pin", { pinned: !pinned })}>{pinned ? <PinOff size={13} /> : <Pin size={13} />}{pinned ? t("取消固定", "Unpin") : t("固定", "Pin")}</button><button className="nw-button nw-button-small" disabled={busyId === event.record.id} onClick={() => void act(event.record.id, revision, "memory/forget", {})}><Eraser size={13} />{t("遗忘", "Forget")}</button></>}{status === "forgotten" && <button className="nw-button nw-button-small" disabled={busyId === event.record.id} onClick={() => void act(event.record.id, revision, "memory/restore", {})}><RotateCcw size={13} />{t("恢复", "Restore")}</button>}</footer></article>;
           })}
         </section>}
+        {tab === "tidy" && <MemoryDuplicatesPanel key={JSON.stringify(scope)} scope={scope} onChanged={() => void load()} />}
         {tab === "search" && <section className="nw-mem-list" aria-label={t("检索结果", "Search results")}>
           <form className="nw-memory-search" onSubmit={event => { event.preventDefault(); void runSearch(); }}><Search size={18} /><input aria-label={t("检索记忆", "Search memory")} placeholder={t("回忆一件事，输入关键词…", "Find a memory by keyword…")} value={query} maxLength={512} onChange={event => setQuery(event.target.value)} /><button className="nw-button" disabled={!query.trim() || loading || connection !== "connected"}>{t("检索", "Search")}</button></form>
           {!trace ? <p className="nw-help">{t("只检索当前范围内的记忆。", "Search stays within the selected scope.")}</p> : <p className="nw-help">{t(`找到 ${trace.hits.length} 条相关记忆，选择一条查看召回依据。`, `${trace.hits.length} related memories. Select one to inspect its recall evidence.`)}</p>}

@@ -215,7 +215,8 @@ fn anthropic_thinking_budget(req: &CanonicalRequest) -> i64 {
     }
 }
 
-fn requested_flags(req: &CanonicalRequest) -> impl Fn(&str) -> bool + '_ {    let has_images = !req.images.is_empty() || req.messages.iter().any(|m| !m.images.is_empty());
+fn requested_flags(req: &CanonicalRequest) -> impl Fn(&str) -> bool + '_ {
+    let has_images = !req.images.is_empty() || req.messages.iter().any(|m| !m.images.is_empty());
     let has_tools = !req.tools.is_empty();
     let stream = req.stream;
     let parallel = req.parallel_tools;
@@ -230,7 +231,7 @@ fn requested_flags(req: &CanonicalRequest) -> impl Fn(&str) -> bool + '_ {    le
         "images" => has_images,
         "reasoning" => reasoning,
         "prompt_cache" => cache,
-        "cancellation" => true,
+        "cancellation" => false,
         _ => false,
     }
 }
@@ -283,7 +284,7 @@ fn capability_in_body(name: &str, body: &Value, endpoint: &str, kind: ProviderKi
         "prompt_cache" => {
             body.get("prompt_cache_key").is_some() || body_contains_cache_control(body)
         }
-        "cancellation" => true,
+        "cancellation" => false,
         _ => false,
     }
 }
@@ -715,7 +716,8 @@ fn body_anthropic(req: &CanonicalRequest, allow: &impl Fn(&str) -> bool) -> Valu
         body["tools"] = json!(tools);
     }
     if allow("reasoning") {
-        body["thinking"] = json!({"type": "enabled", "budget_tokens": anthropic_thinking_budget(req)});
+        body["thinking"] =
+            json!({"type": "enabled", "budget_tokens": anthropic_thinking_budget(req)});
     }
     body
 }
@@ -839,7 +841,10 @@ mod effort_tests {
         let mut r = req(Some("high"));
         r.model = "text-embedding-mini".into();
         let tx = translate(ProviderKind::OpenAiResponses, r).unwrap();
-        assert!(tx.body.get("reasoning").is_none(), "capability negotiation keeps unsupported models clean");
+        assert!(
+            tx.body.get("reasoning").is_none(),
+            "capability negotiation keeps unsupported models clean"
+        );
     }
 
     #[test]
@@ -847,7 +852,11 @@ mod effort_tests {
         let tx = translate(ProviderKind::OpenAiResponses, req(Some("HIGH"))).unwrap();
         assert_eq!(tx.body["reasoning"]["effort"], json!("high"));
         let tx = translate(ProviderKind::OpenAiResponses, req(None)).unwrap();
-        assert_eq!(tx.body["reasoning"]["effort"], json!("medium"), "no request keeps the protocol default");
+        assert_eq!(
+            tx.body["reasoning"]["effort"],
+            json!("medium"),
+            "no request keeps the protocol default"
+        );
     }
 
     #[test]
@@ -864,8 +873,15 @@ mod effort_tests {
         // Gemini has no numeric strength in this gateway: thinking stays
         // a visibility flag and no effort field is invented.
         let tx = translate(ProviderKind::Gemini, req(Some("high"))).unwrap();
-        assert_eq!(tx.body["generationConfig"]["thinkingConfig"]["includeThoughts"], json!(true));
-        assert!(tx.body["generationConfig"]["thinkingConfig"].get("effort").is_none());
+        assert_eq!(
+            tx.body["generationConfig"]["thinkingConfig"]["includeThoughts"],
+            json!(true)
+        );
+        assert!(
+            tx.body["generationConfig"]["thinkingConfig"]
+                .get("effort")
+                .is_none()
+        );
         // reasoning=false never emits strength fields anywhere.
         let mut off = req(Some("high"));
         off.reasoning = false;

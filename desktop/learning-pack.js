@@ -12,6 +12,8 @@
 // evidence is visible after the source updates.
 
 const crypto = require('node:crypto');
+const { createLearningPractice } = require('./learning-practice');
+const { createCreativeBrief } = require('./creative-brief');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const TEXT_SUFFIX = /\.(md|txt|json|csv|tsv|log|ya?ml|toml|ini|html?|css|js|mjs|cjs|ts|tsx|jsx|py|rs|go|java|c|cpp|h|sh|ps1|bat|sql|xml)$/i;
@@ -473,7 +475,20 @@ function createLearningPack({ home, library, studio, rpc } = {}) {
     return undefined;
   }
 
-  return { commands, toolDescriptors, callTool, root: 'learning' };
+  const practice = createLearningPractice({ library, learning: { commands } });
+  const brief = createCreativeBrief({ library });
+  return {
+    commands: { ...commands, ...practice.commands, ...brief.commands },
+    toolDescriptors: () => [...toolDescriptors(), ...practice.toolDescriptors(), ...brief.toolDescriptors()],
+    async callTool(name, params = {}) {
+      for (const domain of [practice, brief]) {
+        const result = await domain.callTool(name, params);
+        if (result !== undefined) return result;
+      }
+      return callTool(name, params);
+    },
+    root: 'learning',
+  };
 }
 
 module.exports = { createLearningPack };

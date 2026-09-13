@@ -9,10 +9,10 @@ const { Server, utils } = require('ssh2');
 const { createSshSessions, relativeRemote } = require('../ssh-session');
 const { createSshStore } = require('../ssh-store');
 const STATUS = utils.sftp.STATUS_CODE;
-async function fixture(t) {
+async function fixture(t, options = {}) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'knorvia-ssh-')), remote = path.join(home, 'remote'); fs.mkdirSync(remote); fs.writeFileSync(path.join(remote, 'hello.txt'), '你好 remote');
   const key = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey.export({ format: 'pem', type: 'pkcs1' });
-  const received = [], sizes = [], clients = new Set();
+  const received = [], sizes = [], clients = new Set(); const openDirs = new Set();
   const server = new Server({ hostKeys: [key] }, client => {
     clients.add(client); client.on('error', () => {}); client.on('close', () => clients.delete(client));
     client.on('authentication', ctx => ctx.method === 'password' && ctx.username === 'fixture' && ctx.password === 'fixture-only-secret' ? ctx.accept() : ctx.reject());
@@ -28,13 +28,17 @@ async function fixture(t) {
         const done = (id, work) => { try { work(); } catch (error) { sftp.status(id, error.code === 'ENOENT' ? STATUS.NO_SUCH_FILE : STATUS.FAILURE); } };
         sftp.on('REALPATH', (id, name) => sftp.name(id, [{ filename: name === '.' ? '/workspace' : name === '/workspace/escape' ? '/outside/secret' : name, longname: name, attrs: {} }]));
         for (const method of ['STAT', 'LSTAT']) sftp.on(method, (id, name) => done(id, () => sftp.attrs(id, attrs(fs.statSync(local(name))))));
-        sftp.on('OPENDIR', (id, name) => done(id, () => { const handle = Buffer.alloc(4); handle.writeUInt32BE(++next); handles.set(next, { entries: fs.readdirSync(local(name)).map(filename => ({ filename, longname: filename, attrs: attrs(fs.statSync(path.join(local(name), filename))) })), sent: false }); sftp.handle(id, handle); }));
-        sftp.on('READDIR', (id, handle) => done(id, () => { const dir = handles.get(handle.readUInt32BE()); if (dir.sent || !dir.entries.length) sftp.status(id, STATUS.EOF); else { dir.sent = true; sftp.name(id, dir.entries); } }));
+        sftp.on('OPENDIR', (id, name) => done(id, () => { const handle = Buffer.alloc(4); handle.writeUInt32BE(++next); const dirPath = local(name); const base = path.basename(dirPath); let entries;
+          if (base === 'dots-only') entries = ['.', '..'].map(filename => ({ filename, longname: filename, attrs: attrs(fs.statSync(dirPath)) }));
+          else if (base === 'huge-batch') entries = Array.from({ length: 5200 }, (_, i) => ({ filename: `bulk-${String(i).padStart(4, '0')}`, longname: '', attrs: attrs(fs.statSync(dirPath)) }));
+          else entries = fs.readdirSync(dirPath).map(filename => ({ filename, longname: filename, attrs: attrs(fs.statSync(path.join(dirPath, filename))) }));
+          handles.set(next, { entries, sent: false, emptyBatch: base === 'empty-batch' }); openDirs.add(next); sftp.handle(id, handle); }));
+        sftp.on('READDIR', (id, handle) => done(id, () => { const dir = handles.get(handle.readUInt32BE()); if (dir.emptyBatch) { dir.emptyBatch = false; sftp.name(id, []); return; } if (dir.sent || !dir.entries.length) sftp.status(id, STATUS.EOF); else { dir.sent = true; sftp.name(id, dir.entries); } }));
         sftp.on('OPEN', (id, name, flags) => done(id, () => { const handle = Buffer.alloc(4); handle.writeUInt32BE(++next); const fd = fs.openSync(local(name), flags & 2 ? 'w' : 'r'); handles.set(next, fd); sftp.handle(id, handle); }));
         sftp.on('READ', (id, handle, offset, length) => done(id, () => { const data = Buffer.alloc(length); const read = fs.readSync(handles.get(handle.readUInt32BE()), data, 0, length, offset); if (read) sftp.data(id, data.subarray(0, read)); else sftp.status(id, STATUS.EOF); }));
         sftp.on('WRITE', (id, handle, offset, data) => done(id, () => { fs.writeSync(handles.get(handle.readUInt32BE()), data, 0, data.length, offset); sftp.status(id, STATUS.OK); }));
         sftp.on('FSTAT', (id, handle) => done(id, () => sftp.attrs(id, attrs(fs.fstatSync(handles.get(handle.readUInt32BE()))))));
-        sftp.on('CLOSE', (id, handle) => done(id, () => { const h = handle.readUInt32BE(); if (typeof handles.get(h) === 'number') fs.closeSync(handles.get(h)); handles.delete(h); sftp.status(id, STATUS.OK); }));
+        sftp.on('CLOSE', (id, handle) => done(id, () => { const h = handle.readUInt32BE(); if (typeof handles.get(h) === 'number') fs.closeSync(handles.get(h)); handles.delete(h); openDirs.delete(h); sftp.status(id, STATUS.OK); }));
         sftp.on('RENAME', (id, from, to) => done(id, () => { if (fs.existsSync(local(to))) return sftp.status(id, STATUS.FAILURE); fs.renameSync(local(from), local(to)); sftp.status(id, STATUS.OK); }));
         sftp.on('REMOVE', (id, name) => done(id, () => { fs.unlinkSync(local(name)); sftp.status(id, STATUS.OK); }));
         sftp.on('close', () => { for (const fd of handles.values()) try { fs.closeSync(fd); } catch {} });
@@ -44,10 +48,10 @@ async function fixture(t) {
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   t.after(async () => { for (const client of clients) client.end(); await new Promise(resolve => server.close(resolve)); });
   const rpc = async (method, p) => ({ workspace: { id: 'fixture', cwd: home }, absolutePath: path.join(home, p.path), kind: fs.statSync(path.join(home, p.path)).isDirectory() ? 'directory' : 'file' });
-  const manager = createSshSessions({ home, rpc, readyTimeout: 3000 }); t.after(() => manager.dispose());
+  const manager = createSshSessions({ home, rpc, readyTimeout: 3000, ...options }); t.after(() => manager.dispose());
   const call = (method, params = {}) => manager.handlers[method](params);
   const host = await call('ssh/host/save', { name: 'Fixture', hostname: '127.0.0.1', port: server.address().port, username: 'fixture', auth: 'password', root: '/workspace' });
-  return { home, remote, manager, call, host, received, sizes, disconnect: () => { for (const client of clients) client.end(); } };
+  return { home, remote, manager, call, host, received, sizes, openDirCount: () => openDirs.size, disconnect: () => { for (const client of clients) client.end(); } };
 }
 test('real SSH host trust, PTY, idempotent input, SFTP and cancellation', async t => {
   const f = await fixture(t), credentials = { hostId: f.host.id, cols: 80, rows: 24, secret: 'fixture-only-secret' };
@@ -78,14 +82,14 @@ test('real SSH host trust, PTY, idempotent input, SFTP and cancellation', async 
 test('host changes clear stored credentials and stale revisions are rejected', async t => {
   const f = await fixture(t); const fakeStorage = { isEncryptionAvailable: () => true, encryptString: value => Buffer.from(`encrypted:${value}`), decryptString: value => value.toString().slice(10) };
   const store = createSshStore({ home: f.home, safeStorage: fakeStorage });
-  let host = store.save({ ...f.host, secret: 'one-host-only' }); assert.equal(host.hasSecret, true);
-  host = store.save({ ...host, hostname: 'different.example' }); assert.equal(host.hasSecret, false);
+  let host = await store.save({ ...f.host, secret: 'one-host-only' }); assert.equal(host.hasSecret, true);
+  host = await store.save({ ...host, hostname: 'different.example' }); assert.equal(host.hasSecret, false);
   await assert.rejects(f.call('ssh/host/save', { ...f.host, revision: 0 }));
   for (const value of ['../a', '/etc/passwd', 'a/../../b', 'a\\b', 'a\0b']) assert.throws(() => relativeRemote(value));
 });
 test('a changed host fingerprint cannot be trusted without explicit replacement', async t => {
   const f = await fixture(t); f.manager.dispose();
-  const store = createSshStore({ home: f.home }); const host = store.update(f.host.id, f.host.revision, { fingerprint: 'SHA256:previous-server' });
+  const store = createSshStore({ home: f.home }); const host = await store.update(f.host.id, f.host.revision, { fingerprint: 'SHA256:previous-server' });
   const manager = createSshSessions({ home: f.home, readyTimeout: 3000 }); t.after(() => manager.dispose());
   const call = (method, params) => manager.handlers[method](params);
   await assert.rejects(call('ssh/open', { sessionId: randomUUID(), hostId: host.id, cols: 80, rows: 24, secret: 'fixture-only-secret' }), e => e.rpc.code === -32087);
@@ -114,4 +118,101 @@ test('long SSH output remains bounded, Ctrl+C is delivered, and disconnect does 
   f.disconnect(); for (let n = 0; n < 50; n++) { if ((await f.call('ssh/read', { sessionId, cursor: output.cursor })).status !== 'ready') break; await new Promise(resolve => setTimeout(resolve, 10)); }
   await assert.rejects(f.call('ssh/write', { sessionId, seq: 3, data: 'must-not-replay' }));
   const next = await f.call('ssh/open', { ...credentials, sessionId: randomUUID() }); assert.equal(next.inputSeq, 0); assert.equal(f.received.some(value => value.includes('must-not-replay')), false);
+});
+// ---- C03 nightshift additions: bounded cursor pagination ----
+const trustAndOpen = async f => {
+  const credentials = { hostId: f.host.id, cols: 80, rows: 24, secret: 'fixture-only-secret' };
+  await assert.rejects(f.call('ssh/open', { ...credentials, sessionId: randomUUID() }));
+  const challenge = (await f.call('ssh/host/list')).pendingTrust[0];
+  await f.call('ssh/host/trust', { id: f.host.id, revision: f.host.revision, fingerprint: challenge.fingerprint });
+  const sessionId = randomUUID();
+  await f.call('ssh/open', { ...credentials, sessionId });
+  return sessionId;
+};
+
+async function untilOpenDirs(f, expected, timeoutMs = 5000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (f.openDirCount() <= expected) return;
+    if (Date.now() > deadline) throw new Error(`remote handles did not drop to ${expected} within ${timeoutMs}ms (still ${f.openDirCount()})`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+}
+test('a 1251-entry directory pages through a bound cursor with no misses and no duplicates', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  for (let i = 0; i < 1250; i++) fs.writeFileSync(path.join(f.remote, `entry-${String(i).padStart(4, '0')}.txt`), 'x');
+  const sessionId = await trustAndOpen(f);
+  const seen = [];
+  let cursor, pages = 0;
+  for (;;) {
+    const page = await f.call('ssh/files/list', { sessionId, path: '', limit: 400, cursor });
+    seen.push(...page.entries.map(e => e.name));
+    pages += 1;
+    if (!page.hasMore) { assert.equal(page.cursor, null, 'finished listings close with a null cursor'); break; }
+    assert.match(page.cursor, /^[a-f\d]{8}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{4}-[a-f\d]{12}$/);
+    cursor = page.cursor;
+    assert.ok(pages < 20, 'pagination must terminate');
+  }
+  assert.equal(pages, 4, '400+400+400+51 pages over 1251 entries');
+  const expected = fs.readdirSync(f.remote).sort();
+  assert.deepEqual([...new Set(seen)].sort(), expected, 'every entry exactly once');
+  assert.equal(seen.length, expected.length, 'no duplicate entries across pages');
+  await new Promise(resolve => setTimeout(resolve, 100));
+  assert.equal(f.openDirCount(), 0, 'EOF releases the remote directory handle');
+  // Directory switch invalidates the cursor: it stays bound to one directory.
+  fs.mkdirSync(path.join(f.remote, 'sub'));
+  const first = await f.call('ssh/files/list', { sessionId, path: '', limit: 10 });
+  assert.equal(f.openDirCount(), 1);
+  await assert.rejects(
+    f.call('ssh/files/list', { sessionId, path: 'sub', cursor: first.cursor, limit: 10 }),
+    e => e.rpc.code === -32005,
+  );
+  // Escape attempts stay refused even with a live cursor.
+  await assert.rejects(f.call('ssh/files/list', { sessionId, path: 'escape', cursor: first.cursor, limit: 10 }), e => e.rpc.code === -32088);
+  // Unknown or expired cursors are a clear refresh error.
+  await assert.rejects(f.call('ssh/files/list', { sessionId, path: '', cursor: randomUUID(), limit: 10 }), e => e.rpc.code === -32005);
+  // A fresh page of the original directory still works after those refusals.
+  const still = await f.call('ssh/files/list', { sessionId, path: '', cursor: first.cursor, limit: 10 });
+  assert.equal(still.entries.length, 10);
+});
+test('explicit cancel, session close and per-session listing bounds release remote handles', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  for (let i = 0; i < 30; i++) fs.writeFileSync(path.join(f.remote, `f${String(i).padStart(2, '0')}.txt`), 'x');
+  const sessionId = await trustAndOpen(f);
+  const one = await f.call('ssh/files/list', { sessionId, path: '', limit: 5 });
+  assert.equal(f.openDirCount(), 1);
+  const cancelled = await f.call('ssh/files/list', { sessionId, cursor: one.cursor, cancel: true });
+  assert.equal(cancelled.canceled, true);
+  assert.equal(cancelled.released, 1);
+  await untilOpenDirs(f, 0);
+  await assert.rejects(f.call('ssh/files/list', { sessionId, path: '', cursor: one.cursor, limit: 5 }), e => e.rpc.code === -32005, 'cancelled cursor is gone');
+  // Per-session bound: opening a fifth listing releases the oldest handle.
+  const cursors = [];
+  for (let i = 0; i < 5; i++) {
+    const page = await f.call('ssh/files/list', { sessionId, path: '', limit: 1 });
+    cursors.push(page.cursor);
+  }
+  await untilOpenDirs(f, 4);
+  await assert.rejects(f.call('ssh/files/list', { sessionId, path: '', cursor: cursors[0], limit: 1 }), e => e.rpc.code === -32005, 'evicted listing is refused');
+  const kept = await f.call('ssh/files/list', { sessionId, path: '', cursor: cursors[4], limit: 1 });
+  assert.equal(kept.entries.length, 1);
+  // Session close releases every remaining remote handle.
+  await f.call('ssh/close', { sessionId });
+  await untilOpenDirs(f, 0);
+});
+test('listing cursors fail clearly after disconnect and never replay anything', { timeout: 20000 }, async t => {
+  const f = await fixture(t);
+  const sessionId = await trustAndOpen(f);
+  const page = await f.call('ssh/files/list', { sessionId, path: '', limit: 5 });
+  f.disconnect();
+  const until = require('node:timers/promises').setTimeout;
+  for (let n = 0; n < 100; n++) {
+    const list = await f.call('ssh/list');
+    if (!list.some(s => s.sessionId === sessionId && s.status === 'ready')) break;
+    await until(20);
+  }
+  await assert.rejects(
+    f.call('ssh/files/list', { sessionId, path: '', cursor: page.cursor, limit: 5 }),
+    e => { assert.equal(e.rpc.code, -32085); assert.match(e.rpc.message, /reconnect|connection ended/i); return true; },
+  );
 });

@@ -5,10 +5,11 @@ const fsp = fs.promises;
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { setTimeout: delay } = require('node:timers/promises');
+const { createLibrarySearchIndex } = require('./library-search-index');
 
 const MAX_FILE = 256 * 1024 * 1024;
 const CHUNK = 512 * 1024;
-const METHODS = ['library/info', 'library/list', 'library/search', 'library/folder', 'library/read', 'library/write', 'library/upload/start', 'library/upload/chunk', 'library/upload/finish', 'library/upload/cancel', 'library/move', 'library/trash', 'library/restore', 'library/versions', 'library/revert', 'library/workspace', 'library/import-project'];
+const METHODS = ['library/info', 'library/list', 'library/search', 'library/folder', 'library/read', 'library/write', 'library/upload/start', 'library/upload/chunk', 'library/upload/finish', 'library/upload/cancel', 'library/move', 'library/trash', 'library/restore', 'library/versions', 'library/revert', 'library/workspace', 'library/import-project', 'library/storage/plan', 'library/storage/cleanup'];
 function fail(message, code = -32602) { const error = new Error(message); error.rpc = { code, message }; throw error; }
 const hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
 async function fileHash(file) { const value = crypto.createHash('sha256'); for await (const chunk of fs.createReadStream(file)) value.update(chunk); return value.digest('hex'); }
@@ -32,6 +33,8 @@ function createPersonalLibrary({ home, rpc } = {}) {
   const content = path.join(root, 'files');
   const meta = path.join(root, '.knorvia-library');
   const indexFile = path.join(meta, 'index.json');
+  const admitted = new Set();
+  let closing = false;
   async function persist(index) { const temporary = `${indexFile}.${uid()}.tmp`; await fsp.writeFile(temporary, JSON.stringify(index), { flush: true }); await fsp.rename(temporary, indexFile); }
   let initialization;
   async function initialize() {
@@ -40,7 +43,7 @@ function createPersonalLibrary({ home, rpc } = {}) {
       for (const dir of ['versions', 'uploads', 'tools', 'trash']) await fsp.mkdir(path.join(meta, dir), { recursive: true });
       // The portable Node helper gives the actual Kernel the same reversible operations as the UI.
       if (path.resolve(__dirname) !== path.resolve(meta, 'tools')) {
-        for (const name of ['personal-library.js', 'personal-library-cli.js']) {
+        for (const name of ['personal-library.js', 'personal-library-cli.js', 'library-search-index.js']) {
           const source = await fsp.readFile(path.join(__dirname, name)), target = path.join(meta, 'tools', name);
           if (await fsp.readFile(target).then(value => value.equals(source)).catch(() => false)) continue;
           const temporary = `${target}.${uid()}.tmp`; await fsp.writeFile(temporary, source); await fsp.rename(temporary, target);
@@ -114,6 +117,10 @@ function createPersonalLibrary({ home, rpc } = {}) {
   }
   async function scan(index) {
     const present = new Set(), folders = []; let scanned = 0, limited = false;
+    // P04: path lookup table replaces the per-file linear find that made
+    // every scan O(entries x files) as the library grows.
+    const activeByPath = new Map();
+    for (const entry of index.entries) if (!entry.trashedAt && !activeByPath.has(entry.path)) activeByPath.set(entry.path, entry);
     // A folder and its recovery receipt are separate from the catalog. Reconcile
     // a process exit after the folder rename but before the catalog commit.
     for (const name of await fsp.readdir(path.join(meta, 'trash'))) if (/^[\da-f-]{36}\.json$/.test(name)) {
@@ -135,7 +142,7 @@ function createPersonalLibrary({ home, rpc } = {}) {
         if (dirent.isDirectory()) { folders.push(child); await walk(path.join(directory, dirent.name), child, depth + 1); }
         else if (dirent.isFile()) {
           present.add(child); const file = path.join(directory, dirent.name), stat = await fsp.stat(file);
-          const old = index.entries.find(entry => !entry.trashedAt && entry.path === child);
+          const old = activeByPath.get(child);
           if (stat.size <= MAX_FILE && (!old || stat.size !== old.size || stat.mtimeMs !== old.mtimeMs)) await snapshot(index, child, file, old);
         }
       }
@@ -145,6 +152,68 @@ function createPersonalLibrary({ home, rpc } = {}) {
     return { folders, limited };
   }
   const publicEntry = entry => ({ id: entry.id, path: entry.path, name: entry.name, sha256: entry.sha256, size: entry.size, modifiedAt: entry.modifiedAt, ...(entry.accessedAt ? { accessedAt: entry.accessedAt } : {}), trashedAt: entry.trashedAt, folder: entry.folder === true, ...(entry.parentTrash ? { parentTrash: entry.parentTrash } : {}), versions: entry.versions.length });
+  // Identity guard for path-addressed operations: when the caller pins the
+  // entry it saw (id and/or content hash), verify it after the scan and
+  // BEFORE any filesystem access. Absent fields keep the old single-item
+  // behaviour; a replaced, renamed, edited or vanished file fails as a
+  // Conflict — including the "path is now empty" case, which must not leak
+  // a raw ENOENT ahead of the guard.
+  function expectIdentity(index, rawPath, params) {
+    if (params.expectedId === undefined && params.expectedSha256 === undefined) return;
+    const rel = relative(rawPath);
+    const entry = index.entries.find(item => !item.trashedAt && item.path === rel);
+    if (!entry) fail('所选资料已不存在，请刷新后重试', -32005);
+    if (params.expectedId !== undefined && entry.id !== params.expectedId) fail('所选资料已被替换或重命名，请刷新后重试', -32005);
+    if (params.expectedSha256 !== undefined && entry.sha256 !== params.expectedSha256) fail('所选资料内容已更新，请刷新后重试', -32005);
+  }
+  // Reclaimable-space preview: superseded history versions, trash contents
+  // and orphaned version files. Computation only — this never deletes.
+  async function computeReclaimPlan(index) {
+    const deletions = [];
+    let trashBytes = 0, trashItems = 0, historyBytes = 0, historyVersions = 0, workingBytes = 0, keptVersionsBytes = 0;
+    const catalogued = new Set(index.entries.map(entry => entry.id));
+    for (const entry of index.entries) {
+      if (entry.trashedAt) {
+        if (entry.parentTrash) continue; // counted with its folder
+        const bytes = entry.folder ? (entry.size || 0) : (entry.versions || []).reduce((sum, v) => sum + (v.size || 0), 0);
+        deletions.push({ kind: entry.folder ? 'trash-folder' : 'trash-file', id: entry.id, path: entry.path, bytes });
+        trashBytes += bytes; trashItems += 1;
+        continue;
+      }
+      workingBytes += entry.size || 0;
+      for (const version of entry.versions || []) {
+        if (version.sha256 === entry.sha256) keptVersionsBytes += version.size || 0;
+        else {
+          deletions.push({ kind: 'history-version', id: entry.id, path: entry.path, sha256: version.sha256, bytes: version.size || 0 });
+          historyBytes += version.size || 0; historyVersions += 1;
+        }
+      }
+    }
+    let orphanBytes = 0;
+    const versionRoot = path.join(meta, 'versions');
+    for (const name of await fsp.readdir(versionRoot).catch(() => [])) {
+      if (catalogued.has(name)) continue;
+      const dir = path.join(versionRoot, name);
+      let bytes = 0;
+      for (const file of await fsp.readdir(dir).catch(() => [])) {
+        const stat = await fsp.stat(path.join(dir, file)).catch(() => null);
+        if (stat?.isFile()) bytes += stat.size;
+      }
+      deletions.push({ kind: 'orphan-versions', id: name, bytes });
+      orphanBytes += bytes;
+    }
+    return {
+      version: 1,
+      token: hash(JSON.stringify(deletions.map(d => [d.kind, d.id, d.sha256 ?? null, d.bytes]))),
+      working: { bytes: workingBytes },
+      keptLatestVersions: { bytes: keptVersionsBytes },
+      history: { versions: historyVersions, bytes: historyBytes },
+      trash: { items: trashItems, bytes: trashBytes },
+      orphans: { bytes: orphanBytes },
+      reclaimableBytes: trashBytes + historyBytes + orphanBytes,
+      deletions,
+    };
+  }
   async function publish(index, source, destination, expectedSha256) {
     const { rel, target } = await checked(destination, { missing: true });
     const parentRel = path.posix.dirname(rel) === '.' ? '' : path.posix.dirname(rel);
@@ -178,6 +247,40 @@ function createPersonalLibrary({ home, rpc } = {}) {
       const source = path.join(meta, 'uploads', `${uid()}.part`); await fsp.writeFile(source, bytes);
       try { return await publish(index, source, destination, expectedSha256); } finally { await fsp.unlink(source).catch(() => {}); }
     });
+  }
+  // P04: bounded text read used by the search index (never the write lock).
+  async function readTextFile(target, maxBytes) {
+    const handle = await fsp.open(target, 'r');
+    try {
+      const stat = await handle.stat();
+      if (!stat.isFile() || stat.size > maxBytes) throw new Error('文件超出可索引大小');
+      const buffer = Buffer.alloc(Math.min(stat.size, maxBytes));
+      let length = 0;
+      while (length < buffer.length) {
+        const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
+        if (!bytesRead) break;
+        length += bytesRead;
+      }
+      const bytes = buffer.subarray(0, length);
+      return { raw: bytes.toString('utf8'), bytes, size: stat.size, mtimeMs: stat.mtimeMs };
+    } finally { await handle.close(); }
+  }
+  // The index is a rebuildable acceleration layer over the catalog; resolvePath
+  // joins catalog-internal relative paths only (validated at write time).
+  const searchIndex = createLibrarySearchIndex({
+    metaDir: meta,
+    // checked() keeps the symlink/junction guard: search never reads a
+    // catalogued path that now points outside the library.
+    resolvePath: async rel => (await checked(rel)).target,
+    readTextFile,
+  });
+  async function readCatalogWithoutLock() {
+    try {
+      const raw = await fsp.readFile(indexFile, 'utf8');
+      const parsed = JSON.parse(raw);
+      if (parsed && parsed.version === 1 && Array.isArray(parsed.entries)) return parsed;
+      return { version: 1, entries: [] };
+    } catch { return { version: 1, entries: [] }; }
   }
   const handlers = {
     'library/info': () => locked(async index => ({ root, filesRoot: content, workspaceId: index.workspaceId, maxFileBytes: MAX_FILE, chunkBytes: CHUNK })),
@@ -241,7 +344,9 @@ function createPersonalLibrary({ home, rpc } = {}) {
       upload.result = result; await fsp.writeFile(record, JSON.stringify(upload)); await fsp.unlink(source); return result;
     }),
     'library/move': params => locked(async index => {
-      await scan(index); const from = await checked(params.from), to = await checked(params.to, { missing: true });
+      await scan(index);
+      expectIdentity(index, params.from, params);
+      const from = await checked(params.from), to = await checked(params.to, { missing: true });
       if (to.rel.startsWith(from.rel + '/') || to.rel === from.rel) fail('请选择不同的目标位置');
       if (await fsp.lstat(to.target).catch(() => null)) fail('目标位置已存在同名资料', -32005);
       await fsp.rename(from.target, to.target);
@@ -249,7 +354,9 @@ function createPersonalLibrary({ home, rpc } = {}) {
       return { path: to.rel };
     }),
     'library/trash': params => locked(async index => {
-      await scan(index); const selected = await checked(params.path);
+      await scan(index);
+      expectIdentity(index, params.path, params);
+      const selected = await checked(params.path);
       const entries = index.entries.filter(entry => !entry.trashedAt && (entry.path === selected.rel || entry.path.startsWith(selected.rel + '/')));
       // Snapshots already exist before removal. A crash can be reconciled from those copies.
       const stat = await fsp.lstat(selected.target);
@@ -281,50 +388,83 @@ function createPersonalLibrary({ home, rpc } = {}) {
     'library/versions': params => locked(async index => { const entry = index.entries.find(item => item.id === params.id); if (!entry) fail('找不到这份资料', -32004); return [...entry.versions].reverse(); }),
     // First content-search vertical: bounded on-demand scan of text files.
     // Hits return the file plus line snippets so the UI can jump to context.
-    'library/search': params => locked(async index => {
+    // P04: content search runs on the incremental index with NO write.lock:
+    // saves never wait behind a query. Refresh is bounded per query, results
+    // paginate by cursor, and coverage counters expose what was not searched.
+    'library/search': async params => {
       const query = typeof params.query === 'string' ? params.query.trim() : '';
-      if (!query) return { hits: [] };
-      const limit = Math.min(Math.max(Number(params.limit) || 20, 1), 50);
-      const needle = query.toLocaleLowerCase();
-      const textFile = /\.(md|txt|json|csv|tsv|log|ya?ml|toml|ini|html?|css|js|mjs|cjs|ts|tsx|jsx|py|rs|go|java|c|cpp|h|sh|ps1|bat|sql|xml)$/i;
-      const searchLimit = 1024 * 1024;
-      const buffer = Buffer.alloc(searchLimit + 1);
-      const hits = [];
-      for (const entry of index.entries) {
-        if (hits.length >= limit) break;
-        if (entry.trashedAt || !textFile.test(entry.name)) continue;
-        let raw;
-        try {
-          const { target } = await checked(entry.path);
-          const handle = await fsp.open(target, 'r');
-          try {
-            const stat = await handle.stat();
-            if (!stat.isFile() || stat.size > searchLimit) continue;
-            let length = 0;
-            while (length < buffer.length) {
-              const { bytesRead } = await handle.read(buffer, length, buffer.length - length, length);
-              if (!bytesRead) break;
-              length += bytesRead;
-            }
-            // A file can grow after stat; never read beyond the search limit.
-            if (length > searchLimit) continue;
-            raw = buffer.toString('utf8', 0, length);
-          } finally { await handle.close(); }
-        } catch { continue; }
-        if (!raw.toLocaleLowerCase().includes(needle)) continue;
-        const lines = raw.split(/\r?\n/);
-        const snippets = [];
-        for (const [offset, line] of lines.entries()) {
-          if (line.toLocaleLowerCase().includes(needle)) {
-            snippets.push({ line: offset + 1, text: line.trim().slice(0, 200) });
-            if (snippets.length >= 3) break;
-          }
-        }
-        hits.push({ id: entry.id, path: entry.path, name: entry.name, sha256: entry.sha256, totalLines: lines.length, snippets });
+      const requestId = typeof params.requestId === 'string' ? params.requestId : undefined;
+      const cancelRequestId = typeof params.cancelRequestId === 'string' ? params.cancelRequestId : undefined;
+      // The cancellation flag is registered BEFORE the freshness sweep, so a
+      // superseded query stops its own traversal, not just the result walk.
+      const flag = searchIndex.begin_request(requestId, cancelRequestId);
+      if (!query) {
+        flag.dispose();
+        return { hits: [], nextCursor: null, coverage: searchIndex.coverage(), aborted: flag.aborted() };
       }
-      return { hits, scanned: true };
-    }),
+      const catalog = await readCatalogWithoutLock();
+      // A cold index builds once in full (the old code rescanned everything
+      // on every query); afterwards each query refreshes a bounded batch.
+      const fullBuild = searchIndex.coverage().indexed === 0;
+      const refreshed = await searchIndex.refresh(catalog.entries, { budget: fullBuild ? catalog.entries.length + 1000 : 400, signal: flag });
+      const result = await searchIndex.search(query, { limit: params.limit, cursor: params.cursor, flag });
+      return { ...result, refreshAborted: refreshed.aborted === true };
+    },
     'library/revert': params => locked(async index => { const entry = index.entries.find(item => item.id === params.id && !item.trashedAt); if (!entry?.versions.some(version => version.sha256 === params.version)) fail('找不到这个版本', -32004); return publish(index, path.join(meta, 'versions', entry.id, params.version), entry.path, params.expectedSha256); }),
+    'library/storage/plan': () => locked(async index => {
+      await scan(index);
+      return computeReclaimPlan(index);
+    }),
+    // Explicit, plan-gated reclamation. The token proves the caller saw the
+    // exact deletion set; anything that changed in between fails as stale so
+    // a rerun or a crash never removes data the user did not preview. The
+    // index is committed before files are unlinked, so a crash can only leave
+    // reclaimable orphans — never an index entry whose file is gone. The
+    // working copy and the latest version of every entry are always kept.
+    'library/storage/cleanup': params => locked(async index => {
+      await scan(index);
+      const plan = await computeReclaimPlan(index);
+      if (params?.token !== plan.token) fail('清理计划已过期，请重新获取预览后再执行', -32005);
+      if (!plan.deletions.length) return { freedBytes: 0, removedVersions: 0, removedTrashItems: 0 };
+      const removed = new Set(plan.deletions.map(item => item.id));
+      const versionRemovals = [];
+      for (const entry of index.entries) {
+        if (entry.trashedAt) continue;
+        for (const version of entry.versions || []) {
+          if (version.sha256 !== entry.sha256) versionRemovals.push(path.join(meta, 'versions', entry.id, version.sha256));
+        }
+        entry.versions = (entry.versions || []).filter(version => version.sha256 === entry.sha256);
+      }
+      const purgedFolders = new Set(index.entries.filter(entry => entry.trashedAt && entry.folder).map(entry => entry.id));
+      const purgeTrashFiles = new Set(index.entries.filter(entry => entry.trashedAt && !entry.folder && !entry.parentTrash).map(entry => entry.id));
+      index.entries = index.entries.filter(entry => {
+        if (!entry.trashedAt) return true;
+        if (entry.parentTrash) return !purgedFolders.has(entry.parentTrash);
+        return false;
+      });
+      await persist(index); // Catalog first: a crash now leaves only orphans.
+      // The token proved the deletion set, so freedBytes is the planned
+      // amount; each removal is best-effort and leftovers resurface as
+      // orphans in the next plan instead of blocking the result.
+      for (const id of purgeTrashFiles) {
+        await fsp.rm(path.join(meta, 'versions', id), { recursive: true, force: true }).catch(() => {});
+      }
+      for (const id of purgedFolders) {
+        await fsp.rm(path.join(meta, 'trash', id), { recursive: true, force: true }).catch(() => {});
+        await fsp.rm(`${path.join(meta, 'trash', id)}.json`, { force: true }).catch(() => {});
+      }
+      for (const file of versionRemovals) await fsp.unlink(file).catch(() => {});
+      for (const item of plan.deletions) {
+        if (item.kind === 'orphan-versions') {
+          await fsp.rm(path.join(meta, 'versions', item.id), { recursive: true, force: true }).catch(() => {});
+        }
+      }
+      return {
+        freedBytes: plan.reclaimableBytes,
+        removedVersions: plan.deletions.filter(item => item.kind === 'history-version').length,
+        removedTrashItems: purgeTrashFiles.size + purgedFolders.size,
+      };
+    }),
     'library/workspace': () => locked(async index => {
       if (!rpc) fail('当前环境无法创建助手任务');
       if (index.workspaceId) { const existing = await rpc('workspace/read', { id: index.workspaceId }).catch(() => null); if (existing) return existing; }
@@ -342,6 +482,29 @@ function createPersonalLibrary({ home, rpc } = {}) {
       return publish(index, verified.target, params.destination, params.expectedSha256);
     }),
   };
-  return { handlers, root, content, async put(source, destination, expectedSha256) { return locked(async index => { if ((await fsp.stat(source)).size > MAX_FILE) fail('单个文件目前支持最大 256 MB'); return publish(index, source, destination, expectedSha256); }); } };
+  const track = handler => async (...args) => {
+    if (closing) fail('资料库正在关闭，请重新打开应用后重试', -32000);
+    const operation = Promise.resolve().then(() => handler(...args));
+    admitted.add(operation);
+    return operation.finally(() => admitted.delete(operation));
+  };
+  const guardedHandlers = Object.fromEntries(Object.entries(handlers).map(([name, handler]) => [name, track(handler)]));
+  const put = track(async (source, destination, expectedSha256) => locked(async index => {
+    if ((await fsp.stat(source)).size > MAX_FILE) fail('单个文件目前支持最大 256 MB');
+    return publish(index, source, destination, expectedSha256);
+  }));
+  async function close(context = {}) {
+    closing = true;
+    const pending = [...admitted];
+    if (!pending.length) return { confirmed: true, ownedPids: [], detail: 'personal-library admissions frozen and drained' };
+    if (context.signal?.aborted) return { confirmed: false, ownedPids: [], detail: `${pending.length} personal-library operation(s) remained in flight` };
+    const settled = Promise.allSettled(pending);
+    if (!context.signal) { await settled; return { confirmed: true, ownedPids: [], detail: 'personal-library admissions frozen and drained' }; }
+    const aborted = new Promise(resolve => context.signal.addEventListener('abort', () => resolve(null), { once: true }));
+    const outcome = await Promise.race([settled, aborted]);
+    if (!outcome) return { confirmed: false, ownedPids: [], detail: `${admitted.size} personal-library operation(s) remained in flight` };
+    return { confirmed: true, ownedPids: [], detail: 'personal-library admissions frozen and drained' };
+  }
+  return { handlers: guardedHandlers, root, content, put, close, get activeCount() { return admitted.size; } };
 }
 module.exports = { createPersonalLibrary, METHODS, MAX_FILE, CHUNK, relative, fileHash, hash };

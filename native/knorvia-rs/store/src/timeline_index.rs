@@ -4,6 +4,7 @@
 use super::durable::ProjectionKind;
 use super::{ProductStore, StoreError, invalid, read_json};
 use knorvia_protocol::{Approval, Item, Turn};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::fs;
@@ -23,6 +24,25 @@ struct Entry {
     kind: String,
     pending: bool,
     path: PathBuf,
+}
+
+/// Serializable timeline directory entry for durable checkpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct EntryDto {
+    pub thread_id: String,
+    /// The entry's own document id (also key.1).
+    pub id: String,
+    /// The owning turn for items/approvals; equals `id` for turns.
+    pub turn_id: String,
+    pub key0: String,
+    pub key1: String,
+    pub status: String,
+    /// The document kind (agentMessage, commandExecution, ...).
+    pub kind: String,
+    /// Which directory the entry lives in (turn/item/approval).
+    pub dir: String,
+    pub pending: bool,
+    pub path: String,
 }
 
 pub(super) enum TimelineProjection {
@@ -133,6 +153,43 @@ impl DirectoryIndex {
         self.entries.insert(id, entry);
     }
 
+    fn snapshot(&self, dir: &str) -> Vec<EntryDto> {
+        self.entries
+            .values()
+            .map(|entry| EntryDto {
+                thread_id: entry.thread_id.clone(),
+                id: entry.key.1.clone(),
+                turn_id: entry.turn_id.clone(),
+                key0: entry.key.0.clone(),
+                key1: entry.key.1.clone(),
+                status: entry.status.clone(),
+                kind: entry.kind.clone(),
+                dir: dir.to_string(),
+                pending: entry.pending,
+                path: entry.path.to_string_lossy().into_owned(),
+            })
+            .collect()
+    }
+
+    fn restore(&mut self, dto: EntryDto) {
+        self.record(Entry {
+            thread_id: dto.thread_id,
+            turn_id: dto.turn_id,
+            key: (dto.key0, dto.key1),
+            status: dto.status,
+            kind: dto.kind,
+            pending: dto.pending,
+            path: PathBuf::from(dto.path),
+        });
+    }
+
+    fn turn_keys(&self, thread_id: &str) -> impl DoubleEndedIterator<Item = &OrderKey> {
+        self.by_thread
+            .get(thread_id)
+            .into_iter()
+            .flat_map(|keys| keys.iter())
+    }
+
     fn keys(&self, thread_id: &str, pending: bool) -> impl DoubleEndedIterator<Item = &OrderKey> {
         let map = if pending {
             &self.pending_by_thread
@@ -150,7 +207,27 @@ impl DirectoryIndex {
         let document: Value = read_json(&entry.path)?;
         let projection = TimelineProjection::parse(kind, &key.1, &document)?
             .ok_or_else(|| StoreError::Corrupt("invalid timeline index kind".into()))?;
-        if projection.entry(&entry.path) != *entry {
+        let rebuilt = projection.entry(&entry.path);
+        if rebuilt != *entry {
+            #[cfg(test)]
+            eprintln!(
+                "knorvia timeline mismatch id={}: restored={{thread:{}, turn:{}, key0:{}, key1:{}, status:{}, kind:{}, pending:{}}} document={{thread:{}, turn:{}, key0:{}, key1:{}, status:{}, kind:{}, pending:{}}}",
+                key.1,
+                entry.thread_id,
+                entry.turn_id,
+                entry.key.0,
+                entry.key.1,
+                entry.status,
+                entry.kind,
+                entry.pending,
+                rebuilt.thread_id,
+                rebuilt.turn_id,
+                rebuilt.key.0,
+                rebuilt.key.1,
+                rebuilt.status,
+                rebuilt.kind,
+                rebuilt.pending,
+            );
             return Err(StoreError::Corrupt(format!(
                 "timeline projection {} disagrees with its recovered index",
                 key.1
@@ -217,6 +294,25 @@ pub(super) struct TimelineDirectoryIndex {
 }
 
 impl TimelineDirectoryIndex {
+    fn snapshot_all(&self) -> Vec<EntryDto> {
+        let mut dtos: Vec<EntryDto> = Vec::new();
+        dtos.extend(self.turns.snapshot("turn"));
+        dtos.extend(self.items.snapshot("item"));
+        dtos.extend(self.approvals.snapshot("approval"));
+        dtos
+    }
+
+    fn restore_all(&mut self, dtos: Vec<EntryDto>) {
+        for dto in dtos {
+            match dto.dir.as_str() {
+                "turn" => self.turns.restore(dto),
+                "item" => self.items.restore(dto),
+                "approval" => self.approvals.restore(dto),
+                _ => {}
+            }
+        }
+    }
+
     fn record(&mut self, projection: &TimelineProjection, path: &Path) {
         let directory = match projection {
             TimelineProjection::Turn(_) => &mut self.turns,
@@ -273,6 +369,21 @@ impl ProductStore {
                 "timeline directory index lock poisoned: {error}"
             )))
         })
+    }
+
+    /// Snapshot every timeline directory entry (turns, items, approvals)
+    /// for a durable checkpoint.
+    pub(super) fn snapshot_timeline_entries(&self) -> Result<Vec<EntryDto>, StoreError> {
+        let index = self.lock_timeline_index()?;
+        Ok(index.snapshot_all())
+    }
+
+    /// Restore timeline directory entries from a checkpoint snapshot. The
+    /// durable documents were verified to exist before this is called.
+    pub(super) fn restore_timeline_entries(&self, dtos: Vec<EntryDto>) -> Result<(), StoreError> {
+        let mut index = self.lock_timeline_index()?;
+        index.restore_all(dtos);
+        Ok(())
     }
 
     pub(super) fn reset_timeline_index(&self) -> Result<(), StoreError> {
@@ -375,6 +486,24 @@ impl ProductStore {
         index.turns.turns(index.turns.pending.iter())
     }
 
+    /// In-memory turn count for one thread: scheduler ticks ask this per
+    /// active automation thread instead of reading every Turn document.
+    pub(super) fn indexed_turn_count_locked(&self, thread_id: &str) -> Result<usize, StoreError> {
+        let index = self.lock_timeline_index()?;
+        Ok(index.turns.turn_keys(thread_id).count())
+    }
+
+    /// The Turns of one thread via the directory index; keys are in memory
+    /// and only the referenced documents are read.
+    pub(super) fn indexed_turns_for_thread_locked(
+        &self,
+        thread_id: &str,
+    ) -> Result<Vec<Turn>, StoreError> {
+        let index = self.lock_timeline_index()?;
+        let keys: Vec<&(String, String)> = index.turns.turn_keys(thread_id).collect();
+        index.turns.turns(keys.into_iter())
+    }
+
     pub(super) fn indexed_thread_approvals_locked(
         &self,
         thread_id: &str,
@@ -383,6 +512,43 @@ impl ProductStore {
         index
             .approvals
             .approvals(index.approvals.keys(thread_id, false))
+    }
+
+    /// Select only the live approval cards for one owner. Lifecycle writers
+    /// already hold mutation/journal locks, so this must not reacquire them.
+    pub(super) fn indexed_turn_pending_approvals_locked(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<Approval>, StoreError> {
+        let index = self.lock_timeline_index()?;
+        let keys = index
+            .approvals
+            .by_turn
+            .get(turn_id)
+            .into_iter()
+            .flat_map(|keys| keys.iter())
+            .filter(|key| {
+                let entry = &index.approvals.entries[&key.1];
+                entry.thread_id == thread_id && entry.pending
+            });
+        index.approvals.approvals(keys)
+    }
+
+    /// Startup repair needs only pending approval owners, including archived
+    /// threads. Historical resolved approvals and unrelated turns are not read.
+    pub(super) fn indexed_pending_approval_turn_ids_locked(
+        &self,
+    ) -> Result<Vec<String>, StoreError> {
+        let index = self.lock_timeline_index()?;
+        Ok(index
+            .approvals
+            .approvals(index.approvals.pending.iter())?
+            .into_iter()
+            .map(|approval| approval.turn_id)
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect())
     }
 
     pub fn read_thread_activity(&self, thread_id: &str) -> Result<ThreadActivity, StoreError> {
@@ -394,6 +560,14 @@ impl ProductStore {
     pub fn list_turn_items(&self, thread_id: &str, turn_id: &str) -> Result<Vec<Item>, StoreError> {
         let _mutations = self.lock_mutations()?;
         self.recover_before_indexed_read()?;
+        self.indexed_turn_items_locked(thread_id, turn_id)
+    }
+
+    pub(super) fn indexed_turn_items_locked(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<Vec<Item>, StoreError> {
         let index = self.lock_timeline_index()?;
         let keys = index
             .items
@@ -523,4 +697,37 @@ fn file_id(path: &Path) -> Result<String, StoreError> {
         .and_then(|s| s.to_str())
         .map(str::to_owned)
         .ok_or_else(|| StoreError::Corrupt("timeline projection has a non-UTF-8 name".into()))
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn directory_index_restore_round_trips_by_turn() {
+        let mut index = DirectoryIndex::default();
+        index.record(Entry {
+            thread_id: "thr".into(),
+            turn_id: "turn_a".into(),
+            key: ("0001".into(), "item_a".into()),
+            status: "completed".into(),
+            kind: "agentMessage".into(),
+            pending: false,
+            path: PathBuf::from("item_a.json"),
+        });
+        let dtos = index.snapshot("item");
+        assert_eq!(dtos.len(), 1);
+        assert_eq!(dtos[0].turn_id, "turn_a");
+        let mut restored = DirectoryIndex::default();
+        restored.restore(dtos[0].clone());
+        assert!(
+            restored
+                .by_turn
+                .get("turn_a")
+                .is_some_and(|keys| !keys.is_empty()),
+            "by_turn must survive restore"
+        );
+        let _ = json!({}); // serde import kept honest
+    }
 }

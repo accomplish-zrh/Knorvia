@@ -1,6 +1,6 @@
 //! Durable turn lifecycle transitions and per-turn item writes.
 
-use super::durable::{EventDraft, ProjectionKind};
+use super::durable::{EventDraft, ProjectionKind, ProjectionWrite};
 use super::{
     ProductStore, StoreError, atomic_write, conflict, invalid, not_found, now_rfc3339, read_json,
 };
@@ -10,6 +10,26 @@ use std::fs;
 
 fn is_terminal_turn_status(status: &str) -> bool {
     matches!(status, "completed" | "failed" | "cancelled" | "interrupted")
+}
+
+/// Build the durable timeline Item that explains one system approval
+/// close-out (A03). `seq` must be the Item's own `item.appended` event
+/// sequence so the timeline order matches the event order.
+pub(crate) fn system_resolution_item(approval: &super::Approval, reason: &str, seq: u64) -> Item {
+    Item {
+        id: knorvia_protocol::item_id(),
+        thread_id: approval.thread_id.clone(),
+        turn_id: approval.turn_id.clone(),
+        kind: "approvalResolution".to_string(),
+        status: "completed".to_string(),
+        seq,
+        payload: json!({
+            "approvalId": approval.id,
+            "turnId": approval.turn_id,
+            "resolution": reason,
+            "source": "system",
+        }),
+    }
 }
 
 fn validate_terminal_turn_status(status: &str) -> Result<(), StoreError> {
@@ -103,7 +123,51 @@ impl ProductStore {
         Ok(turn)
     }
 
+    /// Append only still-pending approvals to the caller's terminal WAL
+    /// batch. Both locks are held and recovery has run before this snapshot.
+    fn append_pending_approval_resolutions_locked(
+        &self,
+        turn: &Turn,
+        reason: &str,
+        drafts: &mut Vec<EventDraft>,
+        writes: &mut Vec<ProjectionWrite>,
+    ) -> Result<(), StoreError> {
+        let approvals = self.indexed_turn_pending_approvals_locked(&turn.thread_id, &turn.id)?;
+        if approvals.is_empty() {
+            return Ok(());
+        }
+        let first_seq = self.next_event_sequence_locked(&turn.thread_id)?;
+        for mut approval in approvals {
+            approval.status = reason.into();
+            writes.push(self.projection_write(
+                ProjectionKind::Approval,
+                &approval.id,
+                &approval,
+            )?);
+            drafts.push(EventDraft::new(
+                "approval.systemResolved",
+                json!({"approval": approval, "reason": reason}),
+            ));
+            let offset = u64::try_from(drafts.len())
+                .map_err(|_| invalid("approval resolution batch is too large"))?;
+            let seq = first_seq
+                .checked_add(offset)
+                .ok_or_else(|| invalid("approval resolution sequence exhausted"))?;
+            let item = system_resolution_item(&approval, reason, seq);
+            writes.push(self.projection_write(ProjectionKind::Item, &item.id, &item)?);
+            drafts.push(EventDraft::new(
+                "item.appended",
+                serde_json::to_value(&item)?,
+            ));
+        }
+        Ok(())
+    }
+
     /// Complete a turn while both the mutation and journal locks are held.
+    /// Its pending approvals cannot outlive the owner: their results and
+    /// explanatory Items commit with the terminal turn, even if the runner's
+    /// best-effort per-approval cleanup failed. A same-terminal retry also
+    /// repairs approvals left by older versions without rewriting the turn.
     fn complete_turn_locked(&self, turn_id: &str, status: &str) -> Result<Turn, StoreError> {
         validate_terminal_turn_status(status)?;
         let path = self.turn_path(turn_id);
@@ -111,25 +175,48 @@ impl ProductStore {
             return Err(not_found("turn", turn_id));
         }
         let mut turn: Turn = read_json(&path)?;
-        if turn.status != "running" {
-            if turn.status == status {
-                return Ok(turn);
-            }
+        let was_running = turn.status == "running";
+        if !was_running && turn.status != status {
             return Err(conflict(format!(
                 "turn {turn_id} already terminal ({})",
                 turn.status
             )));
         }
-        turn.status = status.to_string();
-        turn.completed_at = Some(now_rfc3339());
-        let write = self.projection_write(ProjectionKind::Turn, &turn.id, &turn)?;
-        self.commit_transaction_locked(
-            &turn.thread_id,
-            "turn.completed",
-            serde_json::to_value(&turn)?,
-            None,
-            vec![write],
-        )?;
+        let reason = if status == "cancelled" {
+            "cancelled"
+        } else {
+            "owner_lost"
+        };
+        let mut drafts = Vec::new();
+        let mut writes = Vec::new();
+        self.append_pending_approval_resolutions_locked(&turn, reason, &mut drafts, &mut writes)?;
+        for mut item in self
+            .indexed_turn_items_locked(&turn.thread_id, &turn.id)?
+            .into_iter()
+            .filter(|item| item.status == "waiting_approval")
+        {
+            item.status = "interrupted".into();
+            // Preserve the tool request, while making its obsolete waiting
+            // state non-actionable. The approval's own result remains the
+            // authoritative distinction between human and system decisions.
+            writes.push(self.projection_write(ProjectionKind::Item, &item.id, &item)?);
+            drafts.push(EventDraft::new(
+                "item.interrupted",
+                serde_json::to_value(&item)?,
+            ));
+        }
+        if was_running {
+            turn.status = status.to_string();
+            turn.completed_at = Some(now_rfc3339());
+            writes.push(self.projection_write(ProjectionKind::Turn, &turn.id, &turn)?);
+            drafts.push(EventDraft::new(
+                "turn.completed",
+                serde_json::to_value(&turn)?,
+            ));
+        }
+        if !drafts.is_empty() {
+            self.commit_transaction_batch_locked(&turn.thread_id, drafts, writes)?;
+        }
         Ok(turn)
     }
 
@@ -209,36 +296,21 @@ impl ProductStore {
         for mut turn in running_turns {
             let mut drafts = Vec::new();
             let mut writes = Vec::new();
-
-            for mut approval in self
-                .list_approvals_locked(&turn.thread_id)?
-                .into_iter()
-                .filter(|approval| approval.turn_id == turn.id && approval.status == "pending")
-            {
-                approval.status = "denied".into();
-                writes.push(self.projection_write(
-                    ProjectionKind::Approval,
-                    &approval.id,
-                    &approval,
-                )?);
-                drafts.push(EventDraft::new(
-                    "approval.recovered",
-                    json!({
-                        "approval": approval,
-                        "reason": "turn interrupted after the owning process stopped",
-                    }),
-                ));
-            }
+            self.append_pending_approval_resolutions_locked(
+                &turn,
+                "owner_lost",
+                &mut drafts,
+                &mut writes,
+            )?;
 
             for mut item in self
-                .list_items_locked(&turn.thread_id)?
+                .indexed_turn_items_locked(&turn.thread_id, &turn.id)?
                 .into_iter()
                 .filter(|item| {
-                    item.turn_id == turn.id
-                        && matches!(
-                            item.status.as_str(),
-                            "pending" | "waiting_input" | "waiting_approval"
-                        )
+                    matches!(
+                        item.status.as_str(),
+                        "pending" | "waiting_input" | "waiting_approval"
+                    )
                 })
             {
                 item.status = "interrupted".into();
@@ -259,6 +331,16 @@ impl ProductStore {
             ));
             self.commit_transaction_batch_locked(&turn.thread_id, drafts, writes)?;
             recovered.push(turn);
+        }
+        // Older terminal transitions could leave pending approvals behind.
+        // Discover only their owners, including archived threads, rather
+        // than scanning every historical turn and all of its timeline Items.
+        // The public return value still describes formerly-running turns.
+        for turn_id in self.indexed_pending_approval_turn_ids_locked()? {
+            let turn = self.read_turn(&turn_id)?;
+            if is_terminal_turn_status(&turn.status) {
+                self.complete_turn_locked(&turn.id, &turn.status)?;
+            }
         }
         Ok(recovered)
     }

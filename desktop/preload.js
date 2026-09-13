@@ -2,7 +2,42 @@ const { contextBridge, ipcRenderer } = require("electron");
 
 const listeners = new Map();
 const nativeNotificationListeners = new Set();
-
+// C06: OS notification click-through. The renderer subscribes through this
+// bounded bridge; duplicate subscriptions collapse into one set entry per
+// callback and every unsubscribe removes exactly its own listener.
+const openThreadListeners = new Set();
+let pendingOpenThread = null;
+let openThreadFlushQueued = false;
+function flushPendingOpenThread() {
+  if (openThreadFlushQueued || pendingOpenThread === null || openThreadListeners.size === 0) return;
+  openThreadFlushQueued = true;
+  queueMicrotask(() => {
+    openThreadFlushQueued = false;
+    // React may unmount a subscriber before this microtask. Keep the click
+    // pending for the next mounted shell instead of invoking a stale callback.
+    if (pendingOpenThread === null || openThreadListeners.size === 0) return;
+    const queued = pendingOpenThread;
+    pendingOpenThread = null;
+    for (const listener of [...openThreadListeners]) {
+      if (openThreadListeners.has(listener)) {
+        try { listener(queued); } catch {}
+      }
+    }
+  });
+}
+ipcRenderer.on("knorvia:open-thread", (_event, threadId) => {
+  if (openThreadListeners.size === 0) {
+    pendingOpenThread = threadId;
+    return;
+  }
+  // A newer live click supersedes any older click awaiting a mount flush.
+  pendingOpenThread = null;
+  for (const listener of [...openThreadListeners]) {
+    if (openThreadListeners.has(listener)) {
+      try { listener(threadId); } catch {}
+    }
+  }
+});
 ipcRenderer.on("knorvia:native-notification", (_event, notification) => {
   for (const listener of nativeNotificationListeners) {
     try { listener(notification); } catch {}
@@ -20,6 +55,24 @@ contextBridge.exposeInMainWorld("knorviaDesktop", {
       nativeNotificationListeners.add(callback);
       return () => nativeNotificationListeners.delete(callback);
     },
+  },
+  notifications: {
+    onOpenThread: (callback) => {
+      if (typeof callback !== "function") throw new Error("Open-thread listener must be a function");
+      openThreadListeners.add(callback);
+      flushPendingOpenThread();
+      let subscribed = true;
+      return () => {
+        if (!subscribed) return;
+        subscribed = false;
+        openThreadListeners.delete(callback);
+      };
+    },
+  },
+  migration: {
+    retry: () => ipcRenderer.invoke("knorvia:migration-retry"),
+    openLegacy: () => ipcRenderer.send("knorvia:migration-open-legacy"),
+    exit: () => ipcRenderer.send("knorvia:migration-exit"),
   },
   wsOpen: (id, path) => ipcRenderer.send("knorvia:ws-open", { id, path }),
   wsSend: (id, data) => ipcRenderer.send("knorvia:ws-send", { id, data }),
@@ -64,5 +117,10 @@ contextBridge.exposeInMainWorld("knorviaDesktop", {
   },
   update: {
     check: () => ipcRenderer.invoke("knorvia:update-check"),
+    startDownload: (params) => ipcRenderer.invoke("knorvia:update-download-start", params),
+    downloadStatus: () => ipcRenderer.invoke("knorvia:update-download-status"),
+    cancelDownload: () => ipcRenderer.invoke("knorvia:update-download-cancel"),
+    openDownload: () => ipcRenderer.invoke("knorvia:update-download-open"),
+    chooseDownloadDir: () => ipcRenderer.invoke("knorvia:update-download-choose-dir"),
   },
 });

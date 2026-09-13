@@ -63,4 +63,49 @@ function startupScreen({ logo, theme = 'snow', frost = false, reducedMotion = fa
   </body></html>`;
 }
 
-module.exports = { startupScreen };
+// Recoverable startup: the legacy workspace migration could not complete.
+// The old data is untouched; this screen offers bounded, explicit ways
+// forward. `code` is an OS error code only — never user content.
+function recoveryScreen({ logo, theme = 'snow', frost = false, code = 'UNKNOWN' } = {}) {
+  const base = startupScreen({ logo, theme, frost });
+  const retryBar = `
+    <style>
+      .recovery { margin-top:26px; display:flex; flex-direction:column; align-items:center; gap:14px; }
+      .recovery p { margin:0; font-size:13px; line-height:1.6; color:var(--fg); max-width:460px; text-align:center; }
+      .recovery .code { font-family:Consolas,monospace; font-size:12px; color:var(--muted); }
+      .recovery .actions { display:flex; gap:10px; }
+      .recovery button { border:1px solid color-mix(in srgb,var(--fg) 18%,transparent); background:color-mix(in srgb,var(--fg) 5%,transparent);
+        color:var(--fg); font:inherit; font-size:13px; padding:7px 18px; border-radius:8px; cursor:pointer; }
+      .recovery button.primary { background:var(--accent); border-color:transparent; color:#fff; }
+      .recovery button:disabled { opacity:.5; cursor:default; }
+      .recovery .status { min-height:18px; font-size:12px; color:var(--muted); }
+    </style>
+    <section class="recovery" aria-label="旧数据迁移未完成">
+      <p>旧版本数据迁移没有完成，旧数据保持原样、没有任何丢失。<br>关闭占用该目录的程序后，可以重试迁移。</p>
+      <p class="code">错误码：${String(code).replace(/[^A-Za-z0-9_-]/g, '')}</p>
+      <div class="actions">
+        <button id="knorvia-retry" class="primary" type="button">重试迁移</button>
+        <button id="knorvia-open-legacy" type="button">打开旧数据目录</button>
+        <button id="knorvia-exit" type="button">退出</button>
+      </div>
+      <p class="status" role="status" id="knorvia-recovery-status"></p>
+    </section>
+    <script>(function(){
+      var bridge=window.knorviaDesktop&&window.knorviaDesktop.migration;
+      var status=document.getElementById('knorvia-recovery-status');
+      function busy(label){var b=document.getElementById('knorvia-retry');status.textContent=label;b.disabled=true;setTimeout(function(){b.disabled=false;},1500);}
+      if(!bridge)return;
+      document.getElementById('knorvia-retry').onclick=function(){
+        busy('正在重试迁移…');
+        bridge.retry().then(function(outcome){
+          if(outcome&&outcome.status==='ready'){status.textContent='迁移完成，正在启动 Knorvia…';}
+          else{status.textContent='仍无法迁移（'+((outcome&&outcome.code)||'未知')+'）。请关闭占用旧目录的程序后再试。';}
+        }).catch(function(){status.textContent='重试失败，请稍后再试。';});
+      };
+      document.getElementById('knorvia-open-legacy').onclick=function(){bridge.openLegacy();};
+      document.getElementById('knorvia-exit').onclick=function(){bridge.exit();};
+    })();</script>`;
+  return base.replace('</main>', `</main>${retryBar}`);
+}
+
+module.exports = { recoveryScreen, startupScreen };

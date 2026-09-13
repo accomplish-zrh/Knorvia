@@ -70,3 +70,36 @@ html[data-window-frost] .nl-inspector { background:var(--nw-reading); backdrop-f
 @media(max-width:650px) { .nl-library .nl-rail { width:100%; flex-basis:auto; padding:9px 13px; }.nl-library .nl-rail nav button { font-size:12px; min-height:30px; padding:6px 8px; }.nl-library .nl-list-area { padding:25px 15px 13px; }.nl-list-columns,.nl-file-row { grid-template-columns:minmax(100px,1fr) 28px; }.nl-inspector-heading { min-height:54px; height:54px; padding:0 10px; }.nl-inspector-heading .nl-document-breadcrumb>strong { font-size:12px; }.nl-inspector-heading .nl-document-actions { gap:0; }.nl-document-actions>.nw-icon { width:26px; }.nl-inspector .nl-reading { padding:30px 23px 60px; }.nl-inspector .nl-office-text { padding:15px; }.nl-inspector .nl-text-editor { padding:20px; font-size:14px; } }
 
 .nl-draft-bar{display:flex;align-items:center;gap:12px;padding:10px 24px;background:var(--nw-soft);border-bottom:1px solid var(--nw-line);color:var(--nw-muted);font-size:12px;line-height:1.7}.nl-draft-bar>span{flex:1}.nl-draft-bar .nw-button{font-size:11px;padding:5px 9px;flex-shrink:0}.nl-draft-bar.is-conflict{color:var(--nw-ink);border-inline-start:3px solid var(--nw-lilac)}.nl-text-editor:disabled,.nl-office-text textarea:disabled{opacity:.75;cursor:wait}@media(max-width:650px){.nl-draft-bar{padding:9px 12px;flex-wrap:wrap}.nl-document-actions>.nw-icon{width:24px}.nl-inspector-heading .nl-document-breadcrumb>strong{font-size:11px}}
+
+/* P05 import queue panel */
+.nl-import-panel { border: 1px solid var(--nw-line); border-radius: 12px; padding: 10px 12px; margin: 0 0 12px; background: var(--nw-surface); }
+.nl-import-head { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.nl-import-head strong { font-size: 12px; }
+.nl-import-summary { font-size: 11px; color: var(--nw-muted); flex: 1; }
+.nl-import-head-actions { display: flex; align-items: center; gap: 6px; }
+.nl-import-note { font-size: 11px; color: var(--nw-muted); margin: 6px 0 0; }
+.nl-import-note.is-failed { color: var(--destructive, #b3261e); }
+.nl-import-list { list-style: none; margin: 8px 0 0; padding: 0; max-height: 220px; overflow-y: auto; }
+.nl-import-list li { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 12px; border-top: 1px solid var(--nw-soft); }
+.nl-import-list li:first-child { border-top: 0; }
+.nl-import-name { flex-shrink: 0; max-width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nl-import-list small { color: var(--nw-muted); font-size: 10.5px; flex: 1; }
+.nl-import-state { display: inline-flex; align-items: center; gap: 4px; font-size: 11px; color: var(--nw-muted); }
+.nl-import-state.is-done { color: #1b7f4d; }
+.nl-import-state.is-failed { color: var(--destructive, #b3261e); }
+.nl-import-error { font-size: 10.5px; color: var(--nw-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 30%; }
+.nl-import-actions { display: inline-flex; gap: 4px; }
+.nl-name-cell { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.nl-name-cell .nl-file-name { flex: 1; min-width: 0; }
+.nl-bulk-check { accent-color: var(--nw-green, #1b7f4d); }
+.nl-bulk-bar { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; border: 1px solid var(--nw-line); background: var(--nw-soft); border-radius: 12px; padding: 10px 14px; margin-bottom: 12px; font-size: 13px; }
+.nl-bulk-bar > span { color: var(--nw-muted); }
+.nl-bulk-progress { border: 1px solid var(--nw-line); background: var(--nw-soft); border-radius: 12px; padding: 12px 14px; margin-bottom: 12px; font-size: 13px; }
+.nl-bulk-progress-head { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; }
+.nl-bulk-progress-head strong { font-size: 13px; }
+.nl-bulk-progress-head > span { color: var(--nw-muted); }
+.nl-bulk-retry { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--nw-muted); }
+.nl-bulk-retry input { max-width: 220px; }
+.nl-bulk-failures { margin: 10px 0 0; padding-left: 18px; color: var(--nw-muted); font-size: 12px; display: grid; gap: 4px; }
+.nl-bulk-failures li { overflow-wrap: anywhere; }
+.nl-bulk-failures small { display: block; }

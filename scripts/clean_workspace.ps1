@@ -5,7 +5,8 @@ param(
 
 $workspace = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
 $targets = @(
-    "build", "dist", "release", "knorvia_web", "web/.next", "web/.next-knorvia",
+    # release contains verified deliverables and evidence, not disposable cache.
+    "build", "dist", "knorvia_web", "web/.next", "web/.next-knorvia",
     "web/dist", "web/playwright-report", "web/test-results", "pytest_py_tmp",
     ".pytest_cache", ".ruff_cache", ".coverage", "coverage.xml", "htmlcov",
     # setuptools wheel-build metadata and leftover pytest scratch output

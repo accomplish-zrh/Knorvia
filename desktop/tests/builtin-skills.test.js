@@ -12,7 +12,7 @@ test('bundled router references are complete and startup preserves user edits', 
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'knorvia-builtin-test-'));
   try {
     const seeded = ensureBuiltinSkills(home);
-    assert.deepEqual(seeded.map(result => result.name).sort(), ['learning-pack', 'remotion-best-practices']);
+    assert.deepEqual(seeded.map(result => result.name).sort(), ['creative-brief', 'learning-pack', 'remotion-best-practices', 'short-drama']);
     assert.equal(seeded.every(result => result.installed), true);
     const root = path.join(home, 'state/kernel/skills/remotion-best-practices');
     const skill = path.join(root, 'SKILL.md'), text = fs.readFileSync(skill, 'utf8');

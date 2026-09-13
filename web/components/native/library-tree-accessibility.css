@@ -1,0 +1,16 @@
+/* P06: library tree accessibility layer — focus visibility, APG state
+   styling, and deep-level readability. Kept separate so the base library
+   styles stay untouched. */
+
+.nl-folder-tree [role="treeitem"] { cursor: default; }
+.nl-folder-tree [role="treeitem"]:focus { outline: 2px solid var(--nw-ink); outline-offset: -2px; background: var(--nw-hover); }
+.nl-folder-tree [role="treeitem"]:focus .nl-tree-name,
+.nl-folder-tree [role="treeitem"]:focus .nl-tree-chevron { color: var(--nw-ink); }
+.nl-folder-tree [role="treeitem"][aria-expanded="true"] .nl-tree-chevron svg { transform: rotate(90deg); }
+.nl-folder-tree [role="treeitem"] .nl-tree-name:focus { outline: none; }
+/* Actions stay reachable by pointer/keyboard inside the focused row only. */
+.nl-folder-tree [role="treeitem"]:focus .nl-row-actions,
+.nl-folder-tree [role="treeitem"]:focus-within .nl-row-actions { opacity: 1; }
+/* Deep trees: names ellipsize instead of overflowing the rail at any level. */
+.nl-folder-tree [role="treeitem"] .nl-tree-name span { max-width: 100%; }
+.nl-folder-tree { overflow-y: auto; }

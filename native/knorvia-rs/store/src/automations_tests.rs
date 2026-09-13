@@ -279,3 +279,150 @@ fn crash_after_materialization_interrupts_the_run_and_keeps_the_thread_traceable
     );
     let _ = fs::remove_dir_all(home);
 }
+
+#[test]
+fn quiescence_query_detects_a_durable_claim_boundary() {
+    let (store, home) = store();
+    assert!(!store.has_active_automation_run().unwrap());
+    store.insert_automation_run_fixture("claimed").unwrap();
+    assert!(
+        store.has_active_automation_run().unwrap(),
+        "a run that reached its claim boundary is work in flight for state swaps"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn quiescence_query_ignores_terminal_runs() {
+    let (store, home) = store();
+    store.insert_automation_run_fixture("succeeded").unwrap();
+    store.insert_automation_run_fixture("skipped").unwrap();
+    assert!(!store.has_active_automation_run().unwrap());
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn claimed_occurrence_that_waits_past_valid_until_is_skipped_without_a_thread() {
+    let (store, home) = store();
+    let workspace_id = workspace(&store);
+    let automation = store
+        .create_automation_with_window_at(
+            "Short window",
+            "do not run late",
+            &workspace_id,
+            AutomationSchedule::Once { at: T0 + 5 },
+            AutomationStatus::Active,
+            false,
+            None,
+            None,
+            Some(T0),
+            Some(T0 + 10),
+            T0,
+        )
+        .unwrap();
+    let claimed = store.claim_due_automations_at(T0 + 5).unwrap();
+    assert_eq!(claimed.len(), 1);
+    assert!(
+        store
+            .materialize_automation_run(&claimed[0].id, T0 + 10)
+            .unwrap()
+            .is_none()
+    );
+    let run = store
+        .list_automation_runs(&automation.id, 10)
+        .unwrap()
+        .remove(0);
+    assert_eq!(run.state, AutomationRunState::Skipped);
+    assert!(run.error.as_deref().unwrap().contains("expired"));
+    assert!(
+        run.thread_id.is_none(),
+        "expiry must precede materialization"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn scheduler_records_a_late_unclaimed_occurrence_as_expired() {
+    let (store, home) = store();
+    let workspace_id = workspace(&store);
+    let automation = store
+        .create_automation_with_window_at(
+            "Expired before tick",
+            "never admitted",
+            &workspace_id,
+            AutomationSchedule::Once { at: T0 + 5 },
+            AutomationStatus::Active,
+            false,
+            None,
+            None,
+            Some(T0),
+            Some(T0 + 10),
+            T0,
+        )
+        .unwrap();
+    assert!(store.claim_due_automations_at(T0 + 10).unwrap().is_empty());
+    let run = store
+        .list_automation_runs(&automation.id, 10)
+        .unwrap()
+        .remove(0);
+    assert_eq!(run.state, AutomationRunState::Skipped);
+    assert!(run.error.as_deref().unwrap().contains("expired"));
+    assert_eq!(
+        store.read_automation(&automation.id).unwrap().next_run_at,
+        None
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
+fn validity_window_filters_real_calendar_occurrences_and_uses_revision_cas() {
+    let (store, home) = store();
+    let workspace_id = workspace(&store);
+    let schedule = AutomationSchedule::Calendar {
+        timezone: "Asia/Shanghai".into(),
+        weekdays: vec![],
+        hour: 9,
+        minute: 0,
+        days_of_month: vec![],
+        last_day_of_month: false,
+        months: vec![],
+        misfire: MisfirePolicy::Skip,
+    };
+    let day = 86_400_000;
+    let start = 1_783_387_200_000i64; // 2026-07-07 00:00 UTC
+    let automation = store
+        .create_automation_with_window_at(
+            "Shanghai mornings",
+            "report",
+            &workspace_id,
+            schedule.clone(),
+            AutomationStatus::Active,
+            false,
+            None,
+            None,
+            Some(start),
+            Some(start + day * 2),
+            start - day,
+        )
+        .unwrap();
+    let occurrences = schedule
+        .next_occurrences_in_window_after(start - day, 10, Some(start), Some(start + day * 2))
+        .unwrap();
+    assert_eq!(occurrences.len(), 2);
+    assert!(
+        occurrences
+            .iter()
+            .all(|at| *at >= start && *at < start + day * 2)
+    );
+    let stale = store.update_automation_at(
+        &automation.id,
+        AutomationUpdate {
+            valid_until: Some(Some(start + day * 3)),
+            ..Default::default()
+        },
+        Some(automation.revision + 1),
+        start,
+    );
+    assert!(stale.is_err(), "validity edits must honor revision CAS");
+    let _ = fs::remove_dir_all(home);
+}

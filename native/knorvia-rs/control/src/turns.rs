@@ -314,7 +314,9 @@ impl ControlPlane {
             .thread_settings(source_id)?
             .unwrap_or_default();
         let settings = source_settings.merge(&settings_from_params(params, None)?);
-        let kernel_thread = self.executor_lock().fork_kernel_thread(source_id, &settings)?;
+        let kernel_thread = self
+            .executor_lock()
+            .fork_kernel_thread(source_id, &settings)?;
         let title =
             optional_string(params, "title")?.unwrap_or_else(|| format!("{} (fork)", source.title));
         let fork = self
@@ -327,9 +329,9 @@ impl ControlPlane {
                 let _ = self.executor_lock().discard_kernel_thread(&kernel_thread);
                 error.into_protocol()
             })?;
-        if let Err(error) = self
-            .executor_lock()
-            .bind_kernel_thread(&fork.id, &kernel_thread, &settings)
+        if let Err(error) =
+            self.executor_lock()
+                .bind_kernel_thread(&fork.id, &kernel_thread, &settings)
         {
             // The real Kernel fork exists, but a product child without its
             // mapping would falsely look ready to continue. Hide the durable
@@ -483,7 +485,23 @@ impl ControlPlane {
     pub(super) fn rpc_turn_start(&mut self, params: &Value) -> Result<Value, ProtocolError> {
         self.ensure_accepting_work()?;
         let thread_id = required_str(params, "threadId")?;
+        self.ensure_message_queue_order(thread_id)?;
         let input = required_str(params, "input")?;
+        let (settings, write) = self.prepare_turn_execution(&thread_id, params)?;
+        let turn = self
+            .store
+            .start_turn(thread_id)
+            .map_err(|e| e.into_protocol())?;
+        self.execute_admitted_turn(thread_id, turn, input.to_string(), settings, write, None)
+    }
+
+    /// Shared pre-admission work for every turn start path: workspace and
+    /// archived checks plus the merged, persisted per-thread settings.
+    pub(super) fn prepare_turn_execution(
+        &mut self,
+        thread_id: &str,
+        params: &Value,
+    ) -> Result<(KernelTurnSettings, bool), ProtocolError> {
         let thread = self
             .store
             .read_thread(thread_id)
@@ -517,10 +535,22 @@ impl ControlPlane {
             .pointer("/tools/write")
             .and_then(Value::as_bool)
             .unwrap_or(false);
-        let turn = self
-            .store
-            .start_turn(thread_id)
-            .map_err(|e| e.into_protocol())?;
+        Ok((settings, write))
+    }
+
+    /// Shared post-admission work: the user input Item, the runner, and the
+    /// durable failure projections when the runner cannot be started. A Goal
+    /// execution batch owning the Turn is closed best-effort in every
+    /// failure path; read-time reconciliation covers a failed close.
+    pub(super) fn execute_admitted_turn(
+        &mut self,
+        thread_id: &str,
+        turn: knorvia_protocol::Turn,
+        input: String,
+        settings: KernelTurnSettings,
+        write: bool,
+        advance_for_request: Option<Value>,
+    ) -> Result<Value, ProtocolError> {
         if let Err(error) = self.store.append_item(
             thread_id,
             &turn.id,
@@ -532,16 +562,21 @@ impl ControlPlane {
             self.store
                 .complete_turn_idempotent(&turn.id, "failed")
                 .map_err(|e| e.into_protocol())?;
+            let _ = self.store.close_goal_round(&turn.id, "failed");
             return Err(error.into_protocol());
         }
         let request = TurnRequest {
-            thread_id: thread_id.into(),
+            thread_id: thread_id.to_string(),
             turn_id: turn.id.clone(),
-            prompt: input.into(),
+            prompt: input,
             read_only: !write,
             settings,
+            advance: advance_for_request,
         };
-        if let Err(error) = self.executor_lock().start_turn(&request, Arc::clone(&self.store)) {
+        if let Err(error) = self
+            .executor_lock()
+            .start_turn(&request, Arc::clone(&self.store))
+        {
             let recorded = self.store.append_item(
                 thread_id,
                 &turn.id,
@@ -585,10 +620,13 @@ impl ControlPlane {
             .store
             .read_turn(turn_id)
             .map_err(|e| e.into_protocol())?;
+        self.pause_message_queue_for_stop(&turn.thread_id)?;
         if turn.status != "running" {
             return serde_json::to_value(turn).map_err(json_err);
         }
-        let handled = self.executor_lock().interrupt_turn(&turn.thread_id, turn_id)?;
+        let handled = self
+            .executor_lock()
+            .interrupt_turn(&turn.thread_id, turn_id)?;
         if handled {
             self.executor_lock()
                 .decline_turn_pending(&turn.thread_id, turn_id)?;
@@ -767,7 +805,9 @@ impl ControlPlane {
                 // could not be durably committed. Stop the turn rather than
                 // continuing with un-auditable user input.
                 let _ = self.executor_lock().interrupt_turn(thread_id, turn_id);
-                let _ = self.executor_lock().decline_turn_pending(thread_id, turn_id);
+                let _ = self
+                    .executor_lock()
+                    .decline_turn_pending(thread_id, turn_id);
                 return Err(error.into_protocol());
             }
         };

@@ -23,7 +23,8 @@ fn listing_jobs_in_a_fresh_store_is_empty_not_an_error() {
 }
 
 #[test]
-fn media_jobs_survive_reopen_and_terminal_state_cannot_be_rewritten() {    let root = std::env::temp_dir().join(format!(
+fn media_jobs_survive_reopen_and_terminal_state_cannot_be_rewritten() {
+    let root = std::env::temp_dir().join(format!(
         "knorvia-media-jobs-{}",
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -58,7 +59,10 @@ fn media_jobs_survive_reopen_and_terminal_state_cannot_be_rewritten() {    let r
     assert!(store.run_job(&job.id).is_err());
     assert!(store.retry_job(&job.id).is_err());
     assert!(store.checkpoint_job(&job.id, json!({})).is_err());
-    assert_eq!(job_json(&store.read_job(&job.id).unwrap()), job_json(&finished));
+    assert_eq!(
+        job_json(&store.read_job(&job.id).unwrap()),
+        job_json(&finished)
+    );
     drop(store);
     fs::remove_dir_all(root).unwrap();
 }

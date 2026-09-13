@@ -19,10 +19,12 @@ ROOT = Path(__file__).resolve().parents[1]
 # Whole directories that are pure build output / local runtime copies.
 DIRS = [
     "dist",  # packaged wheels + portable bundles
-    "release",  # portable release staging
+    # Final deliveries under release/ are retained separately: latest verified
+    # version, one rollback and independent skill packages. Never wipe the root.
     "build",  # setuptools bdist output
     "knorvia_web",  # standalone web package (from web/.next)
-    "desktop-data",  # desktop dev-run data dir
+    # desktop-data is the actual development workspace, including user content.
+    # It must never be treated as a regenerable build artifact.
     "knorvia.egg-info",
     "web/.next",
     "web/.next-knorvia",

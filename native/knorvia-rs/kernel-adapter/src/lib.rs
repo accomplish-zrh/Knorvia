@@ -24,6 +24,8 @@ use std::time::{Duration, Instant};
 mod harness;
 mod transport;
 
+pub use transport::TaskLag;
+
 #[derive(Debug, thiserror::Error)]
 pub enum AdapterError {
     #[error("kernel request timed out")]
@@ -376,6 +378,7 @@ pub struct KernelTurnItem {
 
 /// Terminal result of one Kernel turn.
 #[derive(Debug, Clone, PartialEq)]
+#[derive(Default)]
 pub struct KernelTurnResult {
     /// `completed` | `failed` | `interrupted`
     pub status: String,
@@ -386,6 +389,10 @@ pub struct KernelTurnResult {
     pub declined_requests: u32,
     /// Approvals surfaced to the caller (accepted or declined).
     pub surfaced_approvals: u32,
+    /// This turn's own deadline fired before the Kernel reported its
+    /// terminal. A diagnostic fact only: it never rewrites the terminal
+    /// the Kernel reported.
+    pub deadline_exceeded: bool,
 }
 
 /// A Kernel approval server request, normalized for the product approval
@@ -744,6 +751,12 @@ impl KernelSession {
         Ok(sess)
     }
 
+    /// Observable per-task event backlog: queued spill, dropped transient
+    /// deltas, and whether the task was isolated for falling too far behind.
+    pub fn task_lag(&self, thread_id: &str) -> TaskLag {
+        self.transport.task_lag(thread_id)
+    }
+
     pub fn is_alive(&self) -> bool {
         matches!(
             self.child.lock().ok().and_then(|mut c| c.try_wait().ok()),
@@ -1040,10 +1053,7 @@ impl KernelSession {
     ) -> Result<KernelTurnResult, AdapterError> {
         let mut result = KernelTurnResult {
             status: "failed".into(),
-            error: None,
-            items: Vec::new(),
-            declined_requests: 0,
-            surfaced_approvals: 0,
+            ..KernelTurnResult::default()
         };
         let mut deadline = Instant::now() + Duration::from_secs(turn_timeout_secs());
         let mut deadline_interrupted = false;
@@ -1058,6 +1068,7 @@ impl KernelSession {
                     // live while the Kernel acknowledges cooperative stop.
                     self.send_turn_interrupt(thread_id, expected_turn_id)?;
                     deadline_interrupted = true;
+                    result.deadline_exceeded = true;
                     deadline = Instant::now() + Duration::from_secs(5);
                     continue;
                 }
@@ -1072,208 +1083,18 @@ impl KernelSession {
                     ));
                 }
             };
-            let event_turn = v
-                .pointer("/params/turnId")
-                .or_else(|| v.pointer("/params/turn/id"))
-                .and_then(Value::as_str);
-            let event_thread = v.pointer("/params/threadId").and_then(Value::as_str);
-            let child_event = event_thread.is_some_and(|id| id != thread_id);
-            if !child_event && event_turn.is_some_and(|id| id != expected_turn_id) {
-                continue;
-            }
-            // Server requests carry an id too; classify them BEFORE the
-            // response-id check or they are swallowed as strays and the
-            // Kernel waits for our answer forever.
-            if is_server_request(&v) {
-                let id = v.get("id").cloned().unwrap_or(Value::Null);
-                let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
-                if APPROVAL_METHODS.contains(&method) {
-                    let kind = method.split('/').nth(1).unwrap_or("unknown").to_string();
-                    let params = v.get("params").cloned().unwrap_or(json!({}));
-                    let request = KernelApprovalRequest {
-                        kind: kind.clone(),
-                        action: format!("kernel.{kind}"),
-                        payload: params,
-                    };
-                    let decision = match opts.on_approval.as_mut() {
-                        Some(cb) => {
-                            result.surfaced_approvals += 1;
-                            cb(&request)
-                        }
-                        None => {
-                            result.declined_requests += 1;
-                            TurnDecision::Decline
-                        }
-                    };
-                    let response = approval_response_for(&id, decision, method);
-                    self.write_msg(&response)?;
-                    continue;
-                }
-                if method == USER_INPUT_METHOD {
-                    let request = KernelUserInputRequest {
-                        payload: v.get("params").cloned().unwrap_or_else(|| json!({})),
-                    };
-                    let answers = opts
-                        .on_user_input
-                        .as_mut()
-                        .map(|callback| callback(&request))
-                        .unwrap_or_else(|| json!({"answers": {}}));
-                    self.write_msg(&user_input_response(&id, answers))?;
-                    continue;
-                }
-                result.declined_requests += 1;
-                let response = denial_response(
-                    &id,
-                    "knorvia-daemon: this server request is not supported by the kernel turn bridge",
-                );
-                self.write_msg(&response)?;
-                continue;
-            }
-            let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
-                continue;
-            };
-            let params = v.get("params").cloned().unwrap_or(Value::Null);
-            if child_event {
-                let params = if method == "thread/tokenUsage/updated" {
-                    harness::annotate_kernel_usage(&params)
-                } else {
-                    params
-                };
-                // The transport verified this descendant's parent chain.
-                // Preserve its native identity and terminal state separately;
-                // a child finishing must not finish its product parent, and
-                // child usage must not masquerade as the parent's counter.
-                let payload = json!({
-                    "kernelThreadId": event_thread,
-                    "kernelTurnId": event_turn,
-                    "event": method,
-                    "data": params,
-                });
-                if matches!(
-                    method,
-                    "turn/started"
-                        | "turn/completed"
-                        | "item/completed"
-                        | "thread/tokenUsage/updated"
-                        | "error"
-                ) {
-                    let item = KernelTurnItem {
-                        kind: "subAgent".into(),
-                        payload,
-                    };
-                    if let Some(callback) = opts.on_item.as_mut() {
-                        callback(&item);
-                    }
-                    result.items.push(item);
-                } else if let Some(callback) = opts.on_progress.as_mut() {
-                    callback("subAgent", &payload);
-                }
-                continue;
-            }
-            match method {
-                "error" => {
-                    // Normalize the upstream error into a Knorvia shape. Raw
-                    // upstream error objects (provider internals, response
-                    // metadata) must never surface to clients.
-                    let inner = params.get("error").unwrap_or(&params);
-                    let message = inner
-                        .get("message")
-                        .and_then(|m| m.as_str())
-                        .unwrap_or("kernel turn error");
-                    result.error = Some(json!({
-                        "message": message,
-                        "willRetry": params.get("willRetry").cloned().unwrap_or(json!(false)),
-                    }));
-                }
-                "turn/completed" => {
-                    let n_tid = params
-                        .get("threadId")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    if n_tid != thread_id {
-                        continue;
-                    }
-                    let status = params
-                        .pointer("/turn/status")
-                        .and_then(|s| s.as_str())
-                        .unwrap_or("failed");
-                    result.status = status.to_string();
-                    if deadline_interrupted {
-                        result.status = "failed".into();
-                        result.error = Some(
-                            json!({"category": "DEADLINE_EXCEEDED", "message": "Kernel turn exceeded its deadline"}),
-                        );
-                    }
-                    // The final agent message can arrive either as a preceding
-                    // item/completed or inline in turn.items; merge without
-                    // duplicating either way.
-                    if let Some(items) = params.pointer("/turn/items").and_then(|v| v.as_array()) {
-                        for item in items {
-                            let dup = item
-                                .get("id")
-                                .and_then(|i| i.as_str())
-                                .map(|id| !seen_item_ids.insert(id.to_string()))
-                                .unwrap_or(true);
-                            if !dup {
-                                let normalized = normalize_item(item);
-                                if let Some(cb) = opts.on_item.as_mut() {
-                                    cb(&normalized);
-                                }
-                                result.items.push(normalized);
-                            }
-                        }
-                    }
-                    return Ok(result);
-                }
-                "item/completed" => {
-                    let n_tid = params
-                        .get("threadId")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    if n_tid != thread_id {
-                        continue;
-                    }
-                    if let Some(item) = params.get("item") {
-                        if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
-                            seen_item_ids.insert(id.to_string());
-                        }
-                        let normalized = normalize_item(item);
-                        if let Some(cb) = opts.on_item.as_mut() {
-                            cb(&normalized);
-                        }
-                        result.items.push(normalized);
-                    }
-                }
-                "item/agentMessage/delta" => {
-                    let n_tid = params
-                        .get("threadId")
-                        .and_then(|t| t.as_str())
-                        .unwrap_or("");
-                    if n_tid != thread_id {
-                        continue;
-                    }
-                    if let (Some(cb), Some(item_id)) = (
-                        opts.on_delta.as_mut(),
-                        params.get("itemId").and_then(|i| i.as_str()),
-                    ) {
-                        let delta = params.get("delta").and_then(|d| d.as_str()).unwrap_or("");
-                        cb(item_id, delta);
-                    }
-                }
-                _ => match harness::project_event(method, &params) {
-                    Some(harness::Event::Durable(item)) => {
-                        if let Some(callback) = opts.on_item.as_mut() {
-                            callback(&item);
-                        }
-                        result.items.push(item);
-                    }
-                    Some(harness::Event::Progress(kind, payload)) => {
-                        if let Some(callback) = opts.on_progress.as_mut() {
-                            callback(kind, &payload);
-                        }
-                    }
-                    None => {}
-                },
+            let outcome = handle_turn_message(
+                &mut result,
+                &mut seen_item_ids,
+                &v,
+                thread_id,
+                expected_turn_id,
+                &mut opts,
+                deadline_interrupted,
+                &mut |message| self.write_msg(message),
+            )?;
+            if let Some(outcome) = outcome {
+                return Ok(outcome);
             }
         }
     }
@@ -1308,6 +1129,230 @@ impl Drop for KernelSession {
             let _ = child.wait();
         }
     }
+}
+
+
+/// Process one transport message inside `await_turn`. Returns `Some` when
+/// the message produced the turn's outcome. Split from the receive loop so
+/// deadline fixtures can drive synthetic events without a kernel process.
+#[allow(clippy::too_many_arguments)]
+fn handle_turn_message(
+    result: &mut KernelTurnResult,
+    seen_item_ids: &mut std::collections::HashSet<String>,
+    v: &Value,
+    thread_id: &str,
+    expected_turn_id: &str,
+    opts: &mut TurnRunOptions,
+    deadline_interrupted: bool,
+    reply: &mut dyn FnMut(&Value) -> Result<(), AdapterError>,
+) -> Result<Option<KernelTurnResult>, AdapterError> {
+    let event_turn = v
+        .pointer("/params/turnId")
+        .or_else(|| v.pointer("/params/turn/id"))
+        .and_then(Value::as_str);
+    let event_thread = v.pointer("/params/threadId").and_then(Value::as_str);
+    let child_event = event_thread.is_some_and(|id| id != thread_id);
+    if !child_event && event_turn.is_some_and(|id| id != expected_turn_id) {
+        return Ok(None);
+    }
+    // Server requests carry an id too; classify them BEFORE the response-id
+    // check or they are swallowed as strays and the Kernel waits for our
+    // answer forever.
+    if is_server_request(v) {
+        let id = v.get("id").cloned().unwrap_or(Value::Null);
+        let method = v.get("method").and_then(|m| m.as_str()).unwrap_or("");
+        if APPROVAL_METHODS.contains(&method) {
+            let kind = method.split('/').nth(1).unwrap_or("unknown").to_string();
+            let params = v.get("params").cloned().unwrap_or(json!({}));
+            let request = KernelApprovalRequest {
+                kind: kind.clone(),
+                action: format!("kernel.{kind}"),
+                payload: params,
+            };
+            let decision = match opts.on_approval.as_mut() {
+                Some(cb) => {
+                    result.surfaced_approvals += 1;
+                    cb(&request)
+                }
+                None => {
+                    result.declined_requests += 1;
+                    TurnDecision::Decline
+                }
+            };
+            let response = approval_response_for(&id, decision, method);
+            reply(&response)?;
+            return Ok(None);
+        }
+        if method == USER_INPUT_METHOD {
+            let request = KernelUserInputRequest {
+                payload: v.get("params").cloned().unwrap_or_else(|| json!({})),
+            };
+            let answers = opts
+                .on_user_input
+                .as_mut()
+                .map(|callback| callback(&request))
+                .unwrap_or_else(|| json!({"answers": {}}));
+            reply(&user_input_response(&id, answers))?;
+            return Ok(None);
+        }
+        result.declined_requests += 1;
+        let response = denial_response(
+            &id,
+            "knorvia-daemon: this server request is not supported by the kernel turn bridge",
+        );
+        reply(&response)?;
+        return Ok(None);
+    }
+    let Some(method) = v.get("method").and_then(|m| m.as_str()) else {
+        return Ok(None);
+    };
+    let params = v.get("params").cloned().unwrap_or(Value::Null);
+    if child_event {
+        let params = if method == "thread/tokenUsage/updated" {
+            harness::annotate_kernel_usage(&params)
+        } else {
+            params
+        };
+        // The transport verified this descendant's parent chain.
+        // Preserve its native identity and terminal state separately;
+        // a child finishing must not finish its product parent, and
+        // child usage must not masquerade as the parent's counter.
+        let payload = json!({
+            "kernelThreadId": event_thread,
+            "kernelTurnId": event_turn,
+            "event": method,
+            "data": params,
+        });
+        if matches!(
+            method,
+            "turn/started"
+                | "turn/completed"
+                | "item/completed"
+                | "thread/tokenUsage/updated"
+                | "error"
+        ) {
+            let item = KernelTurnItem {
+                kind: "subAgent".into(),
+                payload,
+            };
+            if let Some(callback) = opts.on_item.as_mut() {
+                callback(&item);
+            }
+            result.items.push(item);
+        } else if let Some(callback) = opts.on_progress.as_mut() {
+            callback("subAgent", &payload);
+        }
+        return Ok(None);
+    }
+    match method {
+        "error" => {
+            // Normalize the upstream error into a Knorvia shape. Raw
+            // upstream error objects (provider internals, response
+            // metadata) must never surface to clients.
+            let inner = params.get("error").unwrap_or(&params);
+            let message = inner
+                .get("message")
+                .and_then(|m| m.as_str())
+                .unwrap_or("kernel turn error");
+            result.error = Some(json!({
+                "message": message,
+                "willRetry": params.get("willRetry").cloned().unwrap_or(json!(false)),
+            }));
+        }
+        "turn/completed" => {
+            let n_tid = params
+                .get("threadId")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if n_tid != thread_id {
+                return Ok(None);
+            }
+            let status = params
+                .pointer("/turn/status")
+                .and_then(|s| s.as_str())
+                .unwrap_or("failed");
+            result.status = status.to_string();
+            if deadline_interrupted && status != "completed" && result.error.is_none() {
+                // The deadline interrupt raced a non-completed Kernel
+                // terminal: keep the authoritative terminal and add the
+                // deadline as diagnostics instead of rewriting the turn to
+                // failed. A genuinely completed turn is not tainted.
+                result.error = Some(
+                    json!({"category": "DEADLINE_EXCEEDED", "message": "Kernel turn exceeded its deadline"}),
+                );
+            }
+            // The final agent message can arrive either as a preceding
+            // item/completed or inline in turn.items; merge without
+            // duplicating either way.
+            if let Some(items) = params.pointer("/turn/items").and_then(|v| v.as_array()) {
+                for item in items {
+                    let dup = item
+                        .get("id")
+                        .and_then(|i| i.as_str())
+                        .map(|id| !seen_item_ids.insert(id.to_string()))
+                        .unwrap_or(true);
+                    if !dup {
+                        let normalized = normalize_item(item);
+                        if let Some(cb) = opts.on_item.as_mut() {
+                            cb(&normalized);
+                        }
+                        result.items.push(normalized);
+                    }
+                }
+            }
+            return Ok(Some(std::mem::take(result)));
+        }
+        "item/completed" => {
+            let n_tid = params
+                .get("threadId")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if n_tid != thread_id {
+                return Ok(None);
+            }
+            if let Some(item) = params.get("item") {
+                if let Some(id) = item.get("id").and_then(|i| i.as_str()) {
+                    seen_item_ids.insert(id.to_string());
+                }
+                let normalized = normalize_item(item);
+                if let Some(cb) = opts.on_item.as_mut() {
+                    cb(&normalized);
+                }
+                result.items.push(normalized);
+            }
+        }
+        "item/agentMessage/delta" => {
+            let n_tid = params
+                .get("threadId")
+                .and_then(|t| t.as_str())
+                .unwrap_or("");
+            if n_tid != thread_id {
+                return Ok(None);
+            }
+            if let (Some(cb), Some(item_id)) = (
+                opts.on_delta.as_mut(),
+                params.get("itemId").and_then(|i| i.as_str()),
+            ) {
+                let delta = params.get("delta").and_then(|d| d.as_str()).unwrap_or("");
+                cb(item_id, delta);
+            }
+        }
+        _ => match harness::project_event(method, &params) {
+            Some(harness::Event::Durable(item)) => {
+                if let Some(callback) = opts.on_item.as_mut() {
+                    callback(&item);
+                }
+                result.items.push(item);
+            }
+            Some(harness::Event::Progress(kind, payload)) => {
+                if let Some(callback) = opts.on_progress.as_mut() {
+                    callback(kind, &payload);
+                }
+            }
+            None => {}
+        },
+    }
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -1386,6 +1431,75 @@ mod tests {
         assert_eq!(turn["model"], "gpt-5.6-terra");
         assert_eq!(turn["effort"], "max");
         assert_eq!(turn["serviceTierForTurn"], "priority");
+    }
+
+    fn completed_message(status: &str) -> Value {
+        json!({"method": "turn/completed",
+            "params": {"threadId": "th", "turn": {"id": "tn", "status": status}}})
+    }
+
+    /// Drive one synthetic message through the extracted await_turn body.
+    fn drive(
+        result: &mut KernelTurnResult,
+        v: &Value,
+        deadline_interrupted: bool,
+    ) -> Option<KernelTurnResult> {
+        let mut seen = std::collections::HashSet::new();
+        let mut opts = TurnRunOptions::read_only();
+        handle_turn_message(
+            result,
+            &mut seen,
+            v,
+            "th",
+            "tn",
+            &mut opts,
+            deadline_interrupted,
+            &mut |_| Ok(()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn deadline_then_kernel_completed_keeps_the_authoritative_terminal() {
+        let mut result = KernelTurnResult::default();
+        result.deadline_exceeded = true;
+        let outcome = drive(&mut result, &completed_message("completed"), true)
+            .expect("completed is a terminal outcome");
+        assert_eq!(outcome.status, "completed");
+        assert!(
+            outcome.error.is_none(),
+            "a completed terminal must not be rewritten to failed: {outcome:?}"
+        );
+        assert!(outcome.deadline_exceeded, "the deadline diagnostic stays");
+    }
+
+    #[test]
+    fn deadline_then_kernel_interrupted_keeps_terminal_with_deadline_diagnostics() {
+        let mut result = KernelTurnResult::default();
+        result.deadline_exceeded = true;
+        let outcome = drive(&mut result, &completed_message("interrupted"), true)
+            .expect("interrupted is a terminal outcome");
+        assert_eq!(outcome.status, "interrupted");
+        assert_eq!(
+            outcome.error.as_ref().expect("deadline diagnostics")["category"],
+            "DEADLINE_EXCEEDED"
+        );
+    }
+
+    #[test]
+    fn late_delta_never_produces_an_outcome_or_touches_the_terminal() {
+        let mut result = KernelTurnResult {
+            status: "failed".into(),
+            ..KernelTurnResult::default()
+        };
+        let outcome = drive(
+            &mut result,
+            &json!({"method": "item/agentMessage/delta",
+                "params": {"threadId": "th", "itemId": "i", "delta": "late"}}),
+            true,
+        );
+        assert!(outcome.is_none(), "deltas are not terminal");
+        assert_eq!(result.status, "failed");
     }
 
     #[test]

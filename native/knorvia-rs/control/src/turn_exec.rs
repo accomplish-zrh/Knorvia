@@ -60,8 +60,13 @@ impl KernelTurnSettings {
         Self {
             cwd: overrides.cwd.clone().or_else(|| self.cwd.clone()),
             model: overrides.model.clone().or_else(|| self.model.clone()),
-            reasoning_effort: if reset_effort { None } else {
-                overrides.reasoning_effort.clone().or_else(|| self.reasoning_effort.clone())
+            reasoning_effort: if reset_effort {
+                None
+            } else {
+                overrides
+                    .reasoning_effort
+                    .clone()
+                    .or_else(|| self.reasoning_effort.clone())
             },
             reset_reasoning_effort: reset_effort,
             service_tier: overrides
@@ -92,6 +97,10 @@ pub struct TurnRequest {
     /// the production executor before this turn reaches the Kernel.
     #[serde(default)]
     pub settings: KernelTurnSettings,
+    /// Explicit continuous-advance policy for Goal execution batches. Absent
+    /// (the default) means the batch stops after this turn.
+    #[serde(default)]
+    pub advance: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -287,35 +296,64 @@ pub trait TurnExecutor: Send {
             self.start_write_turn(req, store, None)?;
             return Ok(());
         }
-        let outcome = self.run_turn(req).unwrap_or_else(|error| TurnOutcome {
-            status: "failed".into(),
-            items: vec![],
-            error: Some(json!({"category": error.category, "message": error.message})),
-        });
-        for item in outcome.items {
+        // Same advancing loop contract as the production runner: an explicit
+        // advance policy keeps the batch running across full, durable turns.
+        let mut req = req.clone();
+        loop {
+            let outcome = self.run_turn(&req).unwrap_or_else(|error| TurnOutcome {
+                status: "failed".into(),
+                items: vec![],
+                error: Some(json!({"category": error.category, "message": error.message})),
+            });
+            for item in outcome.items {
+                store
+                    .append_item(
+                        &req.thread_id,
+                        &req.turn_id,
+                        &item.kind,
+                        "completed",
+                        item.payload,
+                    )
+                    .map_err(|e| e.into_protocol())?;
+            }
+            if let Some(error) = outcome.error {
+                store
+                    .append_item(&req.thread_id, &req.turn_id, "error", "failed", error)
+                    .map_err(|e| e.into_protocol())?;
+            }
+            store
+                .complete_turn(&req.turn_id, &outcome.status)
+                .map_err(|e| e.into_protocol())?;
+            // Reflect the terminal in any Goal execution batch (R02); read-time
+            // reconciliation covers a failed close.
+            let _ = store.close_goal_round(&req.turn_id, &outcome.status);
+            let Some(next_req) = advance_decision(store.as_ref(), &req, &outcome.status, false)
+            else {
+                return Ok(());
+            };
             store
                 .append_item(
-                    &req.thread_id,
-                    &req.turn_id,
-                    &item.kind,
+                    &next_req.thread_id,
+                    &next_req.turn_id,
+                    "userMessage",
                     "completed",
-                    item.payload,
+                    json!({"text": next_req.prompt}),
                 )
                 .map_err(|e| e.into_protocol())?;
+            req = next_req;
         }
-        if let Some(error) = outcome.error {
-            store
-                .append_item(&req.thread_id, &req.turn_id, "error", "failed", error)
-                .map_err(|e| e.into_protocol())?;
-        }
-        store
-            .complete_turn(&req.turn_id, &outcome.status)
-            .map_err(|e| e.into_protocol())?;
-        Ok(())
     }
 
     /// Execute one read-only turn on the real Agent Kernel.
     fn run_turn(&mut self, req: &TurnRequest) -> Result<TurnOutcome, ProtocolError>;
+
+    /// Whether this executor currently owns a live runner executing
+    /// `turn_id` on `thread_id`. Goal execution reconciliation uses this to
+    /// avoid declaring an advancing batch interrupted while its runner is
+    /// between rounds. The default (false) fits synchronous test executors.
+    fn has_live_turn(&self, _thread_id: &str, _turn_id: &str) -> bool {
+        false
+    }
 
     /// Start a write turn. Every Kernel approval is bridged to a product
     /// approval record by the executor's drainer; the caller learns the first
@@ -358,9 +396,104 @@ fn internal(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ErrorCategory::Internal, message.into())
 }
 
+/// Shared advancing-batch decision used by the production runner and the
+/// executor contract path. Strictly opt-in via `req.advance`; every stop
+/// reason is a durable batch fact and never implies the Goal completed.
+pub(crate) fn advance_decision(
+    store: &ProductStore,
+    req: &TurnRequest,
+    terminal: &str,
+    cancelled: bool,
+) -> Option<TurnRequest> {
+    let policy = req.advance.as_ref()?;
+    if cancelled {
+        return stop_batch(store, &req.turn_id, "cancelled", "cancelled");
+    }
+    if terminal != "completed" {
+        return stop_batch(store, &req.turn_id, terminal, terminal);
+    }
+    // An undelivered user input in the finished round stops the batch for
+    // the user instead of fabricating an answer and continuing.
+    let undelivered = store
+        .list_turn_items(&req.thread_id, &req.turn_id)
+        .unwrap_or_default()
+        .into_iter()
+        .any(|item| {
+            item.kind == "userInput"
+                && item.payload.get("delivered").and_then(Value::as_bool) == Some(false)
+        });
+    if undelivered {
+        return stop_batch(store, &req.turn_id, "waitingUser", "waitingUser");
+    }
+    let execution = match store
+        .find_goal_execution_by_turn(&req.turn_id)
+        .ok()
+        .flatten()
+    {
+        Some(execution) if execution.terminal_at.is_none() => execution,
+        // Already stopped externally (deadline raced, user stop) or not a
+        // tracked batch: either way the executor must not continue.
+        _ => return None,
+    };
+    if let Some(max_rounds) = policy.get("maxRounds").and_then(Value::as_u64)
+        && execution.rounds.len() as u64 >= max_rounds
+    {
+        return stop_batch(store, &req.turn_id, "paused", "roundsExhausted");
+    }
+    if let Some(deadline_ms) = policy.get("deadlineMs").and_then(Value::as_u64) {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        if now_ms >= deadline_ms {
+            return stop_batch(store, &req.turn_id, "paused", "deadlineReached");
+        }
+    }
+    // The continuation input is derived from the durable Goal record, so a
+    // restart can produce the identical round from the same facts.
+    let goal = store.read_goal(&execution.goal_id).ok()?;
+    let prompt = format!(
+        "Continue this Goal autonomously.\nGoal: {}\nAcceptance criteria: {}\nStanding constraints: {}\nPrevious round ended: completed.\nProceed with the next concrete step toward the acceptance criteria. If the acceptance criteria are already met, reply with a concise completion summary and make no further tool calls.",
+        goal.title,
+        goal.success_criteria.as_deref().unwrap_or(""),
+        goal.constraints.as_deref().unwrap_or(""),
+    );
+    let (_execution, turn) = match store.begin_goal_execution_round(&execution.id) {
+        Ok(next) => next,
+        Err(_) => {
+            // Nobody can admit the next round (a rejected replacement owns
+            // the thread, or the store refused). Stop the batch durably
+            // instead of leaving it running with no owner to advance it.
+            let _ = store.stop_goal_execution(&execution.id, "interrupted", "nextRoundStartFailed");
+            return None;
+        }
+    };
+    Some(TurnRequest {
+        thread_id: req.thread_id.clone(),
+        turn_id: turn.id,
+        prompt,
+        read_only: req.read_only,
+        settings: req.settings.clone(),
+        advance: req.advance.clone(),
+    })
+}
+
+fn stop_batch(
+    store: &ProductStore,
+    turn_id: &str,
+    status: &str,
+    reason: &str,
+) -> Option<TurnRequest> {
+    if let Ok(Some(execution)) = store.find_goal_execution_by_turn(turn_id) {
+        let _ = store.stop_goal_execution(&execution.id, status, reason);
+    }
+    None
+}
+
 #[cfg(test)]
-mod turn_exec_tests {
+mod tests {
     use super::*;
+    use knorvia_store::GoalUpdate;
 
     fn outcome(status: &str, text: &str) -> TurnOutcome {
         TurnOutcome {
@@ -465,9 +598,98 @@ mod turn_exec_tests {
                 prompt: "hi".into(),
                 read_only: true,
                 settings: KernelTurnSettings::default(),
+                advance: None,
             })
             .unwrap();
         assert_eq!(out.status, "completed");
         assert_eq!(out.items[0].payload["text"], "from kernel");
+    }
+
+    fn goal_batch_fixture() -> (ProductStore, String, String) {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let paths = knorvia_platform_paths::layout(
+            std::env::temp_dir().join(format!("knorvia-advance-{}-{unique}", std::process::id())),
+        );
+        let store = ProductStore::open(paths).unwrap();
+        let workspace = store.create_workspace("test").unwrap();
+        let goal = store
+            .create_goal_with_context(
+                &workspace.id,
+                "advance fixture",
+                GoalUpdate {
+                    success_criteria: Some("done means done".into()),
+                    ..GoalUpdate::default()
+                },
+            )
+            .unwrap();
+        let thread = store
+            .create_thread(&workspace.id, "task", Some(&goal.id), None)
+            .unwrap();
+        (store, goal.id, thread.id)
+    }
+
+    fn advance_request(thread_id: &str, turn_id: &str) -> TurnRequest {
+        TurnRequest {
+            thread_id: thread_id.into(),
+            turn_id: turn_id.into(),
+            prompt: "round".into(),
+            read_only: true,
+            settings: KernelTurnSettings::default(),
+            advance: Some(json!({"maxRounds": 5})),
+        }
+    }
+
+    #[test]
+    fn advance_continues_while_the_next_round_admits() {
+        let (store, goal_id, thread_id) = goal_batch_fixture();
+        let (execution, turn) = store
+            .start_goal_execution_turn(
+                &goal_id,
+                &thread_id,
+                "rk",
+                "digest",
+                "action",
+                Some(json!({"maxRounds": 5})),
+            )
+            .unwrap();
+        store.complete_turn(&turn.id, "completed").unwrap();
+        store.close_goal_round(&turn.id, "completed").unwrap();
+        let next = advance_decision(&store, &advance_request(&thread_id, &turn.id), "completed", false)
+            .expect("a healthy advancing batch admits its next round");
+        assert_eq!(next.thread_id, thread_id);
+        assert_eq!(store.read_turn(&next.turn_id).unwrap().status, "running");
+    }
+
+    #[test]
+    fn next_round_admission_failure_stops_the_batch_instead_of_silently_dropping() {
+        let (store, goal_id, thread_id) = goal_batch_fixture();
+        let (execution, turn) = store
+            .start_goal_execution_turn(
+                &goal_id,
+                &thread_id,
+                "rk",
+                "digest",
+                "action",
+                Some(json!({"maxRounds": 5})),
+            )
+            .unwrap();
+        store.complete_turn(&turn.id, "completed").unwrap();
+        store.close_goal_round(&turn.id, "completed").unwrap();
+        // A racing turn/start owns the thread, exactly like the registry
+        // takeover this file's admission now prevents. The next round cannot
+        // be admitted; the batch must stop durably instead of staying
+        // running with no owner.
+        let squatter = store.start_turn(&thread_id).unwrap();
+        let decision =
+            advance_decision(&store, &advance_request(&thread_id, &turn.id), "completed", false);
+        assert!(decision.is_none(), "no round can be admitted");
+        let stopped = store.read_goal_execution(&execution.id).unwrap();
+        assert_eq!(stopped.status, "interrupted");
+        assert_eq!(stopped.stop_reason.as_deref(), Some("nextRoundStartFailed"));
+        assert!(stopped.terminal_at.is_some(), "the batch is terminal");
+        let _ = store.complete_turn(&squatter.id, "cancelled");
     }
 }

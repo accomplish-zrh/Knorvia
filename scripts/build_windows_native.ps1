@@ -1,6 +1,7 @@
 param(
     [Parameter(Mandatory = $true)][string]$RuntimeSource,
     [switch]$SkipWebBuild,
+    [string]$WebDistDir = '.next-knorvia',
     # Optional separate output root for night-shift/CI staging. When set, the
     # portable copy, checksums, and installer land under this directory instead
     # of the product release\ folder. All existing protections (version source
@@ -15,6 +16,7 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+if ($WebDistDir -notmatch '^\.next(?:-[a-zA-Z0-9_-]+)?$') { throw 'WebDistDir must be a local Next build directory name.' }
 if ($ElectronDist -and -not $OutputRoot) { throw 'ElectronDist requires an isolated OutputRoot.' }
 $ProjectRoot = Split-Path -Parent $PSScriptRoot
 $WebRoot = Join-Path $ProjectRoot 'web'
@@ -39,7 +41,7 @@ foreach ($Binary in $NativeBinaries) {
 if (-not $SkipWebBuild) {
     Push-Location $WebRoot
     try {
-        $env:KNORVIA_NEXT_DIST_DIR = '.next-knorvia'
+        $env:KNORVIA_NEXT_DIST_DIR = $WebDistDir
         $env:NEXT_PUBLIC_API_BASE = '__NEXT_PUBLIC_API_BASE_PLACEHOLDER__'
         $env:NEXT_PUBLIC_AUTH_ENABLED = '__NEXT_PUBLIC_AUTH_ENABLED_PLACEHOLDER__'
         node scripts/build_en_overrides.mjs
@@ -49,8 +51,8 @@ if (-not $SkipWebBuild) {
     } finally { Pop-Location }
 }
 
-$Standalone = Join-Path $WebRoot '.next-knorvia\standalone'
-if (-not (Test-Path -LiteralPath (Join-Path $Standalone '.next-knorvia\required-server-files.json'))) { throw 'Build the standalone interface before packaging.' }
+$Standalone = Join-Path $WebRoot "$WebDistDir\standalone"
+if (-not (Test-Path -LiteralPath (Join-Path $Standalone "$WebDistDir\required-server-files.json"))) { throw 'Build the standalone interface before packaging.' }
 $Runtime = Join-Path $ProjectRoot "dist\Knorvia-$Version-portable\runtime"
 if ($OutputRoot) {
     $BuildOutput = Join-Path $OutputRoot "windows-$Version"
@@ -97,15 +99,17 @@ if ($HyperframesSource) {
     if ($LASTEXITCODE -ge 8) { throw 'HyperFrames runtime copy failed.' }
 }
 Copy-Item -LiteralPath $Standalone -Destination (Join-Path $Runtime 'web') -Recurse
-New-Item -ItemType Directory -Force -Path (Join-Path $Runtime 'web\.next-knorvia\static'), (Join-Path $Runtime 'web\public') | Out-Null
-Get-ChildItem -LiteralPath (Join-Path $WebRoot '.next-knorvia\static') -Force | Copy-Item -Destination (Join-Path $Runtime 'web\.next-knorvia\static') -Recurse -Force
+New-Item -ItemType Directory -Force -Path (Join-Path $Runtime "web\$WebDistDir\static"), (Join-Path $Runtime 'web\public') | Out-Null
+Get-ChildItem -LiteralPath (Join-Path $WebRoot "$WebDistDir\static") -Force | Copy-Item -Destination (Join-Path $Runtime "web\$WebDistDir\static") -Recurse -Force
 Get-ChildItem -LiteralPath (Join-Path $WebRoot 'public') -Force | Copy-Item -Destination (Join-Path $Runtime 'web\public') -Recurse -Force
+[IO.File]::WriteAllText((Join-Path $Runtime 'web\renderer.json'), (@{ schemaVersion = 1; distDir = $WebDistDir } | ConvertTo-Json), [Text.UTF8Encoding]::new($false))
 
-$Checksums = [ordered]@{}
-foreach ($Binary in $NativeBinaries) { $Checksums["bin/$Binary"] = (Get-FileHash -LiteralPath (Join-Path $Runtime "bin\$Binary") -Algorithm SHA256).Hash }
-foreach ($MediaBinary in $MediaBinaries) { $Checksums["bin/$($MediaBinary.Name)"] = (Get-FileHash -LiteralPath (Join-Path $Runtime "bin\$($MediaBinary.Name)") -Algorithm SHA256).Hash }
-$Manifest = [ordered]@{ product = 'Knorvia'; version = $Version; runtime = 'native'; renderer = 'web'; components = $Checksums }
-[IO.File]::WriteAllText((Join-Path $Runtime 'manifest.json'), ($Manifest | ConvertTo-Json -Depth 5), [Text.UTF8Encoding]::new($false))
+# C14: the runtime manifest is generated from the ACTUAL frozen build inputs
+# (staged binaries, node.exe, web build chunks, lockfiles, worktree HEAD and
+# dirty state) by a Node helper, so the identity is testable and never guessed
+# from a different checkout.
+node (Join-Path $PSScriptRoot 'write-runtime-integrity.cjs') --runtime $Runtime --project $ProjectRoot --web-dist $WebDistDir --app-version $Version
+if ($LASTEXITCODE -ne 0) { throw 'Runtime integrity manifest generation failed.' }
 
 Push-Location $DesktopRoot
 try {

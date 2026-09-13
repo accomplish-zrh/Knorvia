@@ -1,0 +1,8 @@
+interface:
+  display_name: "短剧制作"
+  short_description: "编排剧本分镜与原生画布，支持队列生成与本地剪辑"
+  brand_color: "#E11D48"
+  default_prompt: "用 $short-drama 把一个关于冬日热茶的温暖故事编排成分镜剧本草稿。"
+
+policy:
+  allow_implicit_invocation: true

@@ -1,11 +1,14 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ChevronDown, Download, Gauge, Loader2, RefreshCw, SlidersHorizontal, Upload } from "lucide-react";
 import { errorText, useWorkbench } from "./NativeWorkbenchProvider";
 import { PRICE_TABLE_STORAGE_KEY, estimateDatedRows, parsePriceTable, type PriceTable } from "@/lib/usage-prices";
 
 import { usageCsv, type UsageExportRow } from "@/lib/usage-export";
+import { dayStartToMs, fetchUsageSummaryWithIndexRetry } from "@/lib/native-usage-ledger";
+import { UsageLedger } from "./UsageLedger";
+import "./usage-ledger.css";
 import "./usage.css";
 
 interface UsageTotals {
@@ -51,7 +54,7 @@ interface UsageSummary {
   byProvider?: Array<{ providerId: string; turns: number; totalTokens: number }>;
   appliedFilters?: Record<string, unknown>;
   media?: { jobsScanned: number; unknownJobs: number; byProvider: MediaUsageRow[]; note: string };
-  paging: { offset: number; limit: number; total: number };
+  paging: { offset: number; limit: number; total: number; snapshot: string; generation: string };
   notes: string[];
 }
 
@@ -100,11 +103,15 @@ export function UsageSettings() {
   const [conversationKind, setConversationKind] = useState('');
   const [thread, setThread] = useState('');
   const [utc, setUtc] = useState(false);
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo] = useState("");
   const [knownModels, setKnownModels] = useState<string[]>([]);
   const [mediaProfiles, setMediaProfiles] = useState<Array<{ id: string; name: string }>>([]);
   const [knownProviders, setKnownProviders] = useState<string[]>([]);
   const [priceTable, setPriceTable] = useState<PriceTable | null>(null);
+  const [indexBuilding, setIndexBuilding] = useState(false);
   const generation = useRef(0);
+  const retryAbort = useRef<AbortController | null>(null);
   useEffect(() => {
     try {
       const stored = window.localStorage.getItem(PRICE_TABLE_STORAGE_KEY);
@@ -121,34 +128,66 @@ export function UsageSettings() {
     return () => { active = false; };
   }, [connection, request]);
 
+  // One filter object drives both the aggregate summary and the per-turn
+  // ledger, so a page change in the ledger never alters these numbers.
+  const summaryParams = useMemo((): Record<string, unknown> => {
+    const now = new Date();
+    const params: Record<string, unknown> = { toMs: now.getTime(), timezoneOffsetMinutes: utc ? 0 : now.getTimezoneOffset(),
+      ...(model ? { model } : {}), ...(provider ? { providerId: provider } : {}), ...(workspace ? { workspaceId: workspace } : {}),
+      ...(bot ? { botId: bot } : {}), ...(conversation ? { conversationId: conversation } : {}),
+      ...(conversationKind ? { conversationKind } : {}), ...(thread ? { threadId: thread } : {}) };
+    const fromMs = customFrom ? dayStartToMs(customFrom, utc) : NaN;
+    const toMs = customTo ? dayStartToMs(customTo, utc, true) : NaN;
+    if (Number.isFinite(fromMs)) params.fromMs = fromMs;
+    if (Number.isFinite(toMs)) params.toMs = toMs;
+    if (!Number.isFinite(fromMs) && !Number.isFinite(toMs)) {
+      if (range === "today") params.fromMs = dayStartMs(now, 0, utc);
+      if (range === "7d") params.fromMs = dayStartMs(now, 6, utc);
+    }
+    return params;
+  }, [range, utc, customFrom, customTo, model, provider, workspace, bot, conversation, conversationKind, thread]);
+
   const load = useCallback(async () => {
+    retryAbort.current?.abort();
+    const controller = new AbortController();
+    retryAbort.current = controller;
     const current = ++generation.current;
     setLoading(true); setError("");
     try {
-      const now = new Date();
-      const params: Record<string, unknown> = { toMs: now.getTime(), timezoneOffsetMinutes: utc ? 0 : now.getTimezoneOffset(),
-        ...(model ? { model } : {}), ...(provider ? { providerId: provider } : {}), ...(workspace ? { workspaceId: workspace } : {}),
-        ...(bot ? { botId: bot } : {}), ...(conversation ? { conversationId: conversation } : {}),
-        ...(conversationKind ? { conversationKind } : {}), ...(thread ? { threadId: thread } : {}) };
-      if (range === "today") params.fromMs = dayStartMs(now, 0, utc);
-      if (range === "7d") params.fromMs = dayStartMs(now, 6, utc);
-      const value = await request<UsageSummary>("usage/summary", params);
+      const params = summaryParams;
+      const value = await fetchUsageSummaryWithIndexRetry<UsageSummary>({
+        request, params, signal: controller.signal,
+        onBuilding: () => {
+          if (current !== generation.current) return;
+          setSummary(null);
+          setIndexBuilding(true);
+          setError("");
+        },
+      });
       if (current !== generation.current) return;
       setSummary(value);
+      setIndexBuilding(false);
       setKnownModels(previous => [...new Set([...previous, ...value.byModel.map(row => row.model), ...(value.media?.byProvider ?? []).map(row => row.model)])].sort());
       setKnownProviders(previous => [...new Set([...previous, ...(value.byProvider ?? []).map(row => row.providerId), ...(value.media?.byProvider ?? []).map(row => row.providerId)])]);
     } catch (cause) {
-      if (current === generation.current) setError(errorText(cause));
+      if (current !== generation.current) return;
+      setIndexBuilding(false);
+      setError(errorText(cause));
     } finally {
+      if (retryAbort.current === controller) retryAbort.current = null;
       if (current === generation.current) setLoading(false);
     }
-  }, [range, request, model, workspace, provider, bot, conversation, conversationKind, thread, utc]);
+  }, [request, summaryParams]);
 
   // Child effects run before the provider creates the client, so gate the
   // first load on the workbench connection actually being established.
   useEffect(() => {
     if (connection === "connected") void load();
-    return () => { generation.current += 1; };
+    return () => {
+      generation.current += 1;
+      retryAbort.current?.abort();
+      retryAbort.current = null;
+    };
   }, [connection, load]);
 
   const totals = summary?.totals;
@@ -173,9 +212,15 @@ export function UsageSettings() {
       <label><span>{t('会话类型', 'Conversation type')}</span><select aria-label={t('会话类型', 'Conversation type')} value={conversationKind} onChange={event => { setConversationKind(event.target.value); setConversation(''); }}><option value="">{t('群聊与私聊', 'Groups and DMs')}</option><option value="group">{t('群聊', 'Groups')}</option><option value="dm">{t('私聊', 'DMs')}</option></select></label>
       <label><span>{t('会话', 'Conversation')}</span><select aria-label={t('筛选会话', 'Filter conversation')} value={conversation} onChange={event => setConversation(event.target.value)}><option value="">{t('全部会话', 'All conversations')}</option>{summary?.filterOptions?.conversations.filter(value => !conversationKind || value.kind === conversationKind).map(value => <option key={value.id} value={value.id}>{value.title}</option>)}</select></label>
       <label><span>{t('任务 ID', 'Task ID')}</span><input aria-label={t('筛选任务 ID', 'Filter task ID')} placeholder={t('任务 ID（可选）', 'Task ID (optional)')} value={thread} onChange={event => setThread(event.target.value.trim())} maxLength={256} /></label>
+      <label className="nw-usage-custom-range"><span>{t('自定义起止', 'Custom range')}</span>
+        <input type="date" aria-label={t('开始日期', 'Start date')} value={customFrom} onChange={event => setCustomFrom(event.target.value)} />
+        <span>–</span>
+        <input type="date" aria-label={t('结束日期', 'End date')} value={customTo} onChange={event => setCustomTo(event.target.value)} />
+        {(customFrom || customTo) && <button type="button" className="nw-button nw-button-small" onClick={() => { setCustomFrom(''); setCustomTo(''); }}>{t('清除', 'Clear')}</button>}
+      </label>
       <label><span>{t('统计时区', 'Reporting timezone')}</span><select aria-label={t('统计时区', 'Reporting timezone')} value={utc ? 'utc' : 'local'} onChange={event => setUtc(event.target.value === 'utc')}><option value="local">{t('本地时间', 'Local time')}</option><option value="utc">{t('UTC', 'UTC')}</option></select></label>
       </div>
-      {filterCount > 0 && <div className="nw-usage-filter-footer"><button type="button" className="nw-button nw-button-small" onClick={() => { setModel(''); setWorkspace(''); setProvider(''); setBot(''); setConversation(''); setConversationKind(''); setThread(''); }}>{t('清除筛选', 'Clear filters')}</button></div>}
+      {filterCount > 0 && <div className="nw-usage-filter-footer"><button type="button" className="nw-button nw-button-small" onClick={() => { setModel(''); setWorkspace(''); setProvider(''); setBot(''); setConversation(''); setConversationKind(''); setThread(''); setCustomFrom(''); setCustomTo(''); }}>{t('清除筛选', 'Clear filters')}</button></div>}
     </details>
     <div className="nw-usage-export-actions">
       <span>{t('导出当前范围', 'Export this range')}</span>
@@ -183,7 +228,9 @@ export function UsageSettings() {
       <button className="nw-button" disabled={!summary || loading || !!error} onClick={() => summary && downloadSummary(summary, false)}>{t('JSON 汇总', 'JSON summary')}</button>
     </div>
     {error && <p className="nw-inline-error" role="alert">{error}</p>}
-    {!summary && !error && <div className="nw-settings-loading" role="status">{connection === 'connected' ? <Loader2 size={18} className="nw-spin" /> : <Gauge size={18} />}<span>{connection === 'connected' ? t('正在整理用量…', 'Loading usage…') : t('连接工作引擎后查看用量。', 'Connect your engine to view usage.')}</span></div>}
+    {!summary && !error && <div className="nw-settings-loading" role="status">{connection === 'connected' ? <Loader2 size={18} className="nw-spin" /> : <Gauge size={18} />}<span>{connection === 'connected'
+      ? indexBuilding ? t('正在建立用量索引；可靠总数暂不可用…', 'Building the usage index; a reliable total is not available yet…') : t('正在整理用量…', 'Loading usage…')
+      : t('连接工作引擎后查看用量。', 'Connect your engine to view usage.')}</span></div>}
     {totals && <div className="nw-preference-card nw-usage-totals nw-usage-primary-totals">
       <div className="nw-usage-stat"><strong>{fmt(totals.totalTokens)}</strong><span>{t("总 token", "Total tokens")}</span></div>
       <div className="nw-usage-stat"><strong>{fmt(totals.inputTokens)}</strong><span>{t("输入", "Input")}</span></div>
@@ -277,6 +324,7 @@ export function UsageSettings() {
       </table></div>
       <p className="nw-help">{t('媒体生成按图片、秒数等单位单独记录，不与 token 相加。历史任务没有计量时间时使用任务更新时间。', summary.media.note)}</p>
     </section>}
+    <UsageLedger params={summaryParams} utc={utc} />
     {summary && <details className="nw-model-catalog"><summary>{t("统计口径", "How this is counted")}</summary><ul className="nw-help">{[
       t('汇总包含筛选范围内的全部记录；导出的 JSON 明细最多包含 100 条。', summary.notes[0]),
       t('缓存输入和推理输出已计入对应用量，不会重复相加。', summary.notes[1]),

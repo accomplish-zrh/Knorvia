@@ -180,7 +180,8 @@ function createCompositionEngine({ rpc, studio, library, playback }) {
   const subtitles = SUB.createSubtitleEngine({ rpc, studio, library, root, readProject: read, sourceFile, worker: getWorker, projectLock: lock, checkpoint });
   const retake = RETAKE.createRetakeEngine({ rpc, studio, library, playback, root, readProject: read, sourceFile, worker: getWorker, projectLock: lock, checkpoint });
   Object.assign(handlers, subtitles.handlers, retake.handlers);
-  return { handlers, async recover() {
+  // C20 activity contract: outstanding edit renders (scheduled to settled).
+  return { handlers, get pendingCount() { return active.size; }, async recover() {
     await subtitles.recover();
     await retake.recover();
     let offset = 0;

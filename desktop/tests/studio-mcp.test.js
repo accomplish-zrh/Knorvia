@@ -44,7 +44,7 @@ function fakeStudio({ profiles = [], failWith } = {}) {
 
 test('tools/list exposes generation, status, cancel, save and references tools', async () => {
   const names = TOOLS.map(tool => tool.name);
-  assert.deepEqual(names.sort(), ['article_video', 'imagegen', 'media_cancel', 'media_edit', 'media_extract_frame', 'media_models', 'media_references', 'media_retake', 'media_save', 'media_sequence_control', 'media_sequence_create', 'media_sequence_status', 'media_status', 'media_subtitles', 'media_templates', 'pet_create', 'pet_status', 'videogen'].sort());
+  assert.deepEqual(names.sort(), ['article_video', 'imagegen', 'media_cancel', 'media_canvas', 'media_edit', 'media_extract_frame', 'media_models', 'media_references', 'media_retake', 'media_save', 'media_sequence_control', 'media_sequence_create', 'media_sequence_status', 'media_status', 'media_subtitles', 'media_templates', 'pet_create', 'pet_status', 'videogen'].sort());
   for (const tool of TOOLS) {
     assert.equal(tool.inputSchema.additionalProperties, false, `${tool.name} must reject unknown arguments`);
   }
@@ -88,6 +88,42 @@ test('subtitle and retake tools preserve revisions and force agent permissions',
     }
     assert.equal(seen[0].revision, 7); assert.equal(seen[1].agentRequested, true); assert.equal(seen[1].idempotencyKey, 'stable');
     assert.equal(TOOLS.find(t => t.name === 'media_subtitles').inputSchema.properties.executable, undefined);
+  } finally { await server.close(); }
+});
+
+test('media_canvas tool exposes list, create, read, save and generate with agentRequested', async () => {
+  const seen = [];
+  const studio = {
+    handlers: {
+      'studio/canvas/list': async p => { seen.push(['list', p]); return { items: [] }; },
+      'studio/canvas/create': async p => { seen.push(['create', p]); return { id: 'c1', revision: 1 }; },
+      'studio/canvas/read': async p => { seen.push(['read', p]); return { id: p.id, revision: 1 }; },
+      'studio/canvas/save': async p => { seen.push(['save', p]); return { id: p.id, revision: 2 }; },
+      'studio/canvas/generate': async p => { seen.push(['generate', p]); return { ok: true, node: { id: p.nodeId, jobId: 'job-1' } }; },
+    },
+  };
+  const server = await createStudioMcp({ getStudio: () => studio });
+  try {
+    for (const [action, args] of [
+      ['list', { query: 'test' }],
+      ['create', { name: 'Canvas 1' }],
+      ['read', { id: 'c1' }],
+      ['save', { id: 'c1', expectedRevision: 1, name: 'Canvas 2' }],
+      ['generate', { id: 'c1', nodeId: 'node-1', idempotencyKey: 'idemp-1' }],
+    ]) {
+      const result = await call(server.env.KNORVIA_STUDIO_MCP_URL, server.env.KNORVIA_STUDIO_MCP_TOKEN, {
+        id: action,
+        method: 'tools/call',
+        params: { name: 'media_canvas', arguments: { action, ...args } },
+      });
+      assert.equal(result.json.result.isError, false, `action ${action} failed: ${result.json.result?.content?.[0]?.text}`);
+    }
+    assert.equal(seen.length, 5);
+    assert.deepEqual(seen[0], ['list', { query: 'test' }]);
+    assert.deepEqual(seen[1], ['create', { name: 'Canvas 1' }]);
+    assert.deepEqual(seen[2], ['read', { id: 'c1' }]);
+    assert.deepEqual(seen[3], ['save', { id: 'c1', expectedRevision: 1, name: 'Canvas 2' }]);
+    assert.deepEqual(seen[4], ['generate', { id: 'c1', nodeId: 'node-1', idempotencyKey: 'idemp-1', agentRequested: true }]);
   } finally { await server.close(); }
 });
 

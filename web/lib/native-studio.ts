@@ -6,6 +6,13 @@ export type StudioInput = { prompt: string; size: string; aspect: string; count:
 export type StudioOutput = { name: string; mime: string; size: number; sha256: string };
 export type StudioJob = { id: string; status: string; kind: 'image' | 'video'; profileId: string; provider: { name: string; model: string }; input: StudioInput; phase: string; createdAt: string; updatedAt: string; progress?: number; error?: string; recoverable?: boolean; outputs: StudioOutput[]; remoteMayContinue?: boolean; source?: string };
 export type StudioFrameExport = { jobId: string; outputIndex: number; path: string; sha256: string; sourceVideoSha256: string; streamIndex: number; pts: number; timeBase?: string; width: number; height: number; libraryId: string; libraryVersion: string; name: string; file: string; decoder: string; usedFullScan?: boolean };
+export type StudioMediaOperation = { executionId: string; key: string; kind: string; label: string; status: 'queued' | 'running' | 'completed' | 'failed' | 'canceled'; stage: string; progress: number; callers: number; error: string; startedAt: number; finishedAt: number };
+// C17: a frame export can be cancelled while it decodes; the cancel only
+// ends this caller's participation if another caller joined the same decode.
+export const cancelFrameExport = (request: (method: string, params?: unknown) => Promise<unknown>, jobId: string, outputIndex = 0) =>
+  request('studio/frame/cancel', { id: jobId, index: outputIndex }) as Promise<{ canceled: boolean; stopped: number; jobId: string; outputIndex: number }>;
+export const listStudioOperations = (request: (method: string, params?: unknown) => Promise<unknown>) =>
+  request('studio/operations/list', {}) as Promise<{ operations: StudioMediaOperation[] }>;
 export type StudioSequenceShot = {
   id: string; order: number; prompt: string; profileId: string; seconds: number;
   continuity: 'previous-tail' | 'none'; status: string; attempt: number;
@@ -49,17 +56,28 @@ export function composePreview(globalPrompt: string | undefined, shotPrompt: str
   return head ? `${head}\n\n${shotPrompt.trim()}` : shotPrompt.trim();
 }
 export async function readStudioOutput(request: LibraryRequest, job: StudioJob, index = 0, signal?: AbortSignal) {
-  let offset: number | null = 0; const output = job.outputs[index];
-  if (!output || output.size > 256 * 1024 * 1024) throw new Error('Media unavailable');
+  let offset = 0; const output = job.outputs[index];
+  if (!output || !Number.isSafeInteger(output.size) || output.size < 0 || output.size > 256 * 1024 * 1024) throw new Error('Media unavailable');
+  if (output.sha256 && !/^[a-f0-9]{64}$/i.test(output.sha256)) throw new Error('Invalid media digest');
+  signal?.throwIfAborted();
   const bytes = new Uint8Array(output.size);
   do {
     signal?.throwIfAborted();
-    const part: { base64: string; nextOffset: number | null } = await request('studio/content', { id: job.id, index, offset });
+    const part: Partial<StudioOutput> & { base64: string; nextOffset: number | null } = await request('studio/content', { id: job.id, index, offset });
     signal?.throwIfAborted();
-    const decoded = Uint8Array.from(atob(part.base64), char => char.charCodeAt(0)); bytes.set(decoded, offset);
-    if (part.nextOffset !== null && part.nextOffset <= offset) throw new Error('Media read did not advance');
-    offset = part.nextOffset;
-  } while (offset !== null);
+    if (!part || typeof part.base64 !== 'string' || part.base64.length > Math.ceil(Math.min(512 * 1024, output.size - offset) / 3) * 4) throw new Error('Invalid media chunk');
+    if ((part.name !== undefined && part.name !== output.name) || (part.mime !== undefined && part.mime !== output.mime) || (part.size !== undefined && part.size !== output.size) || (output.sha256 && part.sha256 !== undefined && part.sha256.toLowerCase() !== output.sha256.toLowerCase())) throw new Error('The media source changed; reopen the output');
+    const decoded = Uint8Array.from(atob(part.base64), char => char.charCodeAt(0));
+    const end = offset + decoded.length;
+    if (end > output.size || (!decoded.length && end < output.size) || (part.nextOffset === null ? end !== output.size : !Number.isSafeInteger(part.nextOffset) || part.nextOffset !== end || end >= output.size)) throw new Error('The media read was incomplete or out of order');
+    bytes.set(decoded, offset);
+    offset = end;
+  } while (offset < output.size);
+  if (output.sha256) {
+    const digest = Array.from(new Uint8Array(await crypto.subtle.digest('SHA-256', bytes)), value => value.toString(16).padStart(2, '0')).join('');
+    signal?.throwIfAborted();
+    if (digest !== output.sha256.toLowerCase()) throw new Error('The media digest changed; reopen the output');
+  }
   return new Blob([bytes], { type: output.mime });
 }
 // Chunked read of an exported tail frame; mirrors readStudioOutput for the

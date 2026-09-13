@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fs;
 use std::io;
+use std::io::Write;
 use std::path::PathBuf;
 
 #[derive(Debug, thiserror::Error)]
@@ -64,10 +65,67 @@ pub struct Invocation {
     pub output: Option<Value>,
     #[serde(default)]
     pub checkpoint: Option<Value>,
+    /// Durable link to the product Job carrying this invocation's business
+    /// identity. Set right after the job is created so a restart can resume
+    /// the SAME job instead of silently opening a new one. Older records
+    /// written before this field existed deserialize as `None`.
+    #[serde(default)]
+    pub job_id: Option<String>,
+    /// Durable publish receipt, written BEFORE the artifact is published and
+    /// cleared on completion: `{"pendingPublish": "<artifactId>",
+    /// "stage": "verified"}`. A crash between publish and job completion
+    /// leaves checkable evidence of exactly which artifact was in flight, so
+    /// resume can reconcile (complete or publish that one artifact) instead
+    /// of re-rendering and publishing a duplicate. Older records deserialize
+    /// as `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub receipt: Option<Value>,
+}
+
+/// Process-wide nonce so concurrent atomic writes never share a staging file.
+static WRITE_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Crash-atomic invocation persistence: staged temp file + rename, so a
+/// process interruption never leaves a half-written JSON in the Home.
+fn atomic_write_json(path: &std::path::Path, value: &impl Serialize) -> Result<(), PackError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let bytes = serde_json::to_vec_pretty(value)?;
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("record");
+    let nonce = WRITE_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = path.with_file_name(format!(".{name}.{}.{}.tmp", std::process::id(), nonce));
+    let write = (|| {
+        let mut f = fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+        Ok::<(), PackError>(())
+    })();
+    match write {
+        Ok(()) => {}
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e.into())
+        }
+    }
 }
 
 pub struct PackHost {
     root: PathBuf,
+    invocation_writes: std::sync::Mutex<()>,
 }
 
 impl PackHost {
@@ -78,6 +136,7 @@ impl PackHost {
         fs::create_dir_all(paths.packs.join("invocations"))?;
         Ok(Self {
             root: paths.packs.clone(),
+            invocation_writes: std::sync::Mutex::new(()),
         })
     }
 
@@ -130,6 +189,11 @@ impl PackHost {
         Ok(serde_json::from_slice(&fs::read(path)?)?)
     }
 
+    /// Read one durable invocation record (job identity, checkpoint, status).
+    pub fn read_invocation(&self, id: &str) -> Result<Invocation, PackError> {
+        self.read_inv(id)
+    }
+
     pub fn invoke(&self, pack_id: &str, input: Value) -> Result<Invocation, PackError> {
         let rec = self.read(pack_id)?;
         if rec.state != PackState::Installed {
@@ -142,12 +206,56 @@ impl PackHost {
             input,
             output: None,
             checkpoint: None,
+            job_id: None,
+            receipt: None,
         };
         self.write_inv(&inv)?;
         Ok(inv)
     }
 
+    /// Durably record (or clear) the publish receipt. Only valid while the
+    /// invocation is `running`: the receipt is written after the artifact is
+    /// staged+verified and BEFORE it is published, and `complete` clears it.
+    pub fn set_receipt(&self, id: &str, receipt: Option<Value>) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut inv = self.read_inv(id)?;
+        if inv.status != "running" {
+            return Err(PackError::Msg(
+                "publish receipt requires running invocation".into(),
+            ));
+        }
+        inv.receipt = receipt;
+        self.write_inv(&inv)?;
+        Ok(inv)
+    }
+
+    /// Durably link an invocation to the product Job that owns its business
+    /// identity (created by `knorvia_packs::invoke` right after the job is
+    /// opened). Resume reads this link to continue the SAME job.
+    pub fn link_job(&self, id: &str, job_id: &str) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut inv = self.read_inv(id)?;
+        if inv.status != "running" {
+            return Err(PackError::Msg(
+                "job link requires running invocation".into(),
+            ));
+        }
+        inv.job_id = Some(job_id.to_string());
+        self.write_inv(&inv)?;
+        Ok(inv)
+    }
+
     pub fn checkpoint(&self, id: &str, checkpoint: Value) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut inv = self.read_inv(id)?;
         if inv.status != "running" {
             return Err(PackError::Msg(
@@ -159,15 +267,43 @@ impl PackHost {
         Ok(inv)
     }
 
-    pub fn cancel(&self, id: &str) -> Result<Invocation, PackError> {
+    pub fn fail(&self, id: &str, message: &str) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut inv = self.read_inv(id)?;
+        if inv.status == "running" {
+            inv.status = "failed".into();
+            inv.output = Some(serde_json::json!({"error":message}));
+            self.write_inv(&inv)?;
+        }
+        Ok(inv)
+    }
+
+    pub fn cancel(&self, id: &str) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut inv = self.read_inv(id)?;
+        if inv.status == "succeeded" {
+            return Ok(inv);
+        }
         inv.status = "cancelled".into();
         self.write_inv(&inv)?;
         Ok(inv)
     }
 
     pub fn resume(&self, id: &str) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut inv = self.read_inv(id)?;
+        // A crash-surviving invocation was turned `failed` by
+        // [`Self::recover_incomplete`] at startup; resume continues THAT
+        // business identity instead of refusing a forever-`running` record.
         if inv.status != "cancelled" && inv.status != "failed" {
             return Err(PackError::Msg("resume requires cancelled or failed".into()));
         }
@@ -180,10 +316,55 @@ impl PackHost {
         Ok(inv)
     }
 
+    /// Convert durable `running` invocations left by a previous process into
+    /// the explicit `failed` terminal state, keeping their checkpoint and job
+    /// link intact. Recovery never re-runs work: unknown external side effects
+    /// are not redone automatically — an explicit `resume` continues the
+    /// recorded business identity. Call once at startup, after establishing
+    /// that no runner from the old process can still own this Home.
+    pub fn recover_incomplete(&self) -> Result<Vec<Invocation>, PackError> {
+        let mut recovered = Vec::new();
+        let dir = self.root.join("invocations");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(recovered),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            // An unparsable invocation file is left untouched: recovery only
+            // asserts about records it can actually read.
+            let Ok(mut inv) = serde_json::from_slice::<Invocation>(&fs::read(path)?) else {
+                continue;
+            };
+            if inv.status != "running" {
+                continue;
+            }
+            inv.status = "failed".into();
+            self.write_inv(&inv)?;
+            recovered.push(inv);
+        }
+        Ok(recovered)
+    }
+
     pub fn complete(&self, id: &str, output: Value) -> Result<Invocation, PackError> {
+        let _writes = self
+            .invocation_writes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut inv = self.read_inv(id)?;
+        if inv.status == "cancelled" {
+            return Err(PackError::Msg(
+                "cancelled invocation cannot complete".into(),
+            ));
+        }
         inv.status = "succeeded".into();
         inv.output = Some(output);
+        // The publish journey is over: the in-flight receipt is spent.
+        inv.receipt = None;
         self.write_inv(&inv)?;
         Ok(inv)
     }
@@ -197,8 +378,7 @@ impl PackHost {
     }
 
     fn write_inv(&self, inv: &Invocation) -> Result<(), PackError> {
-        fs::write(self.inv_path(&inv.id), serde_json::to_vec_pretty(inv)?)?;
-        Ok(())
+        atomic_write_json(&self.inv_path(&inv.id), inv)
     }
 }
 

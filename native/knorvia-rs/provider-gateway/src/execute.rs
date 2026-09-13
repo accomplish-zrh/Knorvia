@@ -2,13 +2,23 @@
 //!
 //! Executes the exact body produced by `translate` against the configured
 //! gateway and normalizes the provider response into text + tool calls.
-//! Transport errors are typed; provider-side HTTP errors are returned in
-//! `ExecutionResult.error` with the HTTP status. Secrets are substituted into
-//! headers at execution time and never logged or returned.
+//! Transport errors are typed; provider-side HTTP errors are classified onto
+//! the protocol error contract (category + retryable + normalized
+//! `Retry-After`) via `crate::error_class`, shared with the Kernel bridge
+//! path. Provider response bodies are never surfaced verbatim: only redacted
+//! structured message fields reach the error text. Secrets are substituted
+//! into headers at execution time and never logged or returned.
 
+use crate::budget::{
+    BudgetBreach, ERROR_BODY_BUDGET, SseFrame, SseFramer, StreamBudget, TOOL_ARGS_BUDGET,
+    TOTAL_OUTPUT_BUDGET, read_capped_body,
+};
+use crate::error_class::{ProviderFailure, classify_status, classify_stream_error, redact_secrets};
 use crate::{ProviderKind, TranslatedRequest};
+use knorvia_protocol::ErrorCategory;
 use serde_json::{Value, json};
-use std::io::{BufRead, BufReader, Read};
+use std::collections::BTreeMap;
+use std::io::Read;
 use std::time::Duration;
 
 pub const PROVIDER_KEY_ENV: &str = "KNORVIA_PROVIDER_API_KEY";
@@ -31,6 +41,22 @@ pub enum ExecuteError {
     Protocol(String),
 }
 
+impl ExecuteError {
+    fn transport(message: impl AsRef<str>) -> Self {
+        Self::Transport(knorvia_protocol::sanitize_diagnostic(message.as_ref()))
+    }
+
+    fn protocol(message: impl AsRef<str>) -> Self {
+        Self::Protocol(knorvia_protocol::sanitize_diagnostic(message.as_ref()))
+    }
+
+    /// Safe rendering for callers that sit on another persistence boundary.
+    /// This also protects against an externally constructed enum variant.
+    pub fn sanitized_message(&self) -> String {
+        knorvia_protocol::sanitize_diagnostic(&self.to_string())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct ToolCall {
     pub name: String,
@@ -47,8 +73,65 @@ pub struct ExecutionResult {
     pub tool_calls: Vec<ToolCall>,
     /// Number of provider events/objects parsed (audit evidence).
     pub events: u64,
-    /// Provider-side error message (HTTP >= 400 or stream error).
+    /// Provider-side error message (HTTP >= 400 or stream error) — redacted
+    /// structured fields only, never a raw response body.
     pub error: Option<String>,
+    /// Protocol error category for `error` (e.g. `PROVIDER_RATE_LIMIT`),
+    /// classified identically on the direct and Kernel bridge paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_category: Option<String>,
+    /// Whether retrying the same request can succeed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retryable: Option<bool>,
+    /// Normalized `Retry-After` seconds (integer or HTTP-date form).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_after: Option<u64>,
+    /// The SSE stream ended without the provider's terminal event: whatever
+    /// text was collected is provisional, never a fabricated completion.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stream_incomplete: bool,
+    /// A13: the response was aborted because it crossed a declared resource
+    /// budget. The partial text above stays provisional and no tool call
+    /// from a truncated stream is ever handed on for execution.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resource_limit: Option<BudgetBreach>,
+}
+
+/// Record a classified failure onto the result with the shared contract
+/// fields (category name, retryability, normalized retry-after).
+pub(crate) fn apply_failure(out: &mut ExecutionResult, failure: ProviderFailure) {
+    let category = serde_json::to_string(&failure.category)
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_else(|_| "TRANSIENT".into());
+    out.error = Some(failure.message);
+    out.error_category = Some(category);
+    out.retryable = Some(failure.retryable);
+    out.retry_after = failure.retry_after_secs;
+}
+
+/// Abort this request on a budget breach. Partial text is kept and marked
+/// provisional; half-received tool calls are dropped rather than executed.
+pub(crate) fn apply_breach(out: &mut ExecutionResult, mut breach: BudgetBreach) {
+    breach.partial_kept = !out.text.is_empty();
+    out.resource_limit = Some(breach.clone());
+    out.tool_calls.clear();
+    out.stream_incomplete = true;
+    apply_failure(
+        out,
+        ProviderFailure {
+            category: ErrorCategory::ResourceExhausted,
+            retryable: false,
+            retry_after_secs: None,
+            message: breach.message(),
+        },
+    );
+}
+
+/// Serialize an `ErrorCategory` to its SCREAMING_SNAKE_CASE wire name.
+pub fn category_name(category: &ErrorCategory) -> String {
+    serde_json::to_string(category)
+        .map(|s| s.trim_matches('"').to_string())
+        .unwrap_or_else(|_| "TRANSIENT".into())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -137,14 +220,23 @@ fn substitute_key(value: &str, api_key: Option<&str>) -> Result<String, ExecuteE
     Ok(value.to_string())
 }
 
+/// Extract a safe provider error message from a response body: only the
+/// structured JSON message fields are surfaced (redacted). Raw bodies never
+/// reach the error text — they can echo credentials or account data.
 fn provider_error_message(status: u16, body: &str) -> String {
     if let Ok(v) = serde_json::from_str::<Value>(body) {
-        let pointers = ["/error/message", "/message", "/error/status", "/error"];
-        for pointer in pointers {
+        for pointer in [
+            "/error/message",
+            "/errors/0/message",
+            "/message",
+            "/detail",
+            "/msg",
+            "/error",
+        ] {
             if let Some(candidate) = v.pointer(pointer) {
                 if let Some(s) = candidate.as_str() {
                     if !s.trim().is_empty() {
-                        return s.to_string();
+                        return redact_secrets(s);
                     }
                 }
             }
@@ -153,16 +245,7 @@ fn provider_error_message(status: u16, body: &str) -> String {
     if body.trim().is_empty() {
         format!("provider returned HTTP {status} with an empty body")
     } else {
-        format!("provider returned HTTP {status}: {}", truncate(body, 300))
-    }
-}
-
-fn truncate(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        let cut: String = s.chars().take(max).collect();
-        format!("{cut}…")
+        format!("provider returned HTTP {status} (body not surfaced)")
     }
 }
 
@@ -175,10 +258,21 @@ fn agent(proxy: Option<ureq::Proxy>) -> ureq::Agent {
     }
     builder.build()
 }
-/// Execute a translated request against the configured gateway.
+/// Execute a translated request against the configured gateway under the
+/// deployed resource budgets.
 pub fn execute(
     tx: &TranslatedRequest,
     cfg: &ExecuteConfig,
+) -> Result<ExecutionResult, ExecuteError> {
+    execute_with_budget(tx, cfg, &StreamBudget::from_env())
+}
+
+/// Execute with an explicit budget. Tests and callers that need to raise a
+/// limit for one request inject it here rather than mutating process state.
+pub fn execute_with_budget(
+    tx: &TranslatedRequest,
+    cfg: &ExecuteConfig,
+    budget: &StreamBudget,
 ) -> Result<ExecutionResult, ExecuteError> {
     if cfg.base_url.trim().is_empty() {
         return Err(ExecuteError::MissingBaseUrl);
@@ -197,23 +291,33 @@ pub fn execute(
         let resolved = substitute_key(value, cfg.api_key.as_deref())?;
         req = req.set(name, &resolved);
     }
-    let body = serde_json::to_vec(&tx.body).map_err(|e| ExecuteError::Protocol(e.to_string()))?;
+    let body = serde_json::to_vec(&tx.body)
+        .map_err(|error| ExecuteError::protocol(error.to_string()))?;
     let response = match req.send_bytes(&body) {
         Ok(resp) => resp,
         Err(ureq::Error::Status(code, resp)) => {
-            // HTTP-level error: read the body and surface a typed result.
-            let mut raw = Vec::new();
-            let _ = resp.into_reader().take(64 * 1024).read_to_end(&mut raw);
-            let text = String::from_utf8_lossy(&raw).to_string();
-            return Ok(ExecutionResult {
+            // HTTP-level error: read the body, classify onto the shared
+            // contract (status table + Retry-After), surface typed metadata.
+            let retry_after = resp.header("retry-after").map(str::to_string);
+            let (text, breach) = read_error_body(resp.into_reader(), budget);
+            let mut out = ExecutionResult {
                 status: code,
-                text: String::new(),
-                tool_calls: Vec::new(),
-                events: 0,
-                error: Some(provider_error_message(code, &text)),
-            });
+                ..Default::default()
+            };
+            apply_failure(
+                &mut out,
+                classify_status(
+                    code,
+                    retry_after.as_deref(),
+                    &provider_error_message(code, &text),
+                ),
+            );
+            if let Some(breach) = breach {
+                note_truncated(&mut out, breach);
+            }
+            return Ok(out);
         }
-        Err(other) => return Err(ExecuteError::Transport(other.to_string())),
+        Err(other) => return Err(ExecuteError::transport(other.to_string())),
     };
     let status = response.status();
     let content_type = response
@@ -223,36 +327,79 @@ pub fn execute(
         .unwrap_or("")
         .to_ascii_lowercase();
     if status >= 400 {
-        let mut raw = Vec::new();
-        let _ = response.into_reader().take(64 * 1024).read_to_end(&mut raw);
-        let text = String::from_utf8_lossy(&raw).to_string();
-        return Ok(ExecutionResult {
+        let retry_after = response.header("retry-after").map(str::to_string);
+        let (text, breach) = read_error_body(response.into_reader(), budget);
+        let mut out = ExecutionResult {
             status,
-            text: String::new(),
-            tool_calls: Vec::new(),
-            events: 0,
-            error: Some(provider_error_message(status, &text)),
-        });
+            ..Default::default()
+        };
+        apply_failure(
+            &mut out,
+            classify_status(
+                status,
+                retry_after.as_deref(),
+                &provider_error_message(status, &text),
+            ),
+        );
+        if let Some(breach) = breach {
+            note_truncated(&mut out, breach);
+        }
+        return Ok(out);
     }
     let mut result = ExecutionResult {
         status,
         ..Default::default()
     };
     if content_type.contains("text/event-stream") {
-        parse_sse(tx.kind, response.into_reader(), &mut result)?;
+        parse_sse(tx.kind, response.into_reader(), &mut result, budget)?;
     } else {
-        let mut raw = String::new();
-        response
-            .into_reader()
-            .take(16 * 1024 * 1024)
-            .read_to_string(&mut raw)
-            .map_err(|e| ExecuteError::Transport(e.to_string()))?;
-        let v: Value = serde_json::from_str(raw.trim())
-            .map_err(|e| ExecuteError::Protocol(format!("non-JSON provider body: {e}")))?;
+        // A single non-streaming document is this request's whole output, so
+        // it is read under the total-output budget: an oversized body is an
+        // honest resource-limit diagnosis, never a "non-JSON" false report.
+        let (raw, breach) = match read_capped_body(
+            &mut response.into_reader(),
+            budget.max_total_bytes,
+            TOTAL_OUTPUT_BUDGET,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => return Err(ExecuteError::transport(e.to_string())),
+        };
+        if let Some(breach) = breach {
+            apply_breach(&mut result, breach);
+            return Ok(result);
+        }
+        let text = String::from_utf8_lossy(&raw).to_string();
+        let v: Value = serde_json::from_str(text.trim())
+            .map_err(|e| ExecuteError::protocol(format!("non-JSON provider body: {e}")))?;
         result.events = 1;
-        parse_single(tx.kind, &v, &mut result)?;
+        parse_single(tx.kind, &v, &mut result, budget)?;
     }
     Ok(result)
+}
+
+/// Read an HTTP error document under its budget. A failed read is not the
+/// primary fact here — the status already is — so the body simply comes back
+/// short; an overflow comes back as a typed breach next to it.
+fn read_error_body<R: Read>(
+    mut reader: R,
+    budget: &StreamBudget,
+) -> (String, Option<BudgetBreach>) {
+    let (raw, breach) =
+        read_capped_body(&mut reader, budget.max_error_body_bytes, ERROR_BODY_BUDGET)
+            .unwrap_or_else(|_| (Vec::new(), None));
+    (String::from_utf8_lossy(&raw).to_string(), breach)
+}
+
+/// The request already failed on status; on top of that, its error document
+/// was cut off. Keep the status classification and say so, rather than
+/// presenting a half-read body as the provider's full diagnosis.
+fn note_truncated(out: &mut ExecutionResult, breach: BudgetBreach) {
+    let note = breach.truncation_note();
+    out.resource_limit = Some(breach);
+    out.error = Some(match out.error.take() {
+        Some(existing) if !existing.trim().is_empty() => format!("{existing} — {note}"),
+        _ => note,
+    });
 }
 
 /// Parse one provider object (non-streaming response body) into the result.
@@ -260,16 +407,20 @@ fn parse_single(
     kind: ProviderKind,
     v: &Value,
     out: &mut ExecutionResult,
+    budget: &StreamBudget,
 ) -> Result<(), ExecuteError> {
     if let Some(err) = extract_stream_error(kind, v) {
-        out.error = Some(err);
+        apply_failure(out, classify_stream_error(&err));
         return Ok(());
     }
     match kind {
         ProviderKind::OpenAiResponses => {
             if let Some(items) = v.get("output").and_then(|o| o.as_array()) {
                 for item in items {
-                    collect_responses_item(item, out)?;
+                    if let Some(breach) = collect_responses_item(item, out, budget) {
+                        apply_breach(out, breach);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -283,7 +434,13 @@ fn parse_single(
                     .and_then(|t| t.as_array())
                 {
                     for call in calls {
-                        out.tool_calls.push(openai_tool_call(call)?);
+                        match openai_tool_call(call, budget) {
+                            Ok(call) => out.tool_calls.push(call),
+                            Err(breach) => {
+                                apply_breach(out, breach);
+                                return Ok(());
+                            }
+                        }
                     }
                 }
             }
@@ -291,7 +448,10 @@ fn parse_single(
         ProviderKind::Anthropic => {
             if let Some(content) = v.get("content").and_then(|c| c.as_array()) {
                 for block in content {
-                    collect_anthropic_block(block, out)?;
+                    if let Some(breach) = collect_anthropic_block(block, out, budget) {
+                        apply_breach(out, breach);
+                        return Ok(());
+                    }
                 }
             }
         }
@@ -300,63 +460,119 @@ fn parse_single(
                 .pointer("/candidates/0/content/parts")
                 .and_then(|p| p.as_array())
             {
-                collect_gemini_parts(parts, out)?;
+                if let Some(breach) = collect_gemini_parts(parts, out, budget) {
+                    apply_breach(out, breach);
+                    return Ok(());
+                }
             }
         }
     }
     Ok(())
 }
 
-/// Stream-parse an SSE body for the provider's wire format.
+/// Stream-parse an SSE body for the provider's wire format. A stream that
+/// ends without its terminal event is recorded as `stream_incomplete` —
+/// the collected text stays provisional instead of passing as a completion.
+/// A response that crosses a declared budget aborts here with a typed
+/// resource-limit diagnosis: whatever arrived stays provisional and no
+/// half-received tool call survives to be executed.
 fn parse_sse<R: Read>(
     kind: ProviderKind,
     reader: R,
     out: &mut ExecutionResult,
+    budget: &StreamBudget,
 ) -> Result<(), ExecuteError> {
-    let mut stream = SseStream::new(reader);
-    while let Some(data) = stream.next_data()? {
+    let mut stream = SseFramer::new(reader, budget.clone());
+    let mut terminated = false;
+    // Chat Completions streams one logical call across many fragments; they
+    // are reassembled per index and emitted only once the upstream says the
+    // call is over.
+    let mut pending_calls: BTreeMap<u64, PartialToolCall> = BTreeMap::new();
+    loop {
+        let data = match stream
+            .next_frame()
+            .map_err(|e| ExecuteError::transport(e.to_string()))?
+        {
+            SseFrame::Event(data) => data,
+            SseFrame::Breach(breach) => {
+                apply_breach(out, breach);
+                return Ok(());
+            }
+            SseFrame::End => break,
+        };
         // Chat-completions wire: `[DONE]` is a non-JSON sentinel.
         if (kind == ProviderKind::OpenAiCompatible || kind == ProviderKind::Local)
             && data.trim() == "[DONE]"
         {
-            return Ok(());
+            flush_tool_calls(&mut pending_calls, out);
+            terminated = true;
+            break;
         }
         let v: Value = match serde_json::from_str(data.trim()) {
             Ok(v) => v,
             Err(e) => {
-                return Err(ExecuteError::Protocol(format!(
+                return Err(ExecuteError::protocol(format!(
                     "malformed SSE data from provider: {e}"
                 )));
             }
         };
         out.events += 1;
         if let Some(err) = extract_stream_error(kind, &v) {
-            out.error = Some(err);
-            return Ok(());
+            // A provider-reported failure event is a definite end of the
+            // stream (the turn still fails — classified, not fabricated).
+            terminated = true;
+            apply_failure(&mut *out, classify_stream_error(&err));
+            break;
         }
         match kind {
             ProviderKind::OpenAiResponses => match v.get("type").and_then(|t| t.as_str()) {
                 Some("response.output_item.done") => {
                     if let Some(item) = v.get("item") {
-                        collect_responses_item(item, out)?;
+                        if let Some(breach) = collect_responses_item(item, out, budget) {
+                            apply_breach(out, breach);
+                            return Ok(());
+                        }
                     }
                 }
-                Some("response.completed") | Some("response.failed") => return Ok(()),
+                Some("response.completed") | Some("response.failed") => {
+                    terminated = true;
+                    break;
+                }
                 _ => {}
             },
             ProviderKind::OpenAiCompatible | ProviderKind::Local => {
-                if let Some(delta) = v.pointer("/choices/0/delta") {
-                    if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
-                        out.text.push_str(text);
-                    }
-                    if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
-                        for call in calls {
-                            out.tool_calls.push(partial_tool_call(call));
+                if let Some(choice) = v.pointer("/choices/0") {
+                    if let Some(delta) = choice.get("delta") {
+                        if let Some(text) = delta.get("content").and_then(|c| c.as_str()) {
+                            out.text.push_str(text);
                         }
+                        if let Some(calls) = delta.get("tool_calls").and_then(|t| t.as_array()) {
+                            if let Some(breach) =
+                                accumulate_tool_calls(calls, &mut pending_calls, budget)
+                            {
+                                apply_breach(out, breach);
+                                return Ok(());
+                            }
+                        }
+                    }
+                    if choice
+                        .get("finish_reason")
+                        .and_then(|t| t.as_str())
+                        .is_some()
+                    {
+                        flush_tool_calls(&mut pending_calls, out);
                     }
                 }
             }
             ProviderKind::Anthropic => match v.get("type").and_then(|t| t.as_str()) {
+                Some("content_block_start") => {
+                    if let Some(block) = v.get("content_block") {
+                        if let Some(breach) = collect_anthropic_block(block, out, budget) {
+                            apply_breach(out, breach);
+                            return Ok(());
+                        }
+                    }
+                }
                 Some("content_block_delta") => {
                     if v.pointer("/delta/type").and_then(|t| t.as_str()) == Some("text_delta") {
                         if let Some(text) = v.pointer("/delta/text").and_then(|t| t.as_str()) {
@@ -364,7 +580,10 @@ fn parse_sse<R: Read>(
                         }
                     }
                 }
-                Some("message_stop") | Some("error") => return Ok(()),
+                Some("message_stop") | Some("error") => {
+                    terminated = true;
+                    break;
+                }
                 _ => {}
             },
             ProviderKind::Gemini => {
@@ -372,14 +591,19 @@ fn parse_sse<R: Read>(
                     .pointer("/candidates/0/content/parts")
                     .and_then(|p| p.as_array())
                 {
-                    collect_gemini_parts(parts, out)?;
+                    if let Some(breach) = collect_gemini_parts(parts, out, budget) {
+                        apply_breach(out, breach);
+                        return Ok(());
+                    }
                 }
                 if v.get("done").and_then(|d| d.as_bool()) == Some(true) {
-                    return Ok(());
+                    terminated = true;
+                    break;
                 }
             }
         }
     }
+    out.stream_incomplete = !terminated;
     Ok(())
 }
 
@@ -433,7 +657,11 @@ fn extract_stream_error(kind: ProviderKind, v: &Value) -> Option<String> {
     }
 }
 
-fn collect_responses_item(item: &Value, out: &mut ExecutionResult) -> Result<(), ExecuteError> {
+fn collect_responses_item(
+    item: &Value,
+    out: &mut ExecutionResult,
+    budget: &StreamBudget,
+) -> Option<BudgetBreach> {
     match item.get("type").and_then(|t| t.as_str()) {
         Some("message") => {
             if let Some(content) = item.get("content").and_then(|c| c.as_array()) {
@@ -445,7 +673,7 @@ fn collect_responses_item(item: &Value, out: &mut ExecutionResult) -> Result<(),
                     }
                 }
             }
-            Ok(())
+            None
         }
         Some("function_call") => {
             let name = item
@@ -454,60 +682,75 @@ fn collect_responses_item(item: &Value, out: &mut ExecutionResult) -> Result<(),
                 .unwrap_or("")
                 .to_string();
             let raw_args = item.get("arguments").cloned().unwrap_or_else(|| json!({}));
-            let arguments = match raw_args {
-                Value::String(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({"raw": s})),
-                other => other,
-            };
-            out.tool_calls.push(ToolCall { name, arguments });
-            Ok(())
+            match bounded_tool_call(name, raw_args, budget) {
+                Ok(call) => {
+                    out.tool_calls.push(call);
+                    None
+                }
+                Err(breach) => Some(breach),
+            }
         }
-        _ => Ok(()),
+        _ => None,
     }
 }
 
-fn collect_anthropic_block(block: &Value, out: &mut ExecutionResult) -> Result<(), ExecuteError> {
+fn collect_anthropic_block(
+    block: &Value,
+    out: &mut ExecutionResult,
+    budget: &StreamBudget,
+) -> Option<BudgetBreach> {
     match block.get("type").and_then(|t| t.as_str()) {
         Some("text") => {
             if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
                 out.text.push_str(text);
             }
-            Ok(())
+            None
         }
         Some("tool_use") => {
-            out.tool_calls.push(ToolCall {
-                name: block
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
-            });
-            Ok(())
+            let name = block
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw = block.get("input").cloned().unwrap_or_else(|| json!({}));
+            match bounded_tool_call(name, raw, budget) {
+                Ok(call) => {
+                    out.tool_calls.push(call);
+                    None
+                }
+                Err(breach) => Some(breach),
+            }
         }
-        _ => Ok(()),
+        _ => None,
     }
 }
 
-fn collect_gemini_parts(parts: &[Value], out: &mut ExecutionResult) -> Result<(), ExecuteError> {
+fn collect_gemini_parts(
+    parts: &[Value],
+    out: &mut ExecutionResult,
+    budget: &StreamBudget,
+) -> Option<BudgetBreach> {
     for part in parts {
         if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
             out.text.push_str(text);
         }
         if let Some(call) = part.get("functionCall") {
-            out.tool_calls.push(ToolCall {
-                name: call
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string(),
-                arguments: call.get("args").cloned().unwrap_or_else(|| json!({})),
-            });
+            let name = call
+                .get("name")
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string();
+            let raw = call.get("args").cloned().unwrap_or_else(|| json!({}));
+            match bounded_tool_call(name, raw, budget) {
+                Ok(call) => out.tool_calls.push(call),
+                Err(breach) => return Some(breach),
+            }
         }
     }
-    Ok(())
+    None
 }
 
-fn openai_tool_call(call: &Value) -> Result<ToolCall, ExecuteError> {
+fn openai_tool_call(call: &Value, budget: &StreamBudget) -> Result<ToolCall, BudgetBreach> {
     let name = call
         .pointer("/function/name")
         .and_then(|n| n.as_str())
@@ -517,6 +760,26 @@ fn openai_tool_call(call: &Value) -> Result<ToolCall, ExecuteError> {
         .pointer("/function/arguments")
         .cloned()
         .unwrap_or_else(|| json!({}));
+    bounded_tool_call(name, raw, budget)
+}
+
+fn bounded_tool_call(
+    name: String,
+    raw: Value,
+    budget: &StreamBudget,
+) -> Result<ToolCall, BudgetBreach> {
+    let received = match &raw {
+        Value::String(value) => value.len(),
+        other => serde_json::to_vec(other).map_or(usize::MAX, |encoded| encoded.len()),
+    };
+    if received > budget.max_tool_args_bytes {
+        return Err(BudgetBreach::new(
+            TOOL_ARGS_BUDGET,
+            budget.max_tool_args_bytes as u64,
+            received as u64,
+            "bytes",
+        ));
+    }
     let arguments = match raw {
         Value::String(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({"raw": s})),
         other => other,
@@ -524,69 +787,70 @@ fn openai_tool_call(call: &Value) -> Result<ToolCall, ExecuteError> {
     Ok(ToolCall { name, arguments })
 }
 
-fn partial_tool_call(call: &Value) -> ToolCall {
-    let name = call
-        .pointer("/function/name")
-        .and_then(|n| n.as_str())
-        .unwrap_or("")
-        .to_string();
-    let raw = call
-        .pointer("/function/arguments")
-        .cloned()
-        .unwrap_or(json!({}));
-    let arguments = match raw {
-        Value::String(s) => serde_json::from_str(&s).unwrap_or_else(|_| json!({"raw": s})),
-        other => other,
-    };
-    ToolCall { name, arguments }
+/// One Chat Completions tool call, reassembled across delta fragments.
+#[derive(Default)]
+struct PartialToolCall {
+    name: String,
+    arguments: String,
+    /// Its arguments outgrew the tool-argument budget: it must never be
+    /// handed on for execution as if it were a complete call.
+    overflowed: bool,
 }
 
-/// Minimal SSE reader: yields the payload of each `data:` block.
-struct SseStream<R: Read> {
-    reader: BufReader<R>,
-    buf: String,
+/// Fold one `delta.tool_calls` array into the per-index accumulator. Returns
+/// the breach when a call's arguments cross their budget, so the caller
+/// aborts the request instead of executing a half-received argument blob.
+fn accumulate_tool_calls(
+    calls: &[Value],
+    pending: &mut BTreeMap<u64, PartialToolCall>,
+    budget: &StreamBudget,
+) -> Option<BudgetBreach> {
+    for (position, call) in calls.iter().enumerate() {
+        let index = call
+            .get("index")
+            .and_then(Value::as_u64)
+            .unwrap_or(position as u64);
+        let entry = pending.entry(index).or_default();
+        if entry.overflowed {
+            continue;
+        }
+        if let Some(name) = call.pointer("/function/name").and_then(Value::as_str) {
+            entry.name.push_str(name);
+        }
+        let Some(args) = call.pointer("/function/arguments").and_then(Value::as_str) else {
+            continue;
+        };
+        let received = entry.arguments.len() + args.len();
+        if received > budget.max_tool_args_bytes {
+            entry.arguments.clear();
+            entry.overflowed = true;
+            return Some(BudgetBreach::new(
+                TOOL_ARGS_BUDGET,
+                budget.max_tool_args_bytes as u64,
+                received as u64,
+                "bytes",
+            ));
+        }
+        entry.arguments.push_str(args);
+    }
+    None
 }
 
-impl<R: Read> SseStream<R> {
-    fn new(reader: R) -> Self {
-        Self {
-            reader: BufReader::new(reader),
-            buf: String::new(),
+/// Emit the reassembled calls. Overflowed ones are dropped, never truncated
+/// into execution.
+fn flush_tool_calls(pending: &mut BTreeMap<u64, PartialToolCall>, out: &mut ExecutionResult) {
+    for entry in pending.values() {
+        if entry.overflowed || (entry.name.is_empty() && entry.arguments.is_empty()) {
+            continue;
         }
+        let arguments = serde_json::from_str(&entry.arguments)
+            .unwrap_or_else(|_| json!({"raw": entry.arguments.clone()}));
+        out.tool_calls.push(ToolCall {
+            name: entry.name.clone(),
+            arguments,
+        });
     }
-
-    fn next_data(&mut self) -> Result<Option<String>, ExecuteError> {
-        let mut data = String::new();
-        loop {
-            let mut line = String::new();
-            let n = self
-                .reader
-                .read_line(&mut line)
-                .map_err(|e| ExecuteError::Transport(e.to_string()))?;
-            if n == 0 {
-                return if data.is_empty() {
-                    Ok(None)
-                } else {
-                    Ok(Some(data))
-                };
-            }
-            let line = line.trim_end_matches(['\n', '\r']);
-            if line.is_empty() {
-                if !data.is_empty() {
-                    return Ok(Some(std::mem::take(&mut data)));
-                }
-                continue;
-            }
-            if let Some(rest) = line.strip_prefix("data:") {
-                if !data.is_empty() {
-                    data.push('\n');
-                }
-                data.push_str(rest.trim_start());
-            }
-            // `event:`, `id:`, `retry:` and comment lines are ignored: the
-            // provider wire carries its kind inside the JSON payload.
-        }
-    }
+    pending.clear();
 }
 
 #[cfg(test)]
@@ -656,6 +920,29 @@ mod execute_tests {
     }
 
     #[test]
+    fn transport_and_protocol_errors_are_sanitized_at_execute_boundary() {
+        let transport = ExecuteError::transport(
+            "request https://first.example/cb?code=code-secret-a15 then http://later/#state=state-secret-a15 Authorization: Basic ab",
+        );
+        let protocol = ExecuteError::protocol(
+            r#"malformed {\"api_key\":\"xy\"} model=sk-secret status=400"#,
+        );
+        for (rendered, secrets) in [
+            (
+                transport.to_string(),
+                vec!["code-secret-a15", "state-secret-a15", "ab"],
+            ),
+            (protocol.to_string(), vec!["xy", "sk-secret"]),
+        ] {
+            for secret in secrets {
+                assert!(!rendered.contains(secret), "{secret} leaked in {rendered}");
+            }
+        }
+        assert!(transport.to_string().contains("first.example"));
+        assert!(protocol.to_string().contains("status=400"));
+    }
+
+    #[test]
     fn missing_base_url_is_typed() {
         let tx = tx_for(ProviderKind::Local, "llama", false);
         let cfg = ExecuteConfig {
@@ -672,24 +959,108 @@ mod execute_tests {
             provider_error_message(429, r#"{"error":{"message":"rate limited","code":"429"}}"#),
             "rate limited"
         );
+        // A non-JSON body is never surfaced verbatim: it could echo keys or
+        // account data. Only the status fact remains.
         assert_eq!(
             provider_error_message(500, "boom"),
-            "provider returned HTTP 500: boom"
+            "provider returned HTTP 500 (body not surfaced)"
         );
         assert_eq!(
             provider_error_message(500, ""),
             "provider returned HTTP 500 with an empty body"
         );
+        // Secret-looking runs inside structured messages are redacted.
+        assert_eq!(
+            provider_error_message(401, r#"{"message":"bad key sk-abcdef1234567890abcdef12"}"#),
+            "bad key [redacted]"
+        );
     }
 
     #[test]
-    fn sse_stream_yields_data_blocks() {
-        let body = "event: a\ndata: {\"n\":1}\n\nevent: b\ndata: {\"n\":2}\n\ndata: [DONE]\n\n";
-        let mut stream = SseStream::new(body.as_bytes());
-        assert_eq!(stream.next_data().unwrap().unwrap(), "{\"n\":1}");
-        assert_eq!(stream.next_data().unwrap().unwrap(), "{\"n\":2}");
-        assert_eq!(stream.next_data().unwrap().unwrap(), "[DONE]");
-        assert!(stream.next_data().unwrap().is_none());
+    fn stream_without_terminal_event_is_marked_incomplete() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Half\"}}]}
+
+",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"-way\"}}]}
+
+",
+        );
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::OpenAiCompatible,
+            body.as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(out.text, "Half-way");
+        assert!(out.stream_incomplete, "truncated stream stays provisional");
+        assert_eq!(out.error_category.as_deref(), None);
+
+        // The same stream terminated by [DONE] is complete.
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::OpenAiCompatible,
+            format!(
+                "{body}data: [DONE]
+
+"
+            )
+            .as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
+        assert!(!out.stream_incomplete);
+
+        // A provider failure event is a terminal (classified) failure.
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::Anthropic,
+            "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}
+
+".as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
+        assert!(!out.stream_incomplete);
+        assert_eq!(out.error.as_deref(), Some("Overloaded"));
+        assert_eq!(
+            out.error_category.as_deref(),
+            Some("PROVIDER_RATE_LIMIT"),
+            "in-band overload classifies like a 429"
+        );
+        assert!(out.retryable.unwrap_or(false));
+    }
+
+    #[test]
+    fn chat_tool_call_fragments_reassemble_into_complete_calls() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_a\",\"function\":{\"name\":\"lookup\",\"arguments\":\"{\\\"q\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"x\\\"}\"}},{\"index\":1,\"id\":\"call_b\",\"function\":{\"name\":\"other\",\"arguments\":\"{}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::OpenAiCompatible,
+            body.as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            out.tool_calls.len(),
+            2,
+            "one call per index, not one per fragment: {:?}",
+            out.tool_calls
+        );
+        assert_eq!(out.tool_calls[0].name, "lookup");
+        assert_eq!(out.tool_calls[0].arguments["q"], "x");
+        assert_eq!(out.tool_calls[1].name, "other");
+        assert!(!out.stream_incomplete);
     }
 
     #[test]
@@ -701,7 +1072,13 @@ mod execute_tests {
             "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\"}}\n\n",
         );
         let mut out = ExecutionResult::default();
-        parse_sse(ProviderKind::OpenAiResponses, body.as_bytes(), &mut out).unwrap();
+        parse_sse(
+            ProviderKind::OpenAiResponses,
+            body.as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.text, "Hello world");
         assert_eq!(out.tool_calls.len(), 1);
         assert_eq!(out.tool_calls[0].name, "lookup");
@@ -719,7 +1096,13 @@ mod execute_tests {
             "data: [DONE]\n\n",
         );
         let mut out = ExecutionResult::default();
-        parse_sse(ProviderKind::OpenAiCompatible, body.as_bytes(), &mut out).unwrap();
+        parse_sse(
+            ProviderKind::OpenAiCompatible,
+            body.as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.text, "Hi there");
     }
 
@@ -732,7 +1115,13 @@ mod execute_tests {
             "data: {\"type\":\"message_stop\"}\n\n",
         );
         let mut out = ExecutionResult::default();
-        parse_sse(ProviderKind::Anthropic, body.as_bytes(), &mut out).unwrap();
+        parse_sse(
+            ProviderKind::Anthropic,
+            body.as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.text, "Bonjour le monde");
     }
 
@@ -740,7 +1129,13 @@ mod execute_tests {
     fn parses_anthropic_stream_error() {
         let body = "data: {\"type\":\"error\",\"error\":{\"type\":\"overloaded_error\",\"message\":\"Overloaded\"}}\n\n";
         let mut out = ExecutionResult::default();
-        parse_sse(ProviderKind::Anthropic, body.as_bytes(), &mut out).unwrap();
+        parse_sse(
+            ProviderKind::Anthropic,
+            body.as_bytes(),
+            &mut out,
+            &StreamBudget::default(),
+        )
+        .unwrap();
         assert_eq!(out.error.as_deref(), Some("Overloaded"));
     }
 
@@ -755,7 +1150,7 @@ mod execute_tests {
             }]
         });
         let mut out = ExecutionResult::default();
-        parse_single(ProviderKind::Gemini, &v, &mut out).unwrap();
+        parse_single(ProviderKind::Gemini, &v, &mut out, &StreamBudget::default()).unwrap();
         assert_eq!(out.text, "Ciao");
         assert_eq!(out.tool_calls[0].name, "lookup");
     }
@@ -763,7 +1158,145 @@ mod execute_tests {
     #[test]
     fn parses_compatible_tool_call_arguments() {
         let call = json!({"id": "c1", "type": "function", "function": {"name": "lookup", "arguments": "{\"q\":\"y\"}"}});
-        let parsed = openai_tool_call(&call).unwrap();
+        let parsed = openai_tool_call(&call, &StreamBudget::default()).unwrap();
         assert_eq!(parsed.arguments["q"], "y");
+    }
+
+    #[test]
+    fn every_complete_tool_shape_obeys_the_argument_budget() {
+        let oversized = "x".repeat(5000);
+        let cases = [
+            (
+                ProviderKind::OpenAiResponses,
+                json!({"output":[{"type":"function_call","name":"run","arguments":oversized}]}),
+            ),
+            (
+                ProviderKind::OpenAiCompatible,
+                json!({"choices":[{"message":{"tool_calls":[{"function":{"name":"run","arguments":oversized}}]}}]}),
+            ),
+            (
+                ProviderKind::Anthropic,
+                json!({"content":[{"type":"tool_use","name":"run","input":{"value":oversized}}]}),
+            ),
+            (
+                ProviderKind::Gemini,
+                json!({"candidates":[{"content":{"parts":[{"functionCall":{"name":"run","args":{"value":oversized}}}]}}]}),
+            ),
+        ];
+        for (kind, document) in cases {
+            let mut budget = StreamBudget::default();
+            budget.max_tool_args_bytes = 1024;
+            let mut out = ExecutionResult::default();
+            parse_single(kind, &document, &mut out, &budget).unwrap();
+            assert!(out.tool_calls.is_empty(), "{kind:?} leaked a tool call");
+            assert_eq!(
+                out.resource_limit
+                    .as_ref()
+                    .map(|breach| breach.budget.as_str()),
+                Some(TOOL_ARGS_BUDGET),
+                "{kind:?} did not report the tool argument limit"
+            );
+        }
+    }
+
+    #[test]
+    fn responses_sse_tool_arguments_obey_the_argument_budget() {
+        let body = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"function_call\",\"name\":\"run\",\"arguments\":\"{}\"}}}}\n\n",
+            "x".repeat(5000)
+        );
+        let mut budget = StreamBudget::default();
+        budget.max_tool_args_bytes = 1024;
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::OpenAiResponses,
+            body.as_bytes(),
+            &mut out,
+            &budget,
+        )
+        .unwrap();
+        assert!(out.tool_calls.is_empty());
+        assert_eq!(
+            out.resource_limit
+                .as_ref()
+                .map(|breach| breach.budget.as_str()),
+            Some(TOOL_ARGS_BUDGET)
+        );
+    }
+
+    fn budget_with_line(cap: usize) -> StreamBudget {
+        StreamBudget {
+            max_line_bytes: cap,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_line_budget_breach_aborts_the_request_and_keeps_partial_text_provisional() {
+        let flood = "a".repeat(50_000);
+        let body = format!(
+            "data: {{\"choices\":[{{\"delta\":{{\"content\":\"so far\"}}}}]}}\n\ndata: {flood}\n\n"
+        );
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::OpenAiCompatible,
+            body.as_bytes(),
+            &mut out,
+            &budget_with_line(4096),
+        )
+        .unwrap();
+        assert_eq!(out.text, "so far", "received facts are preserved");
+        assert!(out.stream_incomplete, "a breach is never a completion");
+        let breach = out.resource_limit.clone().expect("typed resource limit");
+        assert_eq!(breach.budget, crate::budget::LINE_BUDGET);
+        assert_eq!(breach.limit, 4096);
+        assert_eq!(
+            out.error_category.as_deref(),
+            Some("RESOURCE_EXHAUSTED"),
+            "{out:?}"
+        );
+        assert_eq!(out.retryable, Some(false));
+        assert!(
+            out.error
+                .as_deref()
+                .unwrap()
+                .contains("this request was aborted"),
+            "{:?}",
+            out.error
+        );
+    }
+
+    #[test]
+    fn overflowing_tool_arguments_abort_instead_of_executing_a_truncated_call() {
+        let mut body = String::from(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c1\",\"function\":{\"name\":\"write\",\"arguments\":\"{\\\"t\\\":\\\"\"}}]}}]}\n\n",
+        );
+        for _ in 0..600 {
+            body.push_str(
+                "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"aaaaaaaaaa\"}}]}}]}\n\n",
+            );
+        }
+        body.push_str("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n");
+        body.push_str("data: [DONE]\n\n");
+
+        let mut budget = StreamBudget::default();
+        budget.max_tool_args_bytes = 4096;
+        budget.max_line_bytes = 4096;
+        let mut out = ExecutionResult::default();
+        parse_sse(
+            ProviderKind::OpenAiCompatible,
+            body.as_bytes(),
+            &mut out,
+            &budget,
+        )
+        .unwrap();
+        assert!(
+            out.tool_calls.is_empty(),
+            "a truncated call must never reach the executor"
+        );
+        assert!(out.stream_incomplete);
+        let breach = out.resource_limit.clone().expect("typed resource limit");
+        assert_eq!(breach.budget, crate::budget::TOOL_ARGS_BUDGET);
+        assert_eq!(breach.limit, 4096);
     }
 }

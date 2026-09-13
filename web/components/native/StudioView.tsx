@@ -1,8 +1,12 @@
 "use client";
+import dynamic from 'next/dynamic';
+import { useRouter } from 'next/navigation';
+import { keepCanvasHandoff } from '@/lib/native-canvas-recovery';
 import { useCallback, useDeferredValue, useEffect, useMemo, useRef, useState } from 'react';
 import { ArrowUp, BookOpen, Camera, Clapperboard, Image as ImageIcon, Loader2, Search, Settings2, X } from 'lucide-react';
 import { type LibraryEntry } from '@/lib/native-library';
 import { readStudioFrame, studioFinished, type StudioFrameExport, type StudioInput, type StudioJob, type StudioProfile, type StudioReference, type StudioTemplate } from '@/lib/native-studio';
+import { TailExportRunner, type TailExportHandle } from '@/lib/native-studio-tail';
 import { errorText, useWorkbench } from './NativeWorkbenchProvider';
 import { Modal } from './WorkbenchShell';
 import { useLocalPreference } from './useLocalPreference';
@@ -15,6 +19,8 @@ import { StudioSequences } from './StudioSequence';
 import { StudioEditLibrary } from './StudioEditLibrary';
 import { StudioTemplateMenu } from './StudioTemplates';
 import { StudioArticle } from './StudioArticle';
+
+const CanvasWorkspace = dynamic(() => import('./CanvasWorkspace').then(m => m.CanvasWorkspace), { ssr: false });
 
 type Draft = StudioInput & { kind: 'image' | 'video'; profileId: string; inputVersion: 2 };
 const emptyDraft: Draft = { inputVersion: 2, kind: 'image', profileId: '', prompt: '', size: '1024x1024', aspect: '1:1', count: 1, seconds: 4, quality: 'auto', references: [] };
@@ -33,8 +39,12 @@ export function StudioView() {
   const [profiles, setProfiles] = useState<StudioProfile[]>([]), [jobs, setJobs] = useState<StudioJob[]>([]), [total, setTotal] = useState(0), [loading, setLoading] = useState(true);
   const [templates, setTemplates] = useState<StudioTemplate[]>([]);
   const [tailPreview, setTailPreview] = useState<{ url: string; frame: StudioFrameExport } | undefined>(undefined);
+  // C17: the frame export is cancellable — one activation at a time, cancel sends at most once.
+  const tailRunner = useRef<TailExportRunner | null>(null);
+  const [tailActive, setTailActive] = useState<TailExportHandle | null>(null);
   useEffect(() => () => { if (tailPreview) URL.revokeObjectURL(tailPreview.url); }, [tailPreview]);
   const [connectionsOpen, setConnectionsOpen] = useState(false);
+  const [canvasOpen, setCanvasOpen] = useState(false); const router = useRouter();
   const [busy, setBusy] = useState(''), [error, setError] = useState(''), [query, setQuery] = useState(''), [filter, setFilter] = useState('all'), [selected, setSelected] = useState<StudioJob>(), [outputIndex, setOutputIndex] = useState(0);
   const submission = useRef<{ body: string; key: string } | undefined>(undefined), submitting = useRef(false), referenceInputs = useRef<StudioReferenceHandle>(null), prompt = useRef<HTMLTextAreaElement>(null), polling = useRef(false);
   const patch = (value: Partial<Draft>) => updateDraft(current => ({ ...current, ...value }));
@@ -99,14 +109,33 @@ export function StudioView() {
   // offer preview / download / continue-from-frame — the same derived image
   // the storyboard queue uses for continuity.
   const exportTail = async (job: StudioJob) => {
-    setBusy('tail'); setError('');
+    if (tailActive) return;
+    setError('');
+    if (!tailRunner.current) tailRunner.current = new TailExportRunner((method, params) => request(method, params));
+    const runner = tailRunner.current;
+    setTailActive({ jobId: job.id, index: outputIndex });
     try {
-      const frame = await request<StudioFrameExport>('studio/frame/export', { id: job.id, index: outputIndex });
-      const { blob } = await readStudioFrame(request, job.id, outputIndex);
-      const url = URL.createObjectURL(blob);
-      setTailPreview(current => { if (current) URL.revokeObjectURL(current.url); return { url, frame }; });
-      setNotice(t('已导出真实尾帧并存入资料库', 'The real last frame was exported and saved to your library'));
-    } catch (e) { setError(errorText(e)); } finally { setBusy(''); }
+      const outcome = await runner.run(job.id, outputIndex, async frame => {
+        const { blob } = await readStudioFrame(request, job.id, outputIndex);
+        const url = URL.createObjectURL(blob);
+        setTailPreview(current => { if (current) URL.revokeObjectURL(current.url); return { url, frame }; });
+      });
+      if (outcome === 'done') setNotice(t('已导出真实尾帧并存入资料库', 'The real last frame was exported and saved to your library'));
+      else if (outcome === 'cancelled') setNotice(t('已取消尾帧导出', 'The last-frame export was cancelled'));
+    } catch (e) { setError(errorText(e)); } finally { setTailActive(null); }
+  };
+  const cancelTail = async () => {
+    if (!tailRunner.current) return;
+    const result = await tailRunner.current.cancel();
+    const messages: Record<string, string> = {
+      sent: t('已请求取消，等待确认…', 'Cancellation requested; waiting for confirmation'),
+      'already-requested': t('已请求取消，等待确认…', 'Cancellation requested; waiting for confirmation'),
+      confirmed: t('尾帧导出已取消。', 'The last-frame export was cancelled.'),
+      declined: t('导出已经完成，无需取消；结果以最终输出为准。', 'The export already finished; the final output is authoritative.'),
+      failed: t('取消请求失败，可重试。', 'The cancel request failed; you can retry.'),
+      inactive: t('没有进行中的尾帧导出。', 'No last-frame export is running.'),
+    };
+    setNotice(messages[result] ?? t('取消状态未知。', 'Cancel status unknown.'));
   };
   const downloadTail = () => {
     if (!tailPreview) return;
@@ -139,8 +168,9 @@ export function StudioView() {
     const search = deferredQuery.toLocaleLowerCase();
     return jobs.filter(job => (filter === 'all' || job.kind === filter) && `${job.input?.prompt ?? ''} ${job.provider?.name ?? ''}`.toLocaleLowerCase().includes(search));
   }, [jobs, filter, deferredQuery]);
+  if (canvasOpen) return <CanvasWorkspace onClose={() => setCanvasOpen(false)} onAskAgent={(text, id) => { try { keepCanvasHandoff({ id, text }); router.push('/workbench'); } catch (e) { setNotice(errorText(e)); } }} />;
   return <div className="ns-studio">
-    <div className="ns-topline"><button className="nw-button" onClick={() => setConnectionsOpen(true)}><Settings2 size={16} />{t('模型连接', 'Model connections')}</button></div>
+    <div className="ns-topline"><button className="nw-button" onClick={() => setCanvasOpen(true)}><ImageIcon size={16} />{t('创作画布', 'Creative canvas')}</button><button className="nw-button" onClick={() => setConnectionsOpen(true)}><Settings2 size={16} />{t('模型连接', 'Model connections')}</button></div>
     <section className="ns-create" aria-label={t('图片和视频创作', 'Image and video creation')}>
       <div className="ns-heading"><h1>{draft.kind === 'image' ? t('把想象变成画面', 'Turn your ideas into images') : t('让画面动起来', 'Bring your ideas to life')}</h1><p>{t('描述你的想法，或放入参考图继续创作。', 'Describe an idea, or add a reference image and make it your own.')}</p></div>
       <form className="ns-composer" onSubmit={e => { e.preventDefault(); void generate(); }} onDragOver={e => e.preventDefault()} onDrop={e => { e.preventDefault(); void referenceInputs.current?.importFiles(e.dataTransfer.files); }} onPaste={e => { const files = Array.from(e.clipboardData.files).filter(file => file.type.startsWith('image/')); if (files.length) { e.preventDefault(); void referenceInputs.current?.importFiles(files); } }}>
@@ -166,7 +196,7 @@ export function StudioView() {
       {jobs.length < total && <button className="nw-button ns-load-more" disabled={!!busy} onClick={async () => { setBusy('more'); try { const result = await request<{ jobs: StudioJob[]; total: number }>('studio/list', { offset: jobs.length }); setJobs(current => [...current, ...result.jobs.filter(job => !current.some(item => item.id === job.id))]); setTotal(result.total); } catch (e) { setError(errorText(e)); } finally { setBusy(''); } }}>{t('加载更早的作品', 'Load earlier creations')}</button>}
     </section>
     {connectionsOpen && <StudioConnections profiles={profiles} kind={draft.kind} close={() => setConnectionsOpen(false)} saved={refreshProfiles} />}
-    {selected && <Modal title={selected.kind === 'image' ? t('图片作品', 'Image creation') : t('视频作品', 'Video creation')} close={() => { setSelected(undefined); setTailPreview(current => { if (current) URL.revokeObjectURL(current.url); return undefined; }); }} busy={!!busy}><div className="ns-preview"><div className="ns-preview-canvas">{selected.outputs?.length ? <StudioMedia job={selected} index={outputIndex} /> : <div className="ns-empty"><Loader2 size={22} className={studioFinished(selected) ? '' : 'nw-spin'} /><p>{stageLabel(selected)}</p></div>}</div><div className="ns-preview-detail"><p className="ns-prompt-copy">{selected.input?.prompt}</p><p className="ns-hint">{selected.provider?.name} · {selected.input?.size}{selected.kind === 'video' ? ` · ${selected.input?.seconds}s` : ''}</p>{selected.error && <p className="nw-inline-error" role="alert">{selected.error}</p>}{selected.remoteMayContinue && <p className="ns-hint">{t('已停止本地任务；服务商可能仍在生成并计费。', 'Local tracking has stopped; the provider may still generate and charge for this job.')}</p>}{selected.outputs?.length > 1 && <div className="ns-output-selector">{selected.outputs.map((output, index) => <button className="nw-button" key={output.name} aria-pressed={outputIndex === index} onClick={() => setOutputIndex(index)}>{index + 1}</button>)}</div>}<div className="ns-preview-actions"><button className="nw-button" disabled={!!busy || !selected.input} onClick={() => continueFrom(selected)}>{t('继续创作', 'Create again')}</button>{!studioFinished(selected) && <button className="nw-button" disabled={!!busy} onClick={() => void action(selected, ['paused', 'needs-connection'].includes(selected.phase) ? 'studio/resume' : 'studio/cancel')}>{['paused', 'needs-connection'].includes(selected.phase) ? t('继续查询', 'Resume tracking') : t('停止', 'Stop')}</button>}{selected.outputs?.length > 0 && <><button className="nw-button" disabled={!!busy} onClick={() => void saveOutput(selected)}><BookOpen size={15} />{t('存入资料库', 'Save to library')}</button>{selected.kind === 'image' && <><button className="nw-button" disabled={!!busy} onClick={() => void saveOutput(selected, true)}>{t('用作参考图', 'Use as reference')}</button><button className="nw-button" disabled={!!busy} onClick={() => void makeVideoFrom(selected)}><Clapperboard size={15} />{t('以此图制作视频', 'Make a video from this')}</button></>}{selected.kind === 'video' && <button className="nw-button" disabled={!!busy} onClick={() => void exportTail(selected)}><Camera size={15} />{tailPreview ? t('重新导出尾帧', 'Re-export last frame') : t('导出尾帧', 'Export last frame')}</button>}</>}</div>
+    {selected && <Modal title={selected.kind === 'image' ? t('图片作品', 'Image creation') : t('视频作品', 'Video creation')} close={() => { setSelected(undefined); setTailPreview(current => { if (current) URL.revokeObjectURL(current.url); return undefined; }); }} busy={!!busy}><div className="ns-preview"><div className="ns-preview-canvas">{selected.outputs?.length ? <StudioMedia job={selected} index={outputIndex} /> : <div className="ns-empty"><Loader2 size={22} className={studioFinished(selected) ? '' : 'nw-spin'} /><p>{stageLabel(selected)}</p></div>}</div><div className="ns-preview-detail"><p className="ns-prompt-copy">{selected.input?.prompt}</p><p className="ns-hint">{selected.provider?.name} · {selected.input?.size}{selected.kind === 'video' ? ` · ${selected.input?.seconds}s` : ''}</p>{selected.error && <p className="nw-inline-error" role="alert">{selected.error}</p>}{selected.remoteMayContinue && <p className="ns-hint">{t('已停止本地任务；服务商可能仍在生成并计费。', 'Local tracking has stopped; the provider may still generate and charge for this job.')}</p>}{selected.outputs?.length > 1 && <div className="ns-output-selector">{selected.outputs.map((output, index) => <button className="nw-button" key={output.name} aria-pressed={outputIndex === index} onClick={() => setOutputIndex(index)}>{index + 1}</button>)}</div>}<div className="ns-preview-actions"><button className="nw-button" disabled={!!busy || !selected.input} onClick={() => continueFrom(selected)}>{t('继续创作', 'Create again')}</button>{!studioFinished(selected) && <button className="nw-button" disabled={!!busy} onClick={() => void action(selected, ['paused', 'needs-connection'].includes(selected.phase) ? 'studio/resume' : 'studio/cancel')}>{['paused', 'needs-connection'].includes(selected.phase) ? t('继续查询', 'Resume tracking') : t('停止', 'Stop')}</button>}{selected.outputs?.length > 0 && <><button className="nw-button" disabled={!!busy} onClick={() => void saveOutput(selected)}><BookOpen size={15} />{t('存入资料库', 'Save to library')}</button>{selected.kind === 'image' && <><button className="nw-button" disabled={!!busy} onClick={() => void saveOutput(selected, true)}>{t('用作参考图', 'Use as reference')}</button><button className="nw-button" disabled={!!busy} onClick={() => void makeVideoFrom(selected)}><Clapperboard size={15} />{t('以此图制作视频', 'Make a video from this')}</button></>}{selected.kind === 'video' && <button className="nw-button" disabled={!!busy} onClick={() => void exportTail(selected)}><Camera size={15} />{tailPreview ? t('重新导出尾帧', 'Re-export last frame') : t('导出尾帧', 'Export last frame')}</button>}{selected.kind === 'video' && tailActive && tailActive.jobId === selected.id && <button className="nw-button" onClick={() => void cancelTail()}>{t('取消导出', 'Cancel export')}</button>}</>}</div>
       {tailPreview && selected.kind === 'video' && <div className="ns-tail-preview">
         {/* eslint-disable-next-line @next/next/no-img-element */}
         <img src={tailPreview.url} alt={t('视频尾帧预览', 'Video last frame preview')} />

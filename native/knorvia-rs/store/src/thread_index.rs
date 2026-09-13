@@ -3,6 +3,7 @@
 //! durable documents. No on-disk format or migration is introduced.
 
 use super::{ProductStore, StoreError, Thread, invalid, read_json};
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::io;
@@ -15,7 +16,35 @@ pub(super) struct ThreadDirectoryIndex {
     by_workspace: HashMap<String, BTreeSet<String>>,
 }
 
+/// Serializable thread directory for durable checkpoints.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub(super) struct ThreadDirectoryDto {
+    pub id: String,
+    pub workspace_id: String,
+}
+
 impl ThreadDirectoryIndex {
+    pub(super) fn snapshot(&self) -> Vec<ThreadDirectoryDto> {
+        self.workspace_by_id
+            .iter()
+            .map(|(id, workspace_id)| ThreadDirectoryDto {
+                id: id.clone(),
+                workspace_id: workspace_id.clone(),
+            })
+            .collect()
+    }
+
+    pub(super) fn restore(&mut self, dtos: Vec<ThreadDirectoryDto>) {
+        for dto in dtos {
+            self.workspace_by_id
+                .insert(dto.id.clone(), dto.workspace_id.clone());
+            self.by_workspace
+                .entry(dto.workspace_id)
+                .or_default()
+                .insert(dto.id);
+        }
+    }
+
     fn record(&mut self, thread: &Thread) {
         if let Some(previous) = self
             .workspace_by_id
@@ -39,6 +68,20 @@ impl ProductStore {
                 "thread directory index lock poisoned: {error}"
             )))
         })
+    }
+
+    pub(super) fn snapshot_thread_directory(&self) -> Result<Vec<ThreadDirectoryDto>, StoreError> {
+        let index = self.lock_thread_index()?;
+        Ok(index.snapshot())
+    }
+
+    pub(super) fn restore_thread_directory(
+        &self,
+        dtos: Vec<ThreadDirectoryDto>,
+    ) -> Result<(), StoreError> {
+        let mut index = self.lock_thread_index()?;
+        index.restore(dtos);
+        Ok(())
     }
 
     pub(super) fn reset_thread_index(&self) -> Result<(), StoreError> {

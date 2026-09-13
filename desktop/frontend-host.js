@@ -15,7 +15,7 @@ if (!webRoot || !pipeName) throw new Error("Missing desktop renderer configurati
 process.env.NODE_ENV = "production";
 process.chdir(webRoot);
 const distDir = process.env.KNORVIA_NEXT_DIST_DIR || ".next";
-if (![".next", ".next-knorvia"].includes(distDir)) throw new Error("Invalid desktop Next dist directory");
+if (!/^\.next(?:-[a-zA-Z0-9_-]+)?$/.test(distDir)) throw new Error("Invalid desktop Next dist directory");
 const required = require(path.join(webRoot, distDir, "required-server-files.json"));
 const config = required.config;
 process.env.__NEXT_PRIVATE_STANDALONE_CONFIG = JSON.stringify(config);

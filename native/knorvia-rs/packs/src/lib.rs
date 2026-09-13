@@ -12,6 +12,7 @@ use knorvia_capability_host::{Invocation, PackHost, PackManifest, PackState};
 use knorvia_store::{ProductStore, StoreError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use std::sync::Arc;
 
 #[derive(Debug, thiserror::Error)]
 pub enum PackExecError {
@@ -19,6 +20,11 @@ pub enum PackExecError {
     Host(#[from] knorvia_capability_host::PackError),
     #[error(transparent)]
     Store(#[from] StoreError),
+    /// A request-side validation failure: bad pack id, uninstalled pack,
+    /// missing capability, unknown workspace. Zero durable writes happened,
+    /// so a caller's idempotency key stays cleanly retryable (A05).
+    #[error("{0}")]
+    Invalid(String),
     #[error("{0}")]
     Msg(String),
 }
@@ -178,6 +184,53 @@ pub struct RenderContext {
     pub invocation_id: String,
 }
 
+/// Shared cancellation for one in-flight invocation. The control plane
+/// holds one per admitted invocation so a cancel reaches the actual
+/// registered worker, not just the durable record; the runner registers its
+/// live process-tree killer through [`PackRunner::bind_cancel`].
+#[derive(Clone, Default)]
+pub struct InvocationCancel(Arc<CancelInner>);
+
+#[derive(Default)]
+struct CancelInner {
+    cancelled: std::sync::atomic::AtomicBool,
+    publication: std::sync::Mutex<()>,
+    reclaim_failed: std::sync::atomic::AtomicBool,
+    killers: std::sync::Mutex<Vec<Arc<dyn Fn() + Send + Sync>>>,
+}
+
+impl InvocationCancel {
+    /// Cancel the invocation: latch the flag and run every registered
+    /// killer (ending the worker process tree). Each killer runs exactly
+    /// once — a repeated cancel is a no-op, and a killer registered after
+    /// the latch runs at registration so a worker racing its own
+    /// registration cannot survive a cancel.
+    pub fn cancel(&self) {
+        let publication = self.0.publication.lock().unwrap_or_else(|e| e.into_inner());
+        if self.0.cancelled.swap(true, std::sync::atomic::Ordering::SeqCst) { return; }
+        drop(publication);
+        let killers = std::mem::take(&mut *self.0.killers.lock().unwrap_or_else(|e| e.into_inner()));
+        for kill in killers { kill(); }
+    }
+
+    pub fn is_cancelled(&self) -> bool { self.0.cancelled.load(std::sync::atomic::Ordering::SeqCst) }
+    pub fn all_reclaimed(&self) -> bool { !self.0.reclaim_failed.load(std::sync::atomic::Ordering::SeqCst) }
+    fn publication_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.0.publication.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub fn register_killer(&self, kill: Arc<dyn Fn() + Send + Sync>) {
+        let mut killers = self.0.killers.lock().unwrap_or_else(|e| e.into_inner());
+        if self.is_cancelled() { drop(killers); kill(); } else { killers.push(kill); }
+    }
+    pub fn register_reclaimer(&self, kill: Arc<dyn Fn() -> bool + Send + Sync>) {
+        let state = Arc::downgrade(&self.0);
+        self.register_killer(Arc::new(move || {
+            if !kill() { if let Some(state) = state.upgrade() { state.reclaim_failed.store(true, std::sync::atomic::Ordering::SeqCst); } }
+        }));
+    }
+
+}
+
 /// Executes one pack render. Production: the supervised `knorvia-pack-worker`
 /// process (see `capability-host::worker`). Tests: in-process rendering.
 pub trait PackRunner {
@@ -187,6 +240,12 @@ pub trait PackRunner {
         pack_id: &str,
         input: &Value,
     ) -> Result<RenderedPack, PackExecError>;
+
+    /// Bind this runner's in-flight work to a shared cancellation handle so
+    /// a control-plane cancel reaches the live worker process. Default:
+    /// nothing to bind (in-process runners cancel cooperatively at the
+    /// post-render cancelled-job checkpoint).
+    fn bind_cancel(&mut self, _cancel: InvocationCancel) {}
 }
 
 #[derive(Debug, Clone)]
@@ -259,17 +318,30 @@ impl<'a> PackRunner for InProcessRunner<'a> {
     }
 }
 
-pub fn invoke(
+/// Durable identity admitted for one invocation. Created before any work
+/// starts so the control plane (and a later cancel) can name the same
+/// business record while the render is still running in the background.
+#[derive(Debug, Clone)]
+pub struct AdmittedInvocation {
+    pub invocation_id: String,
+    pub job_id: String,
+    pub pack_id: String,
+    pub workspace_id: String,
+}
+
+/// Read-only semantic prevalidation (A05): bad pack id, uninstalled pack,
+/// missing declared capability or unknown workspace fail here with zero
+/// durable writes, so the caller's idempotency key never gets wedged by an
+/// invocation that was never legal.
+pub fn validate_invocation(
     host: &PackHost,
     store: &ProductStore,
     pack_id: &str,
     workspace_id: &str,
-    input: &Value,
-    runner: &mut dyn PackRunner,
-) -> Result<PackOutcome, PackExecError> {
+) -> Result<(), PackExecError> {
     let rec = host.read(pack_id)?;
     if rec.state != PackState::Installed {
-        return Err(PackExecError::Msg(format!(
+        return Err(PackExecError::Invalid(format!(
             "pack {pack_id} is not installed"
         )));
     }
@@ -277,22 +349,77 @@ pub fn invoke(
     // an invocation without a declared capability is a policy violation, not
     // a render error.
     if rec.manifest.capabilities.is_empty() {
-        return Err(PackExecError::Msg(format!(
+        return Err(PackExecError::Invalid(format!(
             "pack {pack_id} declares no capabilities; refusing to invoke"
         )));
     }
-    let _ = store.read_workspace(workspace_id)?;
-    let inv = host.invoke(pack_id, input.clone())?;
-    let mut job = store.create_job(workspace_id, pack_id)?;
-    job = store.run_job(&job.id)?;
+    store
+        .read_workspace(workspace_id)
+        .map_err(|e| PackExecError::Invalid(format!("unknown workspace {workspace_id}: {e}")))?;
+    Ok(())
+}
 
-    if input.get("cancelBeforeWork").and_then(|v| v.as_bool()) == Some(true) {
-        host.cancel(&inv.id)?;
-        store.cancel_job(&job.id)?;
+/// Admit one invocation: validate semantics, create the invocation record
+/// and its running Job, and durably link them. No render happens here, so
+/// this is cheap enough to run on the control thread before background
+/// execution starts. A crash between these writes leaves a `running`
+/// invocation without a job link; [`PackHost::recover_incomplete`] fails
+/// such records at the next open and the idempotency layer reports the
+/// outcome as unknown instead of replaying a half admission.
+pub fn admit_invocation(
+    host: &PackHost,
+    store: &ProductStore,
+    pack_id: &str,
+    workspace_id: &str,
+    input: &Value,
+) -> Result<AdmittedInvocation, PackExecError> {
+    validate_invocation(host, store, pack_id, workspace_id)?;
+    let inv = host.invoke(pack_id, input.clone())?;
+    let job = store.create_job(workspace_id, pack_id)?;
+    let job = store.run_job(&job.id)?;
+    // Durably link the invocation to this job so a restart can resume the
+    // same business identity instead of silently opening a new one.
+    host.link_job(&inv.id, &job.id)?;
+    Ok(AdmittedInvocation {
+        invocation_id: inv.id,
+        job_id: job.id,
+        pack_id: pack_id.to_string(),
+        workspace_id: workspace_id.to_string(),
+    })
+}
+
+/// Run one admitted invocation to its outcome under a shared cancel handle.
+/// This is the execution half of [`invoke`]: checkpoints, render, the
+/// cancel-after-render guard, publish receipt and completion. Nothing here
+/// re-validates semantics; admission owns that.
+pub fn execute_admitted(
+    host: &PackHost,
+    store: &ProductStore,
+    admitted: &AdmittedInvocation,
+    runner: &mut dyn PackRunner,
+    cancel: InvocationCancel,
+) -> Result<PackOutcome, PackExecError> {
+    let AdmittedInvocation {
+        invocation_id: inv_id,
+        job_id,
+        pack_id,
+        workspace_id,
+    } = admitted;
+    let inv_id = inv_id.clone();
+    let job_id = job_id.clone();
+    let pack_id = pack_id.clone();
+    let inv = host.read_invocation(&inv_id)?;
+    let job = store.read_job(&job_id)?;
+    let _ = workspace_id;
+    runner.bind_cancel(cancel.clone());
+
+    if cancel.is_cancelled() || inv.input.get("cancelBeforeWork").and_then(|v| v.as_bool()) == Some(true) {
+        host.cancel(&inv_id)?;
+        store.cancel_job(&job_id)?;
         return Ok(PackOutcome {
-            pack_id: pack_id.into(),
-            invocation_id: inv.id,
-            job_id: job.id,
+            pack_id,
+            invocation_id: inv_id,
+            job_id,
             artifact_id: None,
             status: "cancelled".into(),
             checkpoint: None,
@@ -301,16 +428,16 @@ pub fn invoke(
     }
 
     let checkpoint = json!({"phase": "indexed", "packId": pack_id});
-    store.checkpoint_job(&job.id, checkpoint.clone())?;
-    host.checkpoint(&inv.id, checkpoint.clone())?;
+    store.checkpoint_job(&job_id, checkpoint.clone())?;
+    host.checkpoint(&inv_id, checkpoint.clone())?;
 
-    if input.get("cancelAfterCheckpoint").and_then(|v| v.as_bool()) == Some(true) {
-        host.cancel(&inv.id)?;
-        store.cancel_job(&job.id)?;
+    if inv.input.get("cancelAfterCheckpoint").and_then(|v| v.as_bool()) == Some(true) {
+        host.cancel(&inv_id)?;
+        store.cancel_job(&job_id)?;
         return Ok(PackOutcome {
-            pack_id: pack_id.into(),
-            invocation_id: inv.id,
-            job_id: job.id,
+            pack_id,
+            invocation_id: inv_id,
+            job_id,
             artifact_id: None,
             status: "cancelled".into(),
             checkpoint: Some(checkpoint),
@@ -319,43 +446,73 @@ pub fn invoke(
     }
 
     let ctx = RenderContext {
-        job_id: job.id.clone(),
-        invocation_id: inv.id.clone(),
+        job_id: job_id.clone(),
+        invocation_id: inv_id.clone(),
     };
-    let rendered = match runner.render(&ctx, pack_id, input) {
+    let rendered = match runner.render(&ctx, &pack_id, &inv.input) {
         Ok(v) => v,
         Err(e) => {
-            let _ = store.finish_job(&job.id, "failed");
+            // A cancel that killed the render must leave a cancelled job,
+            // never a failed one and never a published artifact.
+            let cancelled_now = cancel.is_cancelled()
+                || store
+                    .read_job(&job_id)
+                    .map(|job| job.status == "cancelled")
+                    .unwrap_or(false);
+            if cancelled_now {
+                host.cancel(&inv_id)?;
+                store.cancel_job(&job_id)?;
+                return Ok(PackOutcome {
+                    pack_id,
+                    invocation_id: inv_id,
+                    job_id,
+                    artifact_id: None,
+                    status: "cancelled".into(),
+                    checkpoint: Some(checkpoint),
+                    mode: "template".into(),
+                });
+            }
+            let _ = store.finish_job(&job_id, "failed");
             return Err(e);
         }
     };
     // A cancel that landed during the render must not publish: the artifact
     // is discarded and the job stays cancelled.
-    if store.read_job(&job.id)?.status == "cancelled" {
-        host.cancel(&inv.id)?;
+    let _publication = cancel.publication_guard();
+    if cancel.is_cancelled() || store.read_job(&job_id)?.status == "cancelled" {
+        host.cancel(&inv_id)?;
+        store.cancel_job(&job_id)?;
         return Ok(PackOutcome {
-            pack_id: pack_id.into(),
-            invocation_id: inv.id,
-            job_id: job.id,
+            pack_id,
+            invocation_id: inv_id,
+            job_id,
             artifact_id: None,
             status: "cancelled".into(),
             checkpoint: Some(checkpoint),
             mode: "template".into(),
         });
     }
-    let art = store.create_artifact(workspace_id, &rendered.mime, &rendered.title)?;
-    store.stage_artifact(&art.id, &rendered.bytes, pack_id)?;
+    let art = store.create_artifact(&job.workspace_id, &rendered.mime, &rendered.title)?;
+    store.stage_artifact(&art.id, &rendered.bytes, &pack_id)?;
     store.verify_artifact(&art.id)?;
+    // Publish receipt: durable evidence of the artifact in flight, written
+    // before the one true side effect (publish). A crash in the publish →
+    // completion tail leaves this receipt so resume can reconcile that
+    // exact artifact instead of re-rendering and publishing a duplicate.
+    host.set_receipt(
+        &inv_id,
+        Some(json!({"pendingPublish": art.id, "stage": "verified"})),
+    )?;
     let published = store.publish_artifact(&art.id)?;
-    store.finish_job(&job.id, "succeeded")?;
+    store.finish_job(&job_id, "succeeded")?;
     host.complete(
-        &inv.id,
-        json!({"artifactId": published.id, "jobId": job.id}),
+        &inv_id,
+        json!({"artifactId": published.id, "jobId": job_id}),
     )?;
     Ok(PackOutcome {
-        pack_id: pack_id.into(),
-        invocation_id: inv.id,
-        job_id: job.id,
+        pack_id,
+        invocation_id: inv_id,
+        job_id,
         artifact_id: Some(published.id),
         status: "succeeded".into(),
         checkpoint: Some(checkpoint),
@@ -363,6 +520,28 @@ pub fn invoke(
     })
 }
 
+pub fn invoke(
+    host: &PackHost,
+    store: &ProductStore,
+    pack_id: &str,
+    workspace_id: &str,
+    input: &Value,
+    runner: &mut dyn PackRunner,
+) -> Result<PackOutcome, PackExecError> {
+    let admitted = admit_invocation(host, store, pack_id, workspace_id, input)?;
+    execute_admitted(host, store, &admitted, runner, InvocationCancel::default())
+}
+
+/// Resume an interrupted/cancelled invocation, continuing its ORIGINAL job
+/// identity. The invocation's durable job link decides which Job is retried:
+/// resume never silently opens a new Job — that would lose the checkpoint
+/// chain and fork the business identity. Invocations recorded before the job
+/// link existed have no recoverable identity and are refused explicitly.
+///
+/// Validation is strictly read-only FIRST; the durable invocation only
+/// transitions to `running` after every check passed, so a rejected resume
+/// (wrong workspace, missing job link, already-succeeded job) never leaves
+/// the record poisoned in `running` — the caller can retry correctly.
 pub fn resume(
     host: &PackHost,
     store: &ProductStore,
@@ -371,22 +550,111 @@ pub fn resume(
     input: &Value,
     runner: &mut dyn PackRunner,
 ) -> Result<PackOutcome, PackExecError> {
-    let inv = host.resume(invocation_id)?;
-    let mut job = store.create_job(workspace_id, &inv.pack_id)?;
-    job = store.run_job(&job.id)?;
+    resume_with_cancel(host, store, invocation_id, workspace_id, input, runner, InvocationCancel::default())
+}
+
+pub fn resume_with_cancel(
+    host: &PackHost, store: &ProductStore, invocation_id: &str, workspace_id: &str,
+    input: &Value, runner: &mut dyn PackRunner, cancel: InvocationCancel,
+) -> Result<PackOutcome, PackExecError> {
+    runner.bind_cancel(cancel.clone());
+    // ---- Read-only validation (no durable writes below this line) ----
+    let inv = host.read_invocation(invocation_id)?;
+    if inv.status != "cancelled" && inv.status != "failed" {
+        return Err(PackExecError::Msg(format!(
+            "invocation {invocation_id} is {}, not cancelled or failed; \
+             nothing to resume",
+            inv.status
+        )));
+    }
+    let pack_record = host.read(&inv.pack_id)?;
+    if pack_record.state != PackState::Installed {
+        return Err(PackExecError::Msg(format!(
+            "cannot resume: pack {} uninstalled",
+            inv.pack_id
+        )));
+    }
+    let Some(job_id) = inv.job_id.clone() else {
+        return Err(PackExecError::Msg(format!(
+            "invocation {invocation_id} has no durable job identity to continue \
+             (pre-recovery-format record); invoke the pack again with a fresh idempotency key"
+        )));
+    };
+    let existing = store.read_job(&job_id)?;
+    if existing.r#type != inv.pack_id {
+        return Err(PackExecError::Msg(format!(
+            "job {job_id} belongs to pack {}, not resumed pack {}",
+            existing.r#type, inv.pack_id
+        )));
+    }
+    if existing.workspace_id != workspace_id {
+        return Err(PackExecError::Msg(format!(
+            "job {job_id} belongs to workspace {}, not {workspace_id}",
+            existing.workspace_id
+        )));
+    }
+    // Publish-receipt reconciliation (CODEX-0415): a crash inside the
+    // publish tail left a durable receipt identifying the ONE artifact in
+    // flight. Reconcile that exact artifact — never re-render, never create
+    // or publish a second one. This covers both sides of the publish:
+    // verified-but-unpublished (complete the recorded intent) and already
+    // published (finish the bookkeeping only).
+    if let Some(receipt) = inv.receipt.clone() {
+        return reconcile_publish_receipt(host, store, &inv, &job_id, receipt);
+    }
+    // Crash window WITHOUT a receipt (pre-receipt-format records): the job
+    // reached `succeeded` but the invocation never got its output recorded.
+    // With no checkable artifact identity, re-running could publish a
+    // duplicate — refuse for manual reconciliation instead.
+    if existing.status == "succeeded" {
+        return Err(PackExecError::Msg(format!(
+            "job {job_id} already succeeded but invocation {invocation_id} has no \
+             recorded output and no publish receipt (interrupted between job \
+             completion and invocation completion); reconcile manually instead of \
+             re-running — refusing to duplicate the published side effects"
+        )));
+    }
+    // ---- Transitions (only after every check passed) ----
+    let inv = host.resume(&inv.id)?;
+    // A crashed job recovered to `failed` (or was cancelled earlier) is
+    // retried in place: same id, same checkpoint chain, attempt count kept.
+    let job = if existing.status == "failed" || existing.status == "cancelled" {
+        store.retry_job(&job_id)?
+    } else {
+        existing
+    };
+    let job = store.run_job(&job.id)?;
     let ctx = RenderContext {
         job_id: job.id.clone(),
         invocation_id: inv.id.clone(),
     };
-    let rendered = runner.render(&ctx, &inv.pack_id, input)?;
+    let cancelled = || -> Result<PackOutcome, PackExecError> {
+        host.cancel(&inv.id)?; store.cancel_job(&job.id)?;
+        Ok(PackOutcome { pack_id:inv.pack_id.clone(), invocation_id:inv.id.clone(), job_id:job.id.clone(), artifact_id:None,
+            status:"cancelled".into(), checkpoint:inv.checkpoint.clone(), mode:"template".into() })
+    };
+    if cancel.is_cancelled() { return cancelled(); }
+    let rendered = match runner.render(&ctx, &inv.pack_id, input) {
+        Ok(rendered) => rendered,
+        Err(_) if cancel.is_cancelled() => return cancelled(),
+        Err(error) => { let _ = host.fail(&inv.id, &error.to_string()); let _ = store.finish_job(&job.id, "failed"); return Err(error); }
+    };
+    let _publication = cancel.publication_guard();
+    if cancel.is_cancelled() || store.read_job(&job.id)?.status == "cancelled" { return cancelled(); }
+
     let art = store.create_artifact(workspace_id, &rendered.mime, &rendered.title)?;
     store.stage_artifact(&art.id, &rendered.bytes, &inv.pack_id)?;
     store.verify_artifact(&art.id)?;
+    // Same publish receipt as the initial invoke (see above).
+    host.set_receipt(
+        &inv.id,
+        Some(json!({"pendingPublish": art.id, "stage": "verified"})),
+    )?;
     let published = store.publish_artifact(&art.id)?;
     store.finish_job(&job.id, "succeeded")?;
     host.complete(
         &inv.id,
-        json!({"artifactId": published.id, "resumed": true}),
+        json!({"artifactId": published.id, "resumed": true, "jobId": job.id}),
     )?;
     Ok(PackOutcome {
         pack_id: inv.pack_id,
@@ -399,16 +667,111 @@ pub fn resume(
     })
 }
 
+/// Reconcile an interrupted publish tail from the invocation's durable
+/// receipt. Exactly one artifact was in flight; depending on how far the
+/// publish got we either complete it or finish the bookkeeping — the render
+/// is NEVER re-run and no second artifact is created:
+/// - artifact `published`: the side effect already happened; finish the job
+///   and record the invocation output against it.
+/// - artifact `verified` (receipt written, crash before publish): complete
+///   the recorded intent by publishing THAT artifact.
+/// - anything else (missing/corrupt/unexpected lifecycle): refuse with a
+///   typed reconciliation error — an unconfirmable side effect is never
+///   redone blindly.
+fn reconcile_publish_receipt(
+    host: &PackHost,
+    store: &ProductStore,
+    inv: &Invocation,
+    job_id: &str,
+    receipt: Value,
+) -> Result<PackOutcome, PackExecError> {
+    let art_id = receipt
+        .get("pendingPublish")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            PackExecError::Msg(format!(
+                "invocation {} has a malformed publish receipt {receipt}; reconcile manually",
+                inv.id
+            ))
+        })?
+        .to_string();
+    let art = store.read_artifact(&art_id).map_err(|e| {
+        PackExecError::Msg(format!(
+            "publish receipt of invocation {} points at artifact {art_id} which \
+             cannot be read ({e}); reconcile manually — refusing to re-run",
+            inv.id
+        ))
+    })?;
+    let published = match art.lifecycle.as_str() {
+        // The publish landed before the crash: only bookkeeping is missing.
+        "published" => art,
+        // The receipt was written but the publish itself was interrupted:
+        // publish the already staged+verified artifact now (recorded intent,
+        // same id — not a redo of unknown work).
+        "verified" => store.publish_artifact(&art_id)?,
+        other => {
+            return Err(PackExecError::Msg(format!(
+                "artifact {art_id} from the publish receipt of invocation {} is in \
+                 lifecycle {other:?}; reconcile manually — refusing to re-run",
+                inv.id
+            )));
+        }
+    };
+    // Walk the job to `succeeded` WITHOUT executing any work: pure status
+    // bookkeeping for the already-produced artifact.
+    let job = store.read_job(job_id)?;
+    let job = match job.status.as_str() {
+        "succeeded" | "running" => job,
+        "queued" => store.run_job(&job.id)?,
+        "failed" | "cancelled" => {
+            let retried = store.retry_job(&job.id)?;
+            store.run_job(&retried.id)?
+        }
+        other => {
+            return Err(PackExecError::Msg(format!(
+                "job {job_id} is in unexpected status {other:?} during publish \
+                 reconciliation; reconcile manually"
+            )));
+        }
+    };
+    store.finish_job(&job.id, "succeeded")?;
+    host.complete(
+        &inv.id,
+        json!({
+            "artifactId": published.id,
+            "jobId": job.id,
+            "resumed": true,
+            "reconciled": true,
+        }),
+    )?;
+    let content = store
+        .read_revision_content(published.current_revision.as_deref().unwrap_or(""))
+        .unwrap_or_default();
+    Ok(PackOutcome {
+        pack_id: inv.pack_id.clone(),
+        invocation_id: inv.id.clone(),
+        job_id: job.id,
+        artifact_id: Some(published.id),
+        status: "succeeded".into(),
+        checkpoint: inv.checkpoint.clone(),
+        mode: outcome_mode(&content).into(),
+    })
+}
+
 pub fn cancel(
     host: &PackHost,
     store: &ProductStore,
     invocation_id: &str,
     job_id: Option<&str>,
 ) -> Result<Invocation, PackExecError> {
-    let inv = host.cancel(invocation_id)?;
-    if let Some(jid) = job_id {
-        let _ = store.cancel_job(jid);
+    let before = host.read_invocation(invocation_id)?;
+    if job_id.is_some_and(|job| Some(job) != before.job_id.as_deref()) {
+        return Err(PackExecError::Invalid("job does not belong to this invocation".into()));
     }
+    if before.status == "succeeded" { return Ok(before); }
+    let inv = host.cancel(invocation_id)?;
+    if let Some(jid) = inv.job_id.as_deref() { store.cancel_job(jid)?; }
+
     Ok(inv)
 }
 
@@ -841,4 +1204,39 @@ mod tests {
         assert!(err.to_string().contains("query"));
         let _ = std::fs::remove_dir_all(base);
     }
+    #[test]
+    fn cancellation_latch_arbitrates_render_and_resume_publication() {
+        struct CancellingRunner(Option<InvocationCancel>);
+        impl PackRunner for CancellingRunner {
+            fn bind_cancel(&mut self, cancel: InvocationCancel) { self.0 = Some(cancel); }
+            fn render(&mut self, _: &RenderContext, _: &str, _: &Value) -> Result<RenderedPack, PackExecError> {
+                self.0.as_ref().unwrap().cancel();
+                Ok(RenderedPack { mime:"text/plain".into(), title:"must not publish".into(), bytes:b"late result".to_vec() })
+            }
+        }
+        let (_base, host, store, ws) = tmp();
+        let admitted = admit_invocation(&host, &store, "research.knowledge", &ws, &json!({"query":"cancel"})).unwrap();
+        let out = execute_admitted(&host, &store, &admitted, &mut CancellingRunner(None), InvocationCancel::default()).unwrap();
+        assert_eq!(out.status, "cancelled"); assert!(out.artifact_id.is_none());
+        let resumed = resume_with_cancel(&host, &store, &admitted.invocation_id, &ws, &json!({"query":"cancel again"}), &mut CancellingRunner(None), InvocationCancel::default()).unwrap();
+        assert_eq!(resumed.job_id, admitted.job_id);
+        assert_eq!(resumed.status, "cancelled"); assert!(resumed.artifact_id.is_none());
+        assert!(host.checkpoint(&admitted.invocation_id, json!({"late":true})).is_err());
+        assert_eq!(host.read_invocation(&admitted.invocation_id).unwrap().status, "cancelled");
+    }
+
+    #[test]
+    fn concurrent_cancel_registration_runs_killer_once_and_reports_failed_reclaim() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for _ in 0..50 {
+            let token = InvocationCancel::default();
+            let count = Arc::new(AtomicUsize::new(0));
+            let other = token.clone(); let killed = Arc::clone(&count);
+            let registration = std::thread::spawn(move || other.register_reclaimer(Arc::new(move || { killed.fetch_add(1, Ordering::SeqCst); false })));
+            token.cancel(); registration.join().unwrap(); token.cancel();
+            assert_eq!(count.load(Ordering::SeqCst), 1);
+            assert!(!token.all_reclaimed());
+        }
+    }
+
 }

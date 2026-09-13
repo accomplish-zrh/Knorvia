@@ -19,7 +19,15 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 mod embedding;
+mod import_ops;
+mod index;
 pub use embedding::MemoryEmbeddingQuery;
+pub use import_ops::{MemoryImportPlan, MemoryImportReceipt};
+use index::MemorySearchIndex;
+
+/// Process-wide count of record-file reads, used by the recall benchmark to
+/// report how many authoritative files each strategy actually touches.
+pub static DISK_READS: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -505,12 +513,19 @@ fn terms_of(text: &str) -> Vec<String> {
 /// compare-and-swap on revision.
 pub struct MemoryStore {
     root: PathBuf,
+    index: MemorySearchIndex,
+    writes: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl MemoryStore {
     pub fn open(state_root: &Path) -> Self {
+        let root = state_root.join("product").join("memory");
+        let index = MemorySearchIndex::new(root.join("search-index.json"));
+        let writes = import_ops::write_lock(&root);
         Self {
-            root: state_root.join("product").join("memory"),
+            root,
+            index,
+            writes,
         }
     }
 
@@ -528,31 +543,14 @@ impl MemoryStore {
     }
 
     fn write_json(path: &Path, value: &impl Serialize) -> Result<(), MemoryError> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| MemoryError {
-                kind: MemoryErrorKind::Io,
-                message: e.to_string(),
-            })?;
-        }
         let bytes = serde_json::to_vec_pretty(value).map_err(|e| MemoryError {
             kind: MemoryErrorKind::Corrupt,
             message: e.to_string(),
         })?;
-        let tmp = path.with_file_name(format!(
-            ".{}.{}.tmp",
-            std::process::id(),
-            MEMORY_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::write(&tmp, &bytes).map_err(|e| MemoryError {
+        crate::atomic_write(path, &bytes).map_err(|e| MemoryError {
             kind: MemoryErrorKind::Io,
             message: e.to_string(),
-        })?;
-        // rename within the same directory keeps the swap atomic.
-        std::fs::rename(&tmp, path).map_err(|e| MemoryError {
-            kind: MemoryErrorKind::Io,
-            message: e.to_string(),
-        })?;
-        Ok(())
+        })
     }
 
     fn read_json<T: serde::de::DeserializeOwned>(path: &Path) -> Result<T, MemoryError> {
@@ -574,6 +572,7 @@ impl MemoryStore {
         if !path.exists() {
             return Ok(None);
         }
+        DISK_READS.fetch_add(1, Ordering::Relaxed);
         Ok(Some(Self::read_json(&path)?))
     }
 
@@ -626,6 +625,9 @@ impl MemoryStore {
             &revision,
         )?;
         Self::write_json(&self.record_path(&record.id), &record)?;
+        // R06: the keyword index updates incrementally from the same write
+        // path, so edits/forgets/restores/unshares take effect immediately.
+        self.index.upsert(&record);
         Ok(record)
     }
 
@@ -636,6 +638,7 @@ impl MemoryStore {
         draft: MemoryDraft,
         actor: &str,
     ) -> Result<(MemoryRecord, bool), MemoryError> {
+        let _write = self.writes.lock().unwrap_or_else(|e| e.into_inner());
         validate(&draft)?;
         let at_ms = now_ms();
         if let Some(token) = &draft.client_token {
@@ -695,6 +698,7 @@ impl MemoryStore {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
+            DISK_READS.fetch_add(1, Ordering::Relaxed);
             records.push(Self::read_json::<MemoryRecord>(&path)?);
         }
         Ok(records)
@@ -712,6 +716,7 @@ impl MemoryStore {
         action: &MemoryAction,
         apply: impl FnOnce(MemoryRecord) -> Result<MemoryRecord, MemoryError>,
     ) -> Result<MemoryRecord, MemoryError> {
+        let _write = self.writes.lock().unwrap_or_else(|e| e.into_inner());
         sanitize_id(id)?;
         let record = self.read_record(id)?.ok_or_else(|| MemoryError {
             kind: MemoryErrorKind::NotFound,
@@ -844,12 +849,19 @@ impl MemoryStore {
             None,
             &MemoryAction::Restore,
             |mut record| {
-                if record.status != FORGOTTEN {
+                if record.status != FORGOTTEN && record.status != MERGED {
                     return err(
                         MemoryErrorKind::Conflict,
-                        format!("memory record {id} is {}, not forgotten", record.status),
+                        format!(
+                            "memory record {id} is {}, not forgotten or merged",
+                            record.status
+                        ),
                     );
                 }
+                // Restoring a merged duplicate un-merges it: the pointer is
+                // cleared so the record stands alone again, while the full
+                // merge/restore history stays on the timeline.
+                record.merged_into = None;
                 record.status = ACTIVE.into();
                 Ok(record)
             },
@@ -864,6 +876,11 @@ impl MemoryStore {
         source_id: &str,
         target_id: &str,
         expected_revision: Option<u64>,
+        // B03 (night 2026-09-10): pins the survivor to the revision the UI
+        // previewed. Control-plane RPC handling is serialized, so this check
+        // plus the source CAS make preview-then-execute race-free without
+        // pretending a stale read is still fresh.
+        expected_target_revision: Option<u64>,
         actor: &str,
     ) -> Result<(MemoryRecord, MemoryRecord), MemoryError> {
         if source_id == target_id {
@@ -880,6 +897,17 @@ impl MemoryStore {
             return err(
                 MemoryErrorKind::Conflict,
                 format!("merge target {target_id} is {}", target.status),
+            );
+        }
+        if let Some(expected) = expected_target_revision
+            && expected != target.revision
+        {
+            return err(
+                MemoryErrorKind::Conflict,
+                format!(
+                    "merge target {target_id} is at revision {}, caller expected {expected}",
+                    target.revision
+                ),
             );
         }
         let source = self.mutate(
@@ -1044,6 +1072,30 @@ impl MemoryStore {
         consumed_by: (Option<String>, Option<String>),
         embeddings: Option<&MemoryEmbeddingQuery>,
     ) -> Result<MemoryRecallTrace, MemoryError> {
+        self.recall_impl(query_text, scope, limit, consumed_by, embeddings, false)
+    }
+
+    /// R06 benchmark baseline: the original full-scan recall, kept for
+    /// same-machine A/B measurement of the index.
+    pub fn recall_full_scan(
+        &self,
+        query_text: &str,
+        scope: &ScopeQuery,
+        limit: usize,
+        consumed_by: (Option<String>, Option<String>),
+    ) -> Result<MemoryRecallTrace, MemoryError> {
+        self.recall_impl(query_text, scope, limit, consumed_by, None, true)
+    }
+
+    fn recall_impl(
+        &self,
+        query_text: &str,
+        scope: &ScopeQuery,
+        limit: usize,
+        consumed_by: (Option<String>, Option<String>),
+        embeddings: Option<&MemoryEmbeddingQuery>,
+        force_scan: bool,
+    ) -> Result<MemoryRecallTrace, MemoryError> {
         if query_text.len() > 4096 {
             return err(
                 MemoryErrorKind::InvalidArgument,
@@ -1062,39 +1114,103 @@ impl MemoryStore {
         let at_ms = now_ms();
         let query_terms = terms_of(query_text);
         let mut scored: Vec<(MemoryRecord, u64, Vec<String>, u64)> = Vec::new();
-        for record in self.all_records()? {
-            if !scope.visible_from(&record) || record.status != ACTIVE {
-                continue;
-            }
-            let in_window =
-                record.valid_from_ms <= at_ms && record.valid_to_ms.map_or(true, |to| at_ms <= to);
-            if !in_window && !record.pinned {
-                continue;
-            }
-            if query_terms.is_empty() && embeddings.is_none() {
-                continue;
-            }
-            let record_terms: HashSet<String> = terms_of(&record.content).into_iter().collect();
-            let mut matched = Vec::new();
-            for term in &query_terms {
-                if record_terms.contains(term) {
-                    matched.push(term.clone());
+        // R06: keyword-only recall (the default; no vectors configured) is
+        // served by the incremental inverted index. Candidates are ranked by
+        // corpus-aware tf-idf, then re-read and re-validated against the
+        // authoritative record (scope, status, validity, revision) before
+        // they may become hits. The semantic path keeps the full scan: an
+        // embedding score needs every record regardless of keywords.
+        if !force_scan && embeddings.is_none() && !query_terms.is_empty() {
+            self.index.ensure_built(|| self.all_records())?;
+            let cap = limit.clamp(1, 100) * 12 + 64;
+            let mut lowest_accepted: Option<u64> = None;
+            for (id, base) in self.index.rank(&query_terms, cap, scope, at_ms) {
+                if let Some(min_seen) = lowest_accepted {
+                    // Candidates arrive best-first; once enough hits are in
+                    // hand and a remaining base plus the maximum bonus cannot
+                    // outrank the weakest accepted hit, stop reading records.
+                    if scored.len() >= limit.clamp(1, 100) && base + 600 < min_seen {
+                        break;
+                    }
                 }
-            }
-            let semantic_score = embeddings.map_or(0, |query| query.score(&record));
-            if matched.is_empty() && semantic_score == 0 {
-                continue;
-            }
-            let mut score = matched.len() as u64 * 10 + semantic_score;
-            if record.pinned {
-                score += 5;
-            }
-            if let Some(used) = record.last_used_at_ms {
-                if at_ms.saturating_sub(used) < 86_400_000 {
-                    score += 1;
+                let Some(record) = self.read_record(&id)? else {
+                    self.index.remove(&id);
+                    continue;
+                };
+                if !scope.visible_from(&record) || record.status != ACTIVE {
+                    // Heal the index from authoritative state; visibility and
+                    // status are never trusted from the index.
+                    self.index.upsert(&record);
+                    continue;
                 }
+                let in_window = record.valid_from_ms <= at_ms
+                    && record.valid_to_ms.map_or(true, |to| at_ms <= to);
+                if !in_window && !record.pinned {
+                    self.index.upsert(&record);
+                    continue;
+                }
+                let record_terms = index::term_counts(&record.content);
+                let matched: Vec<String> = query_terms
+                    .iter()
+                    .filter(|term| record_terms.contains_key(*term))
+                    .cloned()
+                    .collect();
+                if matched.is_empty() {
+                    // Content changed in ways the index had not caught up
+                    // with; repair and drop this candidate.
+                    self.index.upsert(&record);
+                    continue;
+                }
+                let mut score = base;
+                if record.pinned {
+                    score += 500;
+                }
+                if let Some(used) = record.last_used_at_ms {
+                    if at_ms.saturating_sub(used) < 86_400_000 {
+                        score += 100;
+                    }
+                }
+                lowest_accepted = Some(match lowest_accepted {
+                    Some(min_seen) => min_seen.min(score),
+                    None => score,
+                });
+                scored.push((record, score, matched, 0));
             }
-            scored.push((record, score, matched, semantic_score));
+        } else {
+            for record in self.all_records()? {
+                if !scope.visible_from(&record) || record.status != ACTIVE {
+                    continue;
+                }
+                let in_window = record.valid_from_ms <= at_ms
+                    && record.valid_to_ms.map_or(true, |to| at_ms <= to);
+                if !in_window && !record.pinned {
+                    continue;
+                }
+                if query_terms.is_empty() && embeddings.is_none() {
+                    continue;
+                }
+                let record_terms: HashSet<String> = terms_of(&record.content).into_iter().collect();
+                let mut matched = Vec::new();
+                for term in &query_terms {
+                    if record_terms.contains(term) {
+                        matched.push(term.clone());
+                    }
+                }
+                let semantic_score = embeddings.map_or(0, |query| query.score(&record));
+                if matched.is_empty() && semantic_score == 0 {
+                    continue;
+                }
+                let mut score = matched.len() as u64 * 10 + semantic_score;
+                if record.pinned {
+                    score += 5;
+                }
+                if let Some(used) = record.last_used_at_ms {
+                    if at_ms.saturating_sub(used) < 86_400_000 {
+                        score += 1;
+                    }
+                }
+                scored.push((record, score, matched, semantic_score));
+            }
         }
         scored.sort_by(|a, b| {
             b.1.cmp(&a.1)
@@ -1129,6 +1245,7 @@ impl MemoryStore {
             // Bump the durable use counter with its own CAS revision; a
             // concurrent share/forget between scoring and bumping is a
             // lost counter tick, never a corrupted record.
+            let _write = self.writes.lock().unwrap_or_else(|e| e.into_inner());
             if let Ok(Some(mut used)) = self.read_record(&record.id) {
                 if used.status == ACTIVE {
                     used.use_count += 1;
@@ -1339,88 +1456,48 @@ impl MemoryStore {
         }))
     }
 
-    /// Import records from an export bundle. Each record keeps its id; a
-    /// locally newer-or-equal revision wins and is reported as `kept`,
-    /// an imported newer revision is applied as an audited `import`
-    /// revision, a missing id is created. Counts are returned for honest
-    /// UI reporting — nothing is silently dropped.
+    /// Compatibility entry point: validate the entire bundle before accepting
+    /// an operation. The durable receipt is available through import_receipt.
     pub fn import(
         &self,
         bundle: &serde_json::Value,
         actor: &str,
     ) -> Result<(usize, usize, usize), MemoryError> {
-        if bundle["format"].as_str() != Some("knorvia-memory-export") {
+        let operation_id = import_ops::bundle_operation_id(bundle);
+        let receipt = if self.import_path(&operation_id).exists() {
+            let previous = self.import_receipt(&operation_id)?;
+            if previous.status == "completed" {
+                return Ok((0, 0, previous.items.len()));
+            }
+            self.resume_import(&operation_id)?
+        } else {
+            let plan = self.plan_import(bundle)?;
+            self.apply_import(bundle, &plan.plan_hash, &operation_id, actor)?
+        };
+        if receipt.status != "completed" {
             return err(
-                MemoryErrorKind::InvalidArgument,
-                "not a knorvia-memory-export bundle",
+                MemoryErrorKind::Io,
+                format!(
+                    "import {} {}: created={}, applied={}, kept={}; read durable receipt and resume original operation: {}",
+                    receipt.operation_id,
+                    receipt.status,
+                    receipt.created,
+                    receipt.applied,
+                    receipt.kept,
+                    receipt.error.unwrap_or_default()
+                ),
             );
         }
-        let records = bundle["records"].as_array().ok_or_else(|| MemoryError {
-            kind: MemoryErrorKind::InvalidArgument,
-            message: "bundle has no records array".into(),
-        })?;
-        let mut created = 0usize;
-        let mut applied = 0usize;
-        let mut kept = 0usize;
-        for value in records {
-            let record: MemoryRecord =
-                serde_json::from_value(value.clone()).map_err(|e| MemoryError {
-                    kind: MemoryErrorKind::InvalidArgument,
-                    message: format!("bad record: {e}"),
-                })?;
-            sanitize_id(&record.id)?;
-            validate(&MemoryDraft {
-                scope: record.scope.clone(),
-                kind: record.kind.clone(),
-                content: record.content.clone(),
-                source_refs: record.source_refs.clone(),
-                relation: record.relation.clone(),
-                valid_from_ms: Some(record.valid_from_ms),
-                valid_to_ms: record.valid_to_ms,
-                pinned: record.pinned,
-                client_token: None,
-            })?;
-            let source_revision = record.revision;
-            match self.read_record(&record.id)? {
-                None => {
-                    let mut record = record;
-                    record.revision = 0;
-                    record.imported_from_revision = Some(source_revision);
-                    self.commit(
-                        record,
-                        &MemoryAction::Create,
-                        actor,
-                        now_ms(),
-                        Some("import".into()),
-                    )?;
-                    created += 1;
-                }
-                Some(local)
-                    if source_revision > local.revision
-                        && source_revision > local.imported_from_revision.unwrap_or(0) =>
-                {
-                    let mut record = record;
-                    record.revision = local.revision;
-                    record.imported_from_revision = Some(source_revision);
-                    self.commit(
-                        record,
-                        &MemoryAction::Update,
-                        actor,
-                        now_ms(),
-                        Some("import".into()),
-                    )?;
-                    applied += 1;
-                }
-                Some(_) => kept += 1,
-            }
-        }
-        Ok((created, applied, kept))
+        Ok((receipt.created, receipt.applied, receipt.kept))
     }
 }
 
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod index_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1834,6 +1911,40 @@ mod tests {
     }
 
     #[test]
+    fn merge_honors_target_revision_and_merged_records_restore() {
+        let (store, _home) = new_store("merge-cas");
+        let (keeper, _) = store.create(draft("g1", "keeper fact"), "user").unwrap();
+        let (loser, _) = store
+            .create(draft("g1", "loser duplicate"), "user")
+            .unwrap();
+        // A stale target revision is refused and neither record changes.
+        let stale = store.merge(&loser.id, &keeper.id, Some(1), Some(99), "user");
+        assert_eq!(stale.unwrap_err().kind, MemoryErrorKind::Conflict);
+        assert_eq!(
+            store.read_record(&loser.id).unwrap().unwrap().status,
+            ACTIVE
+        );
+        // With both CAS values the merge succeeds; the survivor is untouched.
+        let (source, target) = store
+            .merge(&loser.id, &keeper.id, Some(1), Some(1), "user")
+            .unwrap();
+        assert_eq!(source.status, MERGED);
+        assert_eq!(source.merged_into.as_deref(), Some(keeper.id.as_str()));
+        assert_eq!(target.revision, 1, "merge never mutates the survivor");
+        assert_eq!(target.content, "keeper fact");
+        // The merged source restores as a standalone record; the timeline
+        // keeps the audited merge + restore story.
+        let restored = store
+            .restore(&loser.id, Some(source.revision), "user")
+            .unwrap();
+        assert_eq!(restored.status, ACTIVE);
+        assert_eq!(restored.merged_into, None);
+        let timeline = store.timeline(&query("g1"), None, None, 100).unwrap();
+        assert!(timeline.iter().any(|event| event.action == "merge"));
+        assert!(timeline.iter().any(|event| event.action == "restore"));
+    }
+
+    #[test]
     fn merge_and_graph_use_only_real_records_and_visible_edges() {
         let (store, _home) = new_store("graph");
         let (a, _) = store
@@ -1845,7 +1956,7 @@ mod tests {
         let (dup, _) = store
             .create(draft("g1", "alice really likes chess"), "user")
             .unwrap();
-        store.merge(&dup.id, &a.id, Some(1), "user").unwrap();
+        store.merge(&dup.id, &a.id, Some(1), None, "user").unwrap();
         // relation record b -> a, evidenced by a turn ref
         let mut rel = draft("g1", "bob and alice discuss chess");
         rel.kind = "relation".into();

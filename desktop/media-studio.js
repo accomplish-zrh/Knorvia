@@ -7,6 +7,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const P = require('./studio-providers');
 const FW = require('./media-frame-worker');
+const { createMediaOperations } = require('./media-operations');
 const SEQ = require('./media-sequence');
 const EDIT = require('./media-composition');
 const ARTICLE = require('./article-video');
@@ -14,11 +15,16 @@ const WORKFLOW = require('./studio-workflow');
 const TPL = require('./studio-templates');
 const { createMediaPlayback } = require('./media-playback');
 const PET = require('./pet-service');
+const CANVAS = require('./studio-canvas');
+const LI = require('./library-image-ops');
 const BASE_METHODS = ['studio/models', 'studio/model/save', 'studio/model/remove', 'studio/model/test', 'studio/list', 'studio/create', 'studio/read', 'studio/cancel', 'studio/resume', 'studio/content', 'studio/library'];
-const METHODS = [...BASE_METHODS, ...SEQ.METHODS, ...EDIT.METHODS, ...ARTICLE.METHODS, ...TPL.METHODS, ...PET.METHODS, 'studio/frame/export', 'studio/frame/content', 'studio/playback', 'studio/workflow/inspect'];
+const METHODS = [...BASE_METHODS, ...SEQ.METHODS, ...EDIT.METHODS, ...ARTICLE.METHODS, ...TPL.METHODS, ...PET.METHODS, ...CANVAS.METHODS, 'studio/frame/export', 'studio/frame/content', 'studio/frame/cancel', 'studio/operations/list', 'studio/operations/cancel', 'studio/media/image-process', 'studio/media/extract-frame', 'studio/playback', 'studio/workflow/inspect'];
 const terminal = job => ['succeeded', 'failed', 'cancelled'].includes(job.status);
 const mimeTypes = { png: 'image/png', jpg: 'image/jpeg', webp: 'image/webp', gif: 'image/gif', mp4: 'video/mp4', webm: 'video/webm' };
 const OUTPUT_NAME = /^[A-Za-z0-9][A-Za-z0-9_-]{0,120}\.(png|jpg|webp|gif|mp4|webm)$/;
+// Registry identities are UUIDs minted by the host; anything else is refused
+// before it reaches the operation maps.
+const OP_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 // Provider-facing messages already carry a deliberate user-facing wording;
 // anything else is sanitized before it reaches the UI or the Agent.
 const expose = error => error.rpc?.message || (error.expose === true ? error.message : 'The media request failed unexpectedly; details were written to the application log');
@@ -31,17 +37,44 @@ function extension(bytes) {
   if (bytes.subarray(0, 4).equals(Buffer.from([26,69,223,163]))) return 'webm';
   P.fail('The response is not a supported image or video file');
 }
-function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, maxActiveJobs = 3 }) {
+function prepareCreateInput(p, params, agent = false) {
+  if (agent && !p.agentEnabled) P.fail('Agent access is disabled for this model connection');
+  const input = { prompt: P.text(params.prompt, 12000), size: P.text(params.size || (p.kind === 'image' ? '1024x1024' : '1280x720'), 30), aspect: P.text(params.aspect || '16:9', 20), count: params.count ?? 1, seconds: params.seconds ?? 4, quality: P.text(params.quality || 'auto', 40), references: P.safeObject(params.references || []) };
+  if (!input.prompt || !/^\d{2,5}x\d{2,5}$/.test(input.size) || !Number.isInteger(input.count) || input.count < 1 || input.count > 4 || !Number.isInteger(input.seconds) || input.seconds < 1 || input.seconds > 60 || !Array.isArray(input.references) || input.references.length > 6) P.fail('Invalid prompt, dimensions, count, duration or references');
+  const reference = ref => {
+    if (!ref || typeof ref !== 'object' || Array.isArray(ref)) P.fail('Invalid reference image');
+    P.id(ref.id); if (ref.version !== undefined && (typeof ref.version !== 'string' || !/^[a-f0-9]{64}$/.test(ref.version))) P.fail('Invalid reference version');
+    return { id: ref.id, ...(ref.version ? { version: ref.version } : {}) };
+  };
+  input.references = input.references.map(reference);
+  if (p.kind === 'video') {
+    if (input.references.length > 1 || (input.references.length && params.firstFrame)) P.fail('请使用独立的 firstFrame 和 lastFrame 指定视频首尾帧');
+    if (params.firstFrame || input.references.length) input.firstFrame = reference(params.firstFrame || input.references[0]);
+    if (params.lastFrame) input.lastFrame = reference(params.lastFrame);
+    input.references = [];
+  } else if (params.firstFrame || params.lastFrame) P.fail('图片创作请使用 references，首尾帧仅用于视频');
+  P.validateInputs(p, input);
+  return input;
+}
+function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, maxActiveJobs = 3, closeTimeoutMs = 8000 }) {
   const root = path.join(home, 'artifacts', 'media-studio');
   fs.mkdirSync(root, { recursive: true });
   const playback = createMediaPlayback({ root });
+  // Derived operations (tail frames) share one bounded registry with dedup
+  // and per-caller cancellation; a decode never runs twice concurrently.
+  const mediaOps = createMediaOperations({ concurrency: 2 });
   const profiles = P.createProfiles({ home, safeStorage });
   const active = new Map(); const waiting = []; const pendingCreates = new Map();
-  let workspace; let initializing; let closed = false;
+  let workspace; let initializing; let closed = false; let closeOutcome;
   // FFmpeg is resolved lazily so a machine without it still boots the studio;
   // frame export then reports a clear, actionable dependency state.
   let frameWorker;
   const getFrameWorker = () => { if (!frameWorker) frameWorker = FW.createFrameWorker({}); return frameWorker; };
+  // Library image/video processing joins THIS registry: one bounded queue, one
+  // cancel surface, one shutdown for every derived media operation. Built on
+  // first use because it resolves the native binaries.
+  let imageOps;
+  const getImageOps = () => { if (!imageOps) imageOps = LI.createLibraryImageOps({ library, operations: mediaOps }); return imageOps; };
   const read = async jobId => {
     const job = await rpc('job/read', { id: P.id(jobId) });
     if (job.workspaceId !== workspace || !job.type.startsWith('media.')) P.fail('Not a personal creation job');
@@ -66,6 +99,7 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
       await sequenceEngine.recover();
       await compositionEngine.recover();
       await articleEngine.recover();
+      await canvasEngine.recover();
     })().catch(error => { initializing = undefined; throw error; });
     return initializing;
   }
@@ -258,22 +292,7 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
   async function create(params, agent = false) {
     await initialize();
     const p = profiles.get(params.profileId);
-    if (agent && !p.agentEnabled) P.fail('Agent access is disabled for this model connection');
-    const input = { prompt: P.text(params.prompt, 12000), size: P.text(params.size || (p.kind === 'image' ? '1024x1024' : '1280x720'), 30), aspect: P.text(params.aspect || '16:9', 20), count: params.count ?? 1, seconds: params.seconds ?? 4, quality: P.text(params.quality || 'auto', 40), references: P.safeObject(params.references || []) };
-    if (!input.prompt || !/^\d{2,5}x\d{2,5}$/.test(input.size) || !Number.isInteger(input.count) || input.count < 1 || input.count > 4 || !Number.isInteger(input.seconds) || input.seconds < 1 || input.seconds > 60 || !Array.isArray(input.references) || input.references.length > 6) P.fail('Invalid prompt, dimensions, count, duration or references');
-    const reference = ref => {
-      if (!ref || typeof ref !== 'object' || Array.isArray(ref)) P.fail('Invalid reference image');
-      P.id(ref.id); if (ref.version !== undefined && (typeof ref.version !== 'string' || !/^[a-f0-9]{64}$/.test(ref.version))) P.fail('Invalid reference version');
-      return { id: ref.id, ...(ref.version ? { version: ref.version } : {}) };
-    };
-    input.references = input.references.map(reference);
-    if (p.kind === 'video') {
-      if (input.references.length > 1 || (input.references.length && params.firstFrame)) P.fail('请使用独立的 firstFrame 和 lastFrame 指定视频首尾帧');
-      if (params.firstFrame || input.references.length) input.firstFrame = reference(params.firstFrame || input.references[0]);
-      if (params.lastFrame) input.lastFrame = reference(params.lastFrame);
-      input.references = [];
-    } else if (params.firstFrame || params.lastFrame) P.fail('图片创作请使用 references，首尾帧仅用于视频');
-    P.validateInputs(p, input);
+    const input = prepareCreateInput(p, params, agent);
     const token = P.id(params.idempotencyKey || crypto.randomUUID());
     const fingerprint = crypto.createHash('sha256').update(JSON.stringify({ profileId: p.id, input })).digest('hex');
     // Serialize duplicate submissions of one key so concurrent creates cannot
@@ -369,10 +388,11 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
   // next to the frame — the job is already terminal here, so the Rust
   // checkpoint API (which requires a running job) is off the table.
   const tailSidecar = file => `${file}.json`;
-  async function exportTailFrameForJob(jobId, index = 0, signal) {
+  async function exportTailFrameForJob(jobId, index = 0, signal, report = () => {}) {
     const job = await read(jobId);
     const c = job.checkpoint;
     if (c?.kind !== 'video') P.fail('尾帧导出仅支持视频作品');
+    report('checking', 0);
     const output = c?.outputs?.[index];
     if (!output) P.fail('Output not found');
     if (!OUTPUT_NAME.test(output.name) || output.name !== path.basename(output.name)) P.fail('Invalid output record');
@@ -386,15 +406,26 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
       const existing = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
       if (existing.file === file && existing.sourceSha256 === output.sha256 && fs.existsSync(path.join(root, existing.file))) return existing;
     } catch { }
+    report('decoding', 5);
     const result = await getFrameWorker().exportTailFrame({ source, target: path.join(root, file), signal, timeoutMs: 120000 });
+    // The worker only guarantees the bytes it hashed were stable across its own
+    // decode. The artifact can still have been replaced since the Job recorded
+    // it, and a frame of that other video must never be published for this one.
+    if (result.sourceSha256 !== output.sha256) {
+      const error = new Error('源视频在导出期间被替换，未发布尾帧');
+      error.rpc = { code: -32602, message: error.message, reason: 'source-changed' };
+      throw error;
+    }
     // Library registration is idempotent by path + content hash via the
     // pre-check above (put's sha argument is an overwrite CAS, not for new
     // files), so a crash between put and sidecar never duplicates the entry.
+    report('publishing', 90);
     const destination = `创作/尾帧/${file}`;
     let entry = (await library.handlers['library/list']()).entries.find(item => !item.trashedAt && item.path === destination && item.sha256 === result.frameSha256);
     if (!entry) entry = await library.put(path.join(root, file), destination);
     const record = { file, libraryId: entry.id, libraryVersion: entry.sha256, libraryName: entry.name, libraryPath: entry.path, sourceSha256: result.sourceSha256, frameSha256: result.frameSha256, frameSize: result.frameSize, ptsTime: result.ptsTime, timeBase: result.timeBase, streamIndex: result.streamIndex, codec: result.codec, rotation: result.rotation, width: result.width, height: result.height, usedFullScan: result.usedFullScan, decoder: await getFrameWorker().decoderVersion(), exportedAt: new Date().toISOString() };
     P.atomic(sidecar, record);
+    report('done', 100);
     return record;
   }
   function readTailRecord(jobId, index) {
@@ -408,11 +439,24 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
     return null;
   }
   const tailHandlers = {
+    // The export runs through the shared operations registry: identical
+    // requests (job, output index, source hash) share ONE decode, each RPC
+    // caller keeps an independent cancellation token, and 'studio/frame/cancel'
+    // can stop the caller's participation while it runs.
     'studio/frame/export': async p => {
       await initialize();
+      const jobId = P.id(p?.id);
       const outputIndex = p?.index ?? p?.outputIndex ?? 0;
+      const job = await read(jobId);
+      const output = job.checkpoint?.outputs?.[outputIndex];
+      if (!output) P.fail('Output not found');
+      const { promise, opId, executionId } = mediaOps.run({
+        key: `studio-tail-frame:${jobId}:${outputIndex}:${output.sha256}`,
+        kind: 'studio.tail-frame', label: `${job.id} #${outputIndex + 1} 尾帧`,
+        execute: (signal, report) => exportTailFrameForJob(jobId, outputIndex, signal, report),
+      });
       let record;
-      try { record = await exportTailFrameForJob(P.id(p?.id), outputIndex); }
+      try { record = await promise; }
       catch (error) {
         if (error.rpc && !error.rpc.reason && error.rpc.code === -32602) error.rpc.reason = 'decode-failed';
         throw error;
@@ -420,7 +464,7 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
       // Both key styles: the contract-agreed flat keys and the nested B-v1
       // shapes the studio UI consumes.
       return {
-        jobId: P.id(p?.id), outputIndex,
+        jobId, outputIndex, operationId: opId, executionId,
         path: record.libraryPath, sha256: record.frameSha256, sourceVideoSha256: record.sourceSha256,
         streamIndex: record.streamIndex, pts: record.ptsTime, timeBase: record.timeBase, width: record.width, height: record.height,
         libraryId: record.libraryId, libraryVersion: record.libraryVersion, name: record.libraryName, file: record.file,
@@ -429,6 +473,25 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
         frame: { sourceSha256: record.sourceSha256, frameSha256: record.frameSha256, ptsTime: record.ptsTime, streamIndex: record.streamIndex, rotation: record.rotation, decoder: record.decoder, usedFullScan: record.usedFullScan },
       };
     },
+    'studio/frame/cancel': async p => {
+      const jobId = P.id(p?.id);
+      const outputIndex = p?.index ?? p?.outputIndex ?? 0;
+      const result = mediaOps.cancelByKey(`studio-tail-frame:${jobId}:${outputIndex}:`);
+      return { ...result, jobId, outputIndex };
+    },
+    'studio/operations/list': () => ({ operations: mediaOps.list().filter(op => op.kind.startsWith('studio.') || op.kind.startsWith('library.')) }),
+    // One cancel surface for the whole derived-media queue: a caller token
+    // drops only this caller's participation in a shared decode, an execution
+    // id stops the decode for everyone.
+    'studio/operations/cancel': p => {
+      const id = value => (typeof value === 'string' && OP_ID.test(value) ? value : null);
+      const opId = id(p?.opId), executionId = id(p?.executionId);
+      if (!opId && !executionId) P.fail('需要 opId 或 executionId');
+      const message = '操作已取消';
+      return opId ? { ...mediaOps.cancel(opId, message), opId } : { ...mediaOps.cancelExecution(executionId, message), executionId };
+    },
+    'studio/media/image-process': async p => { await initialize(); return getImageOps().commands['library/image/process'](p); },
+    'studio/media/extract-frame': async p => { await initialize(); return getImageOps().commands['library/video/extract-frame'](p); },
     'studio/frame/content': async p => {
       await initialize(); const jobId = P.id(p?.id);
       await read(jobId);
@@ -451,16 +514,82 @@ function createMediaStudio({ home, rpc, library, safeStorage, pollMs = 2500, max
     },
   };
   const templateStore = TPL.createTemplateStore({ home });
-  const api = { handlers: { ...handlers, ...templateStore.handlers }, create, profiles, initialize, exportTailFrameForJob, workspaceId: () => { if (!workspace) P.fail('Media service is starting'); return workspace; }, root };
+  // C20 power/activity contract (consumed by the host as a number): the
+  // merged count of every outstanding managed media task. Non-negative and
+  // finite; each terminal transition (success/failure/cancel) or close
+  // decrements it - it never counts finished history, unknown or external
+  // work. Layers: this scheduler's active/waiting/accepting jobs, the
+  // derived-operation registry (frame exports etc.) and the sequence,
+  // composition and article engines' own outstanding tasks. A logical task
+  // that spans layers (a sequence shot running as a studio job) may be
+  // represented in more than one layer: the count is a keep-awake signal,
+  // not an exact task census. Canvas/pet hatching keep-alive is not wired
+  // into this counter (documented uncovered).
+  function pendingActivityCount() {
+    if (closed) return 0;
+    const layers = [mediaOps.pendingCount, active.size, waiting.length, pendingCreates.size,
+      compositionEngine?.pendingCount ?? 0, articleEngine?.pendingCount ?? 0, sequenceEngine?.pendingCount ?? 0];
+    return layers.reduce((total, n) => total + (Number.isFinite(n) && n > 0 ? n : 0), 0);
+  }
+  const api = { handlers: { ...handlers, ...templateStore.handlers }, create, prepareInput: prepareCreateInput, profiles, initialize, readJob: async id => publicJob(await read(id)), exportTailFrameForJob, operations: mediaOps, workspaceId: () => { if (!workspace) P.fail('Media service is starting'); return workspace; }, root, get pendingActivityCount() { return pendingActivityCount(); } };
   const sequenceEngine = SEQ.createSequenceEngine({ home, rpc, library, studio: api, templates: templateStore });
   const compositionEngine = EDIT.createCompositionEngine({ rpc, studio: api, library, playback });
   const articleEngine = ARTICLE.createArticleEngine({ rpc, studio: api, library, playback });
   const pets = PET.createPetService({ home, rpc, studio: api, playback });
-  api.handlers = { ...api.handlers, ...sequenceEngine.handlers, ...compositionEngine.handlers, ...articleEngine.handlers, ...tailHandlers, ...pets.handlers };
+  const canvasEngine = CANVAS.createCanvasEngine({ home, rpc, library, studio: api });
+  api.handlers = { ...api.handlers, ...sequenceEngine.handlers, ...compositionEngine.handlers, ...articleEngine.handlers, ...tailHandlers, ...pets.handlers, ...canvasEngine.handlers };
   return {
-    handlers: api.handlers, create, profiles, initialize, exportTailFrameForJob, workspaceId: api.workspaceId, sequence: sequenceEngine, pets,
-    async close() { closed = true; await articleEngine.close(); await compositionEngine.close(); await pets.close(); waiting.length = 0; for (const task of active.values()) task.controller.abort(); await Promise.allSettled([...active.values()].map(t => t.promise)); await sequenceEngine.close(); await playback.close(); },
+    handlers: api.handlers, create, profiles, initialize, readJob: async id => publicJob(await read(id)), exportTailFrameForJob, operations: mediaOps, workspaceId: api.workspaceId, sequence: sequenceEngine, pets, canvas: canvasEngine, get pendingActivityCount() { return pendingActivityCount(); },
+    // C15 shutdown contract: every owned engine, operation and playback
+    // listener closes concurrently — one stuck component never blocks the
+    // recovery of the others. The whole chain races a bounded deadline and
+    // reports honestly: confirmed only when everything settled, with the
+    // unresolved components named when the deadline wins.
+    async close(context = {}) {
+      if (closeOutcome) return closeOutcome;
+      closed = true;
+      const steps = [
+        ['operations', () => mediaOps.dispose()],
+        ['article', () => articleEngine.close()],
+        ['composition', () => compositionEngine.close()],
+        ['pets', () => pets.close()],
+        ['canvas', () => canvasEngine.close()],
+        ['sequence', () => sequenceEngine.close()],
+        ['playback', () => playback.close()],
+      ];
+      const pending = new Set(steps.map(([name]) => name));
+      const work = (async () => {
+        waiting.length = 0;
+        for (const task of active.values()) task.controller.abort();
+        const outcomes = await Promise.allSettled([...active.values()].map(t => t.promise).concat(steps.map(([name, step]) => Promise.resolve().then(step).finally(() => pending.delete(name)).then(() => null, error => ({ name, error })))));
+        const failures = [];
+        for (const outcome of outcomes) {
+          if (outcome.status === 'fulfilled' && outcome.value) failures.push(`${outcome.value.name}: ${outcome.value.error?.message || 'failed'}`);
+        }
+        return failures;
+      })();
+      const settled = work.then(failures => ({ confirmed: failures.length === 0, ownedPids: [], ...(failures.length ? { detail: `closed with unconfirmed steps: ${failures.join('; ')}` } : { detail: 'media studio closed; owned decoders were aborted' }) }));
+      const timeoutMs = Number.isFinite(context.remainingMs) ? Math.max(0, context.remainingMs) : closeTimeoutMs;
+      if (context.signal?.aborted || timeoutMs === 0) {
+        return { confirmed: false, ownedPids: [], detail: `media studio shutdown had no remaining budget; unconfirmed components: ${[...pending].join(', ') || 'none'}` };
+      }
+      let timer; let removeAbort;
+      const expired = new Promise(resolve => {
+        timer = setTimeout(() => resolve(null), timeoutMs);
+        timer.unref?.();
+        if (context.signal) {
+          const onAbort = () => resolve(null);
+          context.signal.addEventListener('abort', onAbort, { once: true });
+          removeAbort = () => context.signal.removeEventListener('abort', onAbort);
+        }
+      });
+      const outcome = await Promise.race([settled, expired]);
+      clearTimeout(timer); removeAbort?.();
+      if (!outcome) return { confirmed: false, ownedPids: [], detail: `media studio shutdown did not finish within ${timeoutMs}ms; unconfirmed components: ${[...pending].join(', ') || 'none'}` };
+      closeOutcome = outcome;
+      return outcome;
+    },
     root,
   };
 }
-module.exports = { createMediaStudio, METHODS, extension };
+module.exports = { createMediaStudio, METHODS, extension, prepareCreateInput };

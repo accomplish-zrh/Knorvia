@@ -89,7 +89,7 @@ test("closing the preview drops the frozen selection", () => {
   assert.match(card, /const closePreview = \(\) => \{/);
   // Both the backdrop and the X button go through it.
   assert.match(card, /onClick=\{closePreview\}/);
-  assert.match(card, /onClick=\{closePreview\}\n\s*className="rounded-md p-1/);
+  assert.match(card, /onClick=\{closePreview\}\r?\n\s*className="rounded-md p-1/);
   assert.match(card, /return \(\) => clearPendingOfficeSelection\(sessionId\)/);
   assert.match(card, /setPendingOfficeSelection\(\s*\{[^}]*\},\s*sessionId,\s*\)/);
 });

@@ -7,6 +7,8 @@ publish.workspace = true
 description = "Knorvia control plane: handshake, product methods, policy, activity."
 
 [dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 knorvia-platform-paths = { workspace = true }
 knorvia-protocol = { workspace = true }
 knorvia-store = { workspace = true }
@@ -19,3 +21,4 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
+getrandom = { workspace = true }

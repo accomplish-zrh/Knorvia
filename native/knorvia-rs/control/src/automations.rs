@@ -7,7 +7,7 @@
 use super::*;
 use knorvia_store::{
     Automation, AutomationRun, AutomationSchedule, AutomationStatus, AutomationUpdate,
-    ProductStore, StoreError, epoch_millis,
+    MisfirePolicy, ProductStore, StoreError, epoch_millis,
 };
 use serde_json::Map;
 use std::collections::HashSet;
@@ -59,6 +59,7 @@ impl AutomationScheduler {
     pub fn start(
         store: Arc<ProductStore>,
         admissions_paused: Arc<AtomicBool>,
+        state_writer_barrier: Arc<Mutex<()>>,
     ) -> Result<Self, ProtocolError> {
         store
             .recover_automation_runs_after_restart(epoch_millis())
@@ -71,22 +72,28 @@ impl AutomationScheduler {
             .name("knorvia-automation-clock".into())
             .spawn(move || {
                 loop {
-                    let accepting_admissions = !admissions_paused.load(Ordering::Acquire);
-                    match tick_automations_with_admissions(
-                        &store,
-                        epoch_millis(),
-                        accepting_admissions,
-                    ) {
-                        Ok(runs) => {
-                            if offer_dispatches(&dispatch_tx, &worker_in_flight, runs).is_err() {
-                                return;
+                    // Synchronize the final pause check with state rollback.
+                    // The transition owner sets paused, then takes this same
+                    // barrier; after it succeeds, no scheduler read/write can
+                    // still be in progress or begin until admissions resume.
+                    {
+                        let _writer = state_writer_barrier
+                            .lock()
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        if !admissions_paused.load(Ordering::Acquire) {
+                            match tick_automations_with_admissions(&store, epoch_millis(), true) {
+                                Ok(runs) => {
+                                    if offer_dispatches(&dispatch_tx, &worker_in_flight, runs)
+                                        .is_err()
+                                    {
+                                        return;
+                                    }
+                                }
+                                Err(error) => eprintln!(
+                                    "knorvia automation scheduler: {}",
+                                    error.message
+                                ),
                             }
-                        }
-                        // This is a scheduler infrastructure failure, not a
-                        // model result. It is retried on the next bounded tick;
-                        // stdout remains protocol-only.
-                        Err(error) => {
-                            eprintln!("knorvia automation scheduler: {}", error.message)
                         }
                     }
                     match stop_rx.recv_timeout(AUTOMATION_TICK) {
@@ -309,8 +316,15 @@ where
 
     loop {
         plane.dispatch_queued_automations(&scheduler);
+        if let Err(error) = plane.dispatch_queued_messages() {
+            eprintln!("chat queue: {}", error.message);
+        }
         match frames_rx.recv_timeout(AUTOMATION_TICK) {
             Ok(IncomingFrame::Frame(frame)) => {
+                let pack_output = Arc::clone(&output);
+                if plane.defer_pack_request(&plane.handshake, &frame, Arc::new(move |response| {
+                    if let Ok(mut out) = pack_output.lock() { let _ = write_frame(&mut *out, &response); }
+                }))? { continue; }
                 if let Some(response) = plane.handle_json(&frame)? {
                     let mut output = output.lock().map_err(|error| {
                         ProtocolError::new(ErrorCategory::Internal, error.to_string())
@@ -324,7 +338,7 @@ where
                 // waiting on more stdin.
                 plane.dispatch_queued_automations(&scheduler);
             }
-            Ok(IncomingFrame::End) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
+            Ok(IncomingFrame::End) | Err(RecvTimeoutError::Disconnected) => { plane.wait_pack_replies(); return Ok(()); },
             Ok(IncomingFrame::Error(error)) => return Err(error),
             Err(RecvTimeoutError::Timeout) => {}
         }
@@ -471,9 +485,127 @@ fn schedule(params: &Value) -> Result<AutomationSchedule, ProtocolError> {
             })?;
             Ok(AutomationSchedule::Once { at })
         }
+        "calendar" => {
+            let timezone = schedule
+                .get("timezone")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        "schedule.timezone must be an IANA name string",
+                    )
+                })?
+                .to_string();
+            let weekdays = u8_list(schedule.get("weekdays"), "weekdays", 0, 6)?;
+            let hour = schedule
+                .get("hour")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        "schedule.hour must be an unsigned integer",
+                    )
+                })?;
+            let hour = u8::try_from(hour).map_err(|_| {
+                ProtocolError::new(
+                    ErrorCategory::InvalidArgument,
+                    "schedule.hour is out of range",
+                )
+            })?;
+            let minute = schedule
+                .get("minute")
+                .and_then(Value::as_u64)
+                .ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        "schedule.minute must be an unsigned integer",
+                    )
+                })?;
+            let minute = u8::try_from(minute).map_err(|_| {
+                ProtocolError::new(
+                    ErrorCategory::InvalidArgument,
+                    "schedule.minute is out of range",
+                )
+            })?;
+            let days_of_month = u8_list(schedule.get("daysOfMonth"), "daysOfMonth", 1, 31)?;
+            let last_day_of_month = schedule
+                .get("lastDayOfMonth")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let months = u8_list(schedule.get("months"), "months", 1, 12)?;
+            let misfire = match schedule.get("misfire") {
+                None | Some(Value::Null) => MisfirePolicy::default(),
+                Some(Value::String(text)) => match text.as_str() {
+                    "skip" => MisfirePolicy::Skip,
+                    "runLast" => MisfirePolicy::RunLast,
+                    other => {
+                        return Err(ProtocolError::new(
+                            ErrorCategory::InvalidArgument,
+                            format!("schedule.misfire must be skip or runLast, not {other}"),
+                        ));
+                    }
+                },
+                Some(_) => {
+                    return Err(ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        "schedule.misfire must be a string",
+                    ));
+                }
+            };
+            Ok(AutomationSchedule::Calendar {
+                timezone,
+                weekdays,
+                hour,
+                minute,
+                days_of_month,
+                last_day_of_month,
+                months,
+                misfire,
+            })
+        }
         _ => Err(ProtocolError::new(
             ErrorCategory::InvalidArgument,
-            "schedule.kind must be interval or once",
+            "schedule.kind must be interval, once, or calendar",
+        )),
+    }
+}
+
+/// A bounded unsigned-integer list field; absent or null means "every value".
+fn u8_list(
+    value: Option<&Value>,
+    field: &str,
+    low: u8,
+    high: u8,
+) -> Result<Vec<u8>, ProtocolError> {
+    match value {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                let number = item.as_u64().ok_or_else(|| {
+                    ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        format!("schedule.{field} entries must be unsigned integers"),
+                    )
+                })?;
+                let number = u8::try_from(number).map_err(|_| {
+                    ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        format!("schedule.{field} entry {number} is out of range"),
+                    )
+                })?;
+                if number < low || number > high {
+                    return Err(ProtocolError::new(
+                        ErrorCategory::InvalidArgument,
+                        format!("schedule.{field} entry {number} must be {low}..={high}"),
+                    ));
+                }
+                Ok(number)
+            })
+            .collect(),
+        Some(_) => Err(ProtocolError::new(
+            ErrorCategory::InvalidArgument,
+            format!("schedule.{field} must be an array of unsigned integers"),
         )),
     }
 }
@@ -483,6 +615,25 @@ fn optional_schedule(params: &Value) -> Result<Option<AutomationSchedule>, Proto
         return Ok(None);
     }
     schedule(params).map(Some)
+}
+
+fn optional_nullable_epoch(
+    params: &Value,
+    key: &str,
+) -> Result<Option<Option<i64>>, ProtocolError> {
+    match params.get(key) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(value) => value
+            .as_i64()
+            .map(|value| Some(Some(value)))
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCategory::InvalidArgument,
+                    format!("{key} must be a UTC epoch millisecond integer or null"),
+                )
+            }),
+    }
 }
 
 /// Accept the original `revision` spelling and the rest of the control
@@ -518,7 +669,11 @@ impl ControlPlane {
     /// scheduler has no executor access; callers must drain it through
     /// [`Self::dispatch_queued_automations`] on the reader-owning thread.
     pub fn start_automation_scheduler(&self) -> Result<AutomationScheduler, ProtocolError> {
-        AutomationScheduler::start(Arc::clone(&self.store), Arc::clone(&self.admissions_paused))
+        AutomationScheduler::start(
+            Arc::clone(&self.store),
+            Arc::clone(&self.admissions_paused),
+            Arc::clone(&self.state_writer_barrier),
+        )
     }
 
     /// Run every currently queued durable dispatch. The per-run error is
@@ -553,6 +708,17 @@ impl ControlPlane {
         &mut self,
         run_id: &str,
     ) -> Result<Option<AutomationRun>, ProtocolError> {
+        let Some(_materialized) = self
+            .store
+            .materialize_automation_run(run_id, epoch_millis())
+            .map_err(StoreError::into_protocol)?
+        else {
+            return Ok(None);
+        };
+        // Recheck immediately before the normal Turn admission. A run can sit
+        // in the bounded dispatch queue until after validUntil; this second
+        // materialization read converts it to skipped/expired and creates no
+        // Turn. It does not affect a Turn that was already admitted.
         let Some(run) = self
             .store
             .materialize_automation_run(run_id, epoch_millis())
@@ -607,6 +773,52 @@ impl ControlPlane {
             .map_err(StoreError::into_protocol)
     }
 
+    /// Preview the next occurrences of a schedule (R03). Either an existing
+    /// automation `id` or a full inline `schedule` object; the preview never
+    /// claims or mutates anything.
+    pub(crate) fn rpc_automation_preview(&self, params: &Value) -> Result<Value, ProtocolError> {
+        let (schedule, stored_from, stored_until) = match optional_schedule(params)? {
+            Some(schedule) => (schedule, None, None),
+            None => {
+                let id = required_str(params, "id")?;
+                let automation = self
+                    .store
+                    .read_automation(&id)
+                    .map_err(|error| error.into_protocol())?;
+                (
+                    automation.schedule,
+                    automation.valid_from,
+                    automation.valid_until,
+                )
+            }
+        };
+        let valid_from = optional_nullable_epoch(params, "validFrom")?.unwrap_or(stored_from);
+        let valid_until = optional_nullable_epoch(params, "validUntil")?.unwrap_or(stored_until);
+        let from = match params.get("from") {
+            None | Some(Value::Null) => epoch_millis(),
+            Some(value) => value.as_i64().ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCategory::InvalidArgument,
+                    "from must be a UTC epoch millisecond integer",
+                )
+            })?,
+        };
+        let count = params
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(5)
+            .clamp(1, 50) as usize;
+        let next = schedule
+            .next_occurrences_in_window_after(from, count, valid_from, valid_until)
+            .map_err(|error| error.into_protocol())?;
+        Ok(json!({
+            "next": next,
+            "count": next.len(),
+            "validFrom": valid_from,
+            "validUntil": valid_until,
+        }))
+    }
+
     pub(super) fn rpc_automation_list(&self, params: &Value) -> Result<Value, ProtocolError> {
         let workspace_id = match params.get("workspaceId") {
             None | Some(Value::Null) => None,
@@ -635,7 +847,7 @@ impl ControlPlane {
         let workspace_id = required_text(params, "workspaceId")?;
         let automation = self
             .store
-            .create_automation_with_settings(
+            .create_automation_with_window_at(
                 &title,
                 &prompt,
                 &workspace_id,
@@ -644,6 +856,9 @@ impl ControlPlane {
                 optional_bool(params, "allowWrites")?.unwrap_or(false),
                 optional_nullable_text(params, "model")?.flatten(),
                 optional_nullable_text(params, "reasoningEffort")?.flatten(),
+                optional_nullable_epoch(params, "validFrom")?.flatten(),
+                optional_nullable_epoch(params, "validUntil")?.flatten(),
+                epoch_millis(),
             )
             .map_err(StoreError::into_protocol)?;
         Ok(json!({"automation": self.automation_value(&automation)?}))
@@ -660,6 +875,8 @@ impl ControlPlane {
             allow_writes: optional_bool(params, "allowWrites")?,
             model: optional_nullable_text(params, "model")?,
             reasoning_effort: optional_nullable_text(params, "reasoningEffort")?,
+            valid_from: optional_nullable_epoch(params, "validFrom")?,
+            valid_until: optional_nullable_epoch(params, "validUntil")?,
         };
         let automation = self
             .store

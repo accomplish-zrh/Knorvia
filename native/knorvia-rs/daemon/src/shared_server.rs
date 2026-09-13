@@ -203,6 +203,7 @@ pub(crate) fn serve(paths: KnorviaPaths) -> Result<(), ProtocolError> {
     let mut final_peer = None;
     loop {
         plane.dispatch_queued_automations(&scheduler);
+        if let Err(error) = plane.dispatch_queued_messages() { eprintln!("chat queue: {}", error.message); }
         match frames.recv_timeout(Duration::from_millis(25)) {
             Ok(Incoming::Open(id, peer)) => {
                 if std::env::var_os("KNORVIA_TRANSPORT_TRACE").is_some() {
@@ -234,6 +235,10 @@ pub(crate) fn serve(paths: KnorviaPaths) -> Result<(), ProtocolError> {
                     Some(serde_json::to_string(&RpcFailure::from_category(request_id.expect("validated request id"),
                         ErrorCategory::Conflict, "other clients are connected; close them before updating the shared runtime")).map_err(io_error)?)
                 } else {
+                    let peer = peers.lock().map_err(io_error)?.get(&id).cloned();
+                    if let Some(peer) = peer {
+                        if plane.defer_pack_request(session, &body, Arc::new(move |response| peer.send(response)))? { continue; }
+                    }
                     match plane.handle_session_json(session, &body) {
                         Ok(response) => response,
                         Err(_) => {
@@ -286,7 +291,8 @@ pub(crate) fn serve(paths: KnorviaPaths) -> Result<(), ProtocolError> {
                 .map_err(|error| error.into_protocol())?
                 .iter()
                 .any(|plan| plan.status == knorvia_store::AutomationStatus::Active);
-            if running == 0 && (!scheduled || restart_owner.is_some()) {
+            let queued = plane.has_queued_message_work()?;
+            if running == 0 && !queued && !plane.has_active_pack_requests() && (!scheduled || restart_owner.is_some()) {
                 break;
             }
             // Closing a window detaches; active work and schedules retain ownership.

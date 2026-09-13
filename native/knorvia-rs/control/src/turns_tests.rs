@@ -336,26 +336,61 @@ fn explicit_default_and_model_switch_clear_saved_reasoning_settings() {
     let probe = Arc::new(Probe::default());
     let mut plane = plane(RecordingExecutor::new(Arc::clone(&probe)));
     init(&mut plane);
-    let workspace = rpc(&mut plane, "w", "workspace/create", json!({"title":"Effort"}));
-    let started = rpc(&mut plane, "t", "thread/start", json!({
-        "workspaceId":workspace["result"]["id"], "model":"reasoning-model", "reasoningEffort":"high"
-    }));
+    let workspace = rpc(
+        &mut plane,
+        "w",
+        "workspace/create",
+        json!({"title":"Effort"}),
+    );
+    let started = rpc(
+        &mut plane,
+        "t",
+        "thread/start",
+        json!({
+            "workspaceId":workspace["result"]["id"], "model":"reasoning-model", "reasoningEffort":"high"
+        }),
+    );
     let id = started["result"]["id"].as_str().unwrap();
-    let clear = rpc(&mut plane, "clear", "thread/update", json!({"id":id,"reasoningEffort":null}));
+    let clear = rpc(
+        &mut plane,
+        "clear",
+        "thread/update",
+        json!({"id":id,"reasoningEffort":null}),
+    );
     assert!(clear["error"].is_null(), "{clear}");
     assert!(clear["result"]["reasoningEffort"].is_null());
-    let sent = rpc(&mut plane, "send", "turn/start", json!({"threadId":id,"input":"Use default effort"}));
+    let sent = rpc(
+        &mut plane,
+        "send",
+        "turn/start",
+        json!({"threadId":id,"input":"Use default effort"}),
+    );
     assert!(sent["error"].is_null(), "{sent}");
     let first = probe.requests.lock().unwrap()[0].settings.clone();
     assert!(first.reasoning_effort.is_none());
     assert_eq!(first.collaboration_mode.as_deref(), Some("default"));
-    rpc(&mut plane, "high", "thread/update", json!({"id":id,"reasoningEffort":"high"}));
-    let changed = rpc(&mut plane, "switch", "thread/update", json!({"id":id,"model":"fast-model"}));
+    rpc(
+        &mut plane,
+        "high",
+        "thread/update",
+        json!({"id":id,"reasoningEffort":"high"}),
+    );
+    let changed = rpc(
+        &mut plane,
+        "switch",
+        "thread/update",
+        json!({"id":id,"model":"fast-model"}),
+    );
     assert!(changed["result"]["reasoningEffort"].is_null());
     let read = rpc(&mut plane, "read", "thread/read", json!({"id":id}));
     assert!(read["result"]["reasoningEffort"].is_null());
     // Changing a model with an explicit new effort preserves that selection.
-    let chosen = rpc(&mut plane, "chosen", "thread/update", json!({"id":id,"model":"reasoning-model","reasoningEffort":"low"}));
+    let chosen = rpc(
+        &mut plane,
+        "chosen",
+        "thread/update",
+        json!({"id":id,"model":"reasoning-model","reasoningEffort":"low"}),
+    );
     assert_eq!(chosen["result"]["reasoningEffort"], "low");
 }
 

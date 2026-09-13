@@ -85,6 +85,25 @@ test('source renderer startup can use Electron as Node when no staged runtime ex
   assert.equal(launcher.useElectronAsNode, true);
 });
 
+test('an isolated release declares its build directory without permitting paths outside the renderer', () => {
+  const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'knorvia-renderer-manifest-'));
+  const web = path.join(runtime, 'web');
+  try {
+    fs.mkdirSync(path.join(web, '.next-canvas-release'), { recursive: true });
+    fs.mkdirSync(path.join(web, 'node_modules', 'next'), { recursive: true });
+    fs.writeFileSync(path.join(web, '.next-canvas-release', 'required-server-files.json'), '{"config":{}}');
+    const manifest = path.join(web, 'renderer.json');
+    fs.writeFileSync(manifest, JSON.stringify({ schemaVersion: 1, distDir: '.next-canvas-release' }));
+    assert.equal(resolveWebRenderer({ runtimeRoot: runtime }).distDir, '.next-canvas-release');
+    for (const distDir of ['../outside', '.next/../outside', 'D:\\outside']) {
+      fs.writeFileSync(manifest, JSON.stringify({ schemaVersion: 1, distDir }));
+      assert.throws(() => resolveWebRenderer({ runtimeRoot: runtime }), /not found/);
+    }
+  } finally {
+    fs.rmSync(runtime, { recursive: true, force: true });
+  }
+});
+
 test('a relocated native release resolves its bundled renderer without Python or source paths', () => {
   const runtime = fs.mkdtempSync(path.join(os.tmpdir(), 'knorvia-native-release-'));
   try {
@@ -99,12 +118,13 @@ test('a relocated native release resolves its bundled renderer without Python or
   }
 });
 
-test('the current KNORVIA_WEB_DIR standalone output can start the named-pipe renderer host', {
+const currentStandalone = process.env.KNORVIA_ACCEPT_WEB_ROOT || path.resolve(__dirname, '../../web/.next/standalone');
+test('the configured standalone output can start the named-pipe renderer host', {
   skip: process.platform !== 'win32'
-    || !fs.existsSync(path.resolve(__dirname, '../../web/.next/standalone/.next/required-server-files.json')),
+    || !fs.existsSync(currentStandalone),
   timeout: 45_000,
 }, async () => {
-  const webRoot = path.resolve(__dirname, '../../web/.next/standalone');
+  const { webRoot, distDir } = resolveWebRenderer({ webDir: currentStandalone });
   const frontendHost = path.resolve(__dirname, '../frontend-host.js');
   const pipe = `\\\\.\\pipe\\knorvia-source-renderer-${process.pid}-${Date.now()}`;
   const child = spawn(process.execPath, [frontendHost], {
@@ -115,7 +135,7 @@ test('the current KNORVIA_WEB_DIR standalone output can start the named-pipe ren
       ...process.env,
       KNORVIA_WEB_ROOT: webRoot,
       KNORVIA_UI_PIPE: pipe,
-      KNORVIA_NEXT_DIST_DIR: '.next',
+      KNORVIA_NEXT_DIST_DIR: distDir,
     },
   });
   try {

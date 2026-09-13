@@ -97,22 +97,8 @@ impl ProductStore {
         &self,
         mut visit: impl FnMut(knorvia_protocol::Job) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        let entries = match std::fs::read_dir(self.paths().state.join("product").join("jobs")) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        for entry in entries {
-            let entry = entry?;
-            if entry.file_type()?.is_file()
-                && entry.path().extension().and_then(|e| e.to_str()) == Some("json")
-            {
-                let job: knorvia_protocol::Job =
-                    serde_json::from_slice(&std::fs::read(entry.path())?)?;
-                if job.r#type.starts_with("media.") || job.r#type.starts_with("studio.") {
-                    visit(job)?;
-                }
-            }
+        for job in self.usage_query_snapshot(None, None, None, None)?.jobs {
+            visit(job)?;
         }
         Ok(())
     }
@@ -125,34 +111,11 @@ impl ProductStore {
         to_ms: Option<u64>,
         mut visit: impl FnMut(UsageRecord) -> Result<(), StoreError>,
     ) -> Result<(), StoreError> {
-        let root = self.paths().state.join("product").join("usage");
-        let dirs = match std::fs::read_dir(root) {
-            Ok(dirs) => dirs,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => return Err(error.into()),
-        };
-        for dir in dirs {
-            let dir = dir?;
-            if !dir.file_type()?.is_dir() {
-                continue;
-            }
-            for entry in std::fs::read_dir(dir.path())? {
-                let entry = entry?;
-                if !entry.file_type()?.is_file()
-                    || entry.path().extension().and_then(|e| e.to_str()) != Some("json")
-                {
-                    continue;
-                }
-                if entry.metadata()?.len() > 1024 * 1024 {
-                    return Err(StoreError::Corrupt("oversized usage record".into()));
-                }
-                let record: UsageRecord = serde_json::from_slice(&std::fs::read(entry.path())?)?;
-                if from_ms.is_none_or(|from| record.recorded_at_ms >= from)
-                    && to_ms.is_none_or(|to| record.recorded_at_ms <= to)
-                {
-                    visit(record)?;
-                }
-            }
+        for record in self
+            .usage_query_snapshot(from_ms, to_ms, None, None)?
+            .records
+        {
+            visit(record)?;
         }
         Ok(())
     }
@@ -165,6 +128,8 @@ impl ProductStore {
     /// later recovery/replay that re-derives the same Turn must never create
     /// a second record (transport replays are not new consumption).
     pub fn record_usage(&self, record: &UsageRecord) -> Result<bool, StoreError> {
+        let _mutation = self.lock_mutations()?;
+        let first_ledger = !self.paths().state.join("product").join("usage").exists();
         sanitize(&record.thread_id)?;
         sanitize(&record.turn_id)?;
         let path = self.usage_path(&record.thread_id, &record.turn_id);
@@ -173,6 +138,9 @@ impl ProductStore {
         }
         let bytes = serde_json::to_vec_pretty(record)?;
         crate::atomic_write(&path, &bytes)?;
+        if self.note_usage_record(record, first_ledger).is_err() {
+            let _ = self.invalidate_usage_index();
+        }
         Ok(true)
     }
 
@@ -197,34 +165,9 @@ impl ProductStore {
         from_ms: Option<u64>,
         to_ms: Option<u64>,
     ) -> Result<(Vec<UsageRecord>, usize), StoreError> {
-        let root = self.paths().state.join("product").join("usage");
-        let mut paths: Vec<PathBuf> = Vec::new();
-        let mut push_dir = |dir: PathBuf, paths: &mut Vec<PathBuf>| {
-            let Ok(entries) = std::fs::read_dir(&dir) else {
-                return Ok::<(), StoreError>(());
-            };
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.extension().and_then(|e| e.to_str()) == Some("json") {
-                    paths.push(path);
-                }
-            }
-            Ok(())
-        };
-        if let Ok(thread_dirs) = std::fs::read_dir(&root) {
-            for thread_dir in thread_dirs.flatten() {
-                push_dir(thread_dir.path(), &mut paths)?;
-            }
-        }
-        let mut records = Vec::with_capacity(paths.len());
-        for path in paths {
-            let bytes = std::fs::read(&path)?;
-            records.push(serde_json::from_slice::<UsageRecord>(&bytes)?);
-        }
-        records.retain(|record| {
-            from_ms.is_none_or(|from| record.recorded_at_ms >= from)
-                && to_ms.is_none_or(|to| record.recorded_at_ms <= to)
-        });
+        let mut records = self
+            .usage_query_snapshot(from_ms, to_ms, None, None)?
+            .records;
         records.sort_by(|a, b| {
             a.recorded_at_ms
                 .cmp(&b.recorded_at_ms)
@@ -232,12 +175,14 @@ impl ProductStore {
                 .then_with(|| a.turn_id.cmp(&b.turn_id))
         });
         let total = records.len();
-        let page = records
-            .into_iter()
-            .skip(offset)
-            .take(limit.min(500))
-            .collect();
-        Ok((page, total))
+        Ok((
+            records
+                .into_iter()
+                .skip(offset)
+                .take(limit.min(500))
+                .collect(),
+            total,
+        ))
     }
 
     /// Derive the usage record for one terminal Turn from its durable items.

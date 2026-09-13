@@ -645,7 +645,9 @@ function createSequenceEngine({ home, rpc, library, studio, templates, pollMs = 
     }
   }
 
-  return { handlers, METHODS, recover, schedule, async close() { closed = true; await Promise.allSettled([...runners.keys()].map(jobId => stopRunner(jobId))); } };
+  // C20 activity contract: a sequence runner counts as outstanding work from
+  // schedule until its runner settles; paused sequences contribute nothing.
+  return { handlers, METHODS, recover, schedule, get pendingCount() { return runners.size; }, async close() { closed = true; await Promise.allSettled([...runners.keys()].map(jobId => stopRunner(jobId))); } };
 }
 
 module.exports = { createSequenceEngine, METHODS, PREFIX };

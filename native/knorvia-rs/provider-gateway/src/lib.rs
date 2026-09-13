@@ -8,18 +8,34 @@
 //! and normalizes the provider response (text + tool calls + typed errors).
 
 mod bridge;
+mod bridge_cancel;
 mod bridge_server;
+mod budget;
 mod compat_tools;
+mod error_class;
 mod execute;
 mod translate;
 
 use serde::{Deserialize, Serialize};
 
 pub use bridge::{AnthropicSseTranslator, ChatSseTranslator, UpstreamProtocol, translate_request};
-pub use bridge_server::{BridgeServer, spawn as spawn_responses_bridge};
+pub use bridge_server::{
+    BridgeServer, spawn as spawn_responses_bridge,
+    spawn_with_budget as spawn_responses_bridge_with_budget,
+};
+pub use budget::{
+    BudgetBreach, DEFAULT_MAX_ERROR_BODY_BYTES, DEFAULT_MAX_EVENT_BYTES, DEFAULT_MAX_EVENTS,
+    DEFAULT_MAX_LINE_BYTES, DEFAULT_MAX_TOOL_ARGS_BYTES, DEFAULT_MAX_TOTAL_BYTES,
+    ERROR_BODY_BUDGET, EVENT_BUDGET, EVENT_COUNT_BUDGET, LINE_BUDGET, StreamBudget,
+    TOOL_ARGS_BUDGET, TOTAL_OUTPUT_BUDGET,
+};
+pub use error_class::{
+    ProviderFailure, classify_status, classify_stream_error, classify_transport,
+    extract_provider_message, normalize_retry_after, redact_secrets,
+};
 pub use execute::{
     ExecuteConfig, ExecuteError, ExecutionResult, KEY_PLACEHOLDER, PROVIDER_BASE_URL_ENV,
-    PROVIDER_KEY_ENV, ToolCall, execute,
+    PROVIDER_KEY_ENV, ToolCall, category_name, execute, execute_with_budget,
 };
 pub use translate::{
     AppliedField, CanonicalImage, CanonicalMessage, CanonicalRequest, CanonicalTool,
@@ -118,7 +134,27 @@ pub fn negotiate(kind: ProviderKind, model: &str) -> Vec<CapabilityReport> {
         .collect()
 }
 
+/// Cancellation here describes only Knorvia's socket-owning Responses bridge.
+/// It does not guarantee a provider stops generation or billing immediately.
+pub fn negotiate_bridge(kind: ProviderKind, model: &str) -> Vec<CapabilityReport> {
+    let mut reports = negotiate(kind, model);
+    if matches!(
+        kind,
+        ProviderKind::OpenAiCompatible | ProviderKind::Anthropic | ProviderKind::Local
+    ) {
+        if let Some(report) = reports.iter_mut().find(|r| r.name == "cancellation") {
+            report.status = CapabilityStatus::Supported;
+            report.reason = "bridge request disconnect/close shuts down its registered upstream socket, including response headers and silent streams; local cleanup is bounded after bridge setup; cloud generation/billing stop is not guaranteed".into();
+        }
+    }
+    reports
+}
+
 fn report(kind: ProviderKind, model: &str, name: &str) -> CapabilityReport {
+    if name == "cancellation" {
+        return CapabilityReport { name:name.into(), status:CapabilityStatus::Unavailable,
+            reason:"direct provider/execute has no request cancellation handle; bridge cancellation is reported separately for its actual execution path".into() };
+    }
     let (status, reason) = match (kind, name) {
         (
             ProviderKind::OpenAiResponses,

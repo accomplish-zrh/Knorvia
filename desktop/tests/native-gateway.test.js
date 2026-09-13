@@ -1,6 +1,9 @@
 'use strict';
 
 const http = require('node:http');
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { once } = require('node:events');
@@ -147,6 +150,7 @@ test('loopback native gateway issues one-time sessions and routes approved RPC',
     }
   };
   const engine = {
+    builtinSkills: [{ name: 'short-drama', userModified: true, updateAvailable: true }],
     rpc: async (method, params) => {
       calls.push({ method, params });
       if (method === 'cliDispatch/claim') return { jobs: [], cancels: [] };
@@ -182,6 +186,8 @@ test('loopback native gateway issues one-time sessions and routes approved RPC',
     assert.deepEqual(approved, {
       jsonrpc: '2.0', id: 'test-1', result: { method: 'thread/read', params: { id: 'thread-1' } },
     });
+    const builtin = await client.request('extension/builtin/status', {});
+    assert.deepEqual(builtin.result, { skills: engine.builtinSkills }, 'browser RPC must read the actual native runtime engine');
     assertOnlyExpectedCalls();
 
     notification({ jsonrpc: '2.0', method: 'turn/event', params: { threadId: 'thread-1', status: 'running' } });
@@ -269,4 +275,56 @@ test('gateway drops a peer before an outbound notification can grow its socket q
   };
   assert.equal(sendPeerJson(peer, { jsonrpc: '2.0', method: 'turn/event', params: {} }), false);
   assert.deepEqual(closed, { code: 1013, reason: 'client output backlog' });
+});
+
+test('gateway close bounds a startup dependency that never settles and memoizes the close', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'knorvia-gateway-startup-close-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  const gateway = createNativeGateway({
+    host: '127.0.0.1', port: 0, dev: true, home,
+    env: { ...process.env, KNORVIA_SHUTDOWN_BUDGET_MS: '120' },
+    engineFactory: () => new Promise(() => {}),
+  });
+  void gateway.start().catch(() => {});
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const began = performance.now();
+  const first = gateway.close();
+  const second = gateway.close();
+  assert.equal(first, second, 'repeated close calls share one bounded shutdown');
+  const report = await first;
+  const elapsed = performance.now() - began;
+  assert.ok(elapsed < 600, `gateway close escaped its 120ms host budget (${elapsed}ms)`);
+  assert.ok(report.unconfirmed.includes('gateway-startup'));
+  assert.equal(report.steps.find(step => step.name === 'gateway-startup')?.status, 'unconfirmed');
+});
+
+test('late startup cleanup reuses the expired original shutdown deadline', async t => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'knorvia-gateway-late-cleanup-'));
+  t.after(() => fs.rmSync(home, { recursive: true, force: true }));
+  let resolveEngine;
+  const engineReady = new Promise(resolve => { resolveEngine = resolve; });
+  const shutdownTimeouts = [];
+  const gateway = createNativeGateway({
+    host: '127.0.0.1', port: 0, dev: true, home,
+    env: { ...process.env, KNORVIA_SHUTDOWN_BUDGET_MS: '120' },
+    engineFactory: () => engineReady,
+  });
+  const startup = gateway.start().catch(error => error);
+  await new Promise(resolve => setTimeout(resolve, 20));
+  const report = await gateway.close();
+  assert.ok(report.unconfirmed.includes('gateway-startup'));
+
+  // Resolve startup only after the original absolute deadline has expired.
+  // The delayed sweep must signal shutdown with zero remaining budget.
+  await new Promise(resolve => setTimeout(resolve, 120));
+  resolveEngine({
+    rpc: async () => ({}),
+    onNotification: () => () => {},
+    shutdown: async ({ timeoutMs }) => { shutdownTimeouts.push(timeoutMs); },
+    kill: () => {},
+  });
+  await startup;
+  const until = Date.now() + 1000;
+  while (!shutdownTimeouts.length && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 10));
+  assert.deepEqual(shutdownTimeouts, [0], 'late cleanup cannot allocate a fresh shutdown budget');
 });

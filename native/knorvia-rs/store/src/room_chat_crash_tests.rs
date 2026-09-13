@@ -1,5 +1,5 @@
-use super::*;
 use super::super::{BindingAction, BindingIdentity, ProductStore};
+use super::*;
 use knorvia_platform_paths::KnorviaPaths;
 
 fn crash_home(tag: &str) -> KnorviaPaths {
@@ -29,10 +29,12 @@ fn delivery_window_lookup_matches_only_the_exact_suffix() {
         .unwrap();
 
     // No outcome yet: a crashed dispatch must look like "needs a turn".
-    assert!(store
-        .find_dispatch_outcome(&room.id, &binding_id, user.seq)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .find_dispatch_outcome(&room.id, &binding_id, user.seq)
+            .unwrap()
+            .is_none()
+    );
 
     // An outcome for a different window must not satisfy this one.
     store
@@ -53,10 +55,12 @@ fn delivery_window_lookup_matches_only_the_exact_suffix() {
             },
         )
         .unwrap();
-    assert!(store
-        .find_dispatch_outcome(&room.id, &binding_id, user.seq)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .find_dispatch_outcome(&room.id, &binding_id, user.seq)
+            .unwrap()
+            .is_none()
+    );
 
     // Seed the outcome for the exact window, as a dispatch would right
     // before the (simulated) crash that prevented the watermark advance.
@@ -96,10 +100,12 @@ fn delivery_window_lookup_matches_only_the_exact_suffix() {
             },
         )
         .unwrap();
-    assert!(store
-        .find_dispatch_outcome(&room.id, &other.binding.id, user.seq)
-        .unwrap()
-        .is_none());
+    assert!(
+        store
+            .find_dispatch_outcome(&room.id, &other.binding.id, user.seq)
+            .unwrap()
+            .is_none()
+    );
 }
 
 #[test]
@@ -122,7 +128,10 @@ fn watermark_crash_windows_recover_without_replaying_completed_deliveries() {
     // Window A: crash BEFORE any outcome — the suffix stays un-consumed and
     // the recovery dispatch sees the full suffix again.
     let head_before = store.room_chat_head(&room.id).unwrap();
-    assert_eq!(store.read_binding(&binding_id).unwrap().last_delivered_seq, 0);
+    assert_eq!(
+        store.read_binding(&binding_id).unwrap().last_delivered_seq,
+        0
+    );
 
     // Window B: outcome persisted, crash BEFORE watermark advance. Recovery:
     // the exact-window lookup finds the outcome, so the dispatcher skips the
@@ -147,10 +156,12 @@ fn watermark_crash_windows_recover_without_replaying_completed_deliveries() {
         )
         .unwrap();
     let reopened = ProductStore::open(paths.clone()).unwrap();
-    assert!(reopened
-        .find_dispatch_outcome(&room.id, &binding_id, user.seq)
-        .unwrap()
-        .is_some());
+    assert!(
+        reopened
+            .find_dispatch_outcome(&room.id, &binding_id, user.seq)
+            .unwrap()
+            .is_some()
+    );
     // Recovery advances the watermark to the transcript head (the dispatcher
     // consumes everything visible, including the answer it just recorded);
     // the transcript keeps exactly one answer.
@@ -159,7 +170,10 @@ fn watermark_crash_windows_recover_without_replaying_completed_deliveries() {
         .record_binding_delivery(&binding_id, head, Some(resolved.binding.revision))
         .unwrap();
     assert_eq!(
-        reopened.read_binding(&binding_id).unwrap().last_delivered_seq,
+        reopened
+            .read_binding(&binding_id)
+            .unwrap()
+            .last_delivered_seq,
         head
     );
     assert_eq!(reopened.room_chat_head(&room.id).unwrap(), head_before + 1);

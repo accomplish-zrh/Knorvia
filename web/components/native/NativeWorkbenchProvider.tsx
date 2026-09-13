@@ -1,7 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useRef, useState } from "react";
-import { useRouter } from "next/navigation";
+import { usePathname, useRouter } from "next/navigation";
 import { createNativeClient } from "@/lib/knorvia-native-client";
 import type { NativeConnectionConfig } from "@/lib/knorvia-native-types";
 import { I18nProvider } from "@/i18n/I18nProvider";
@@ -12,15 +12,18 @@ import { mergeThreadIndex, readPagedThreadIndex } from "@/lib/native-thread-inde
 import { setTheme, getStoredTheme, getSystemTheme, applyThemeToDocument, isDarkTheme, subscribeToThemeChanges, THEME_STORAGE_KEY, type Theme } from "@/lib/theme";
 import { applyWindowFrostToDocument, readStoredWindowFrost, subscribeToWindowFrost, saveWindowFrost, type WindowFrostState, DEFAULT_FROST_CLARITY, DEFAULT_FROST_PLATES } from "@/lib/window-frost";
 import { addDelta, itemHistory, mergeSnapshot, needsHistoryBridge, reconcileLive, withItemHistory, type Artifact, type LiveText, type Model, type NativeEvent, type SnapshotMergeOptions, type Thread, type ThreadSnapshot, type Workspace } from "@/lib/native-workbench-state";
+import { lightThread, readThreadsBounded, ThreadCache } from "@/lib/native-thread-cache";
+import { recoveryKindOf, recoveryKindOfMessage, type PersistenceRecovery, type RecoveryErrorKind } from "@/lib/native-recovery-error";
 
 type StartOptions = { workspaceId: string; model?: string; reasoningEffort?: string; cwd?: string; write: boolean; submissionId?: string };
 type WorkbenchContext = {
   locale: "zh" | "en"; t: (zh: string, en: string) => string; toggleLocale: () => void;
   theme: Theme; toggleTheme: () => void; chooseTheme: (theme: Theme) => void;
   frost: WindowFrostState; setFrost: (state: WindowFrostState) => void;
-  connection: string; error: string; notice: string;
+  connection: string; error: string; errorKind: RecoveryErrorKind; notice: string;
+  recovery: PersistenceRecovery | null; clearRecovery: () => void;
   connectionInfo: NativeConnectionConfig | null;
-  setError: (error: string) => void; setNotice: (message: string) => void;
+  setError: (error: string | unknown) => void; setNotice: (message: string) => void;
   workspaces: Workspace[]; threads: Thread[]; threadIndexComplete: boolean; models: Model[]; modelError: string;
   workspaceId: string; setWorkspaceId: (id: string) => void; snapshots: Record<string, ThreadSnapshot>; live: LiveText[];
   request: <T>(method: string, params?: Record<string, unknown>) => Promise<T>;
@@ -29,6 +32,8 @@ type WorkbenchContext = {
   sendTurn: (id: string, input: string, options: Omit<StartOptions, "workspaceId">) => Promise<void>;
   saveResult: (thread: Thread, content: string) => Promise<Artifact>;
   reconnect: () => Promise<void>;
+  /** Keep a thread's full session in the bounded cache (side chat, exports). */
+  pinThread: (id: string) => () => void;
 };
 const Context = createContext<WorkbenchContext | null>(null);
 export function useWorkbench() {
@@ -40,6 +45,8 @@ export function errorText(error: unknown) { return error instanceof Error ? erro
 
 export function NativeWorkbenchProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
+  const pathname = usePathname();
+  const activeThreadIdRef = useRef<string | null>(null);
   const clientRef = useRef<ReturnType<typeof createNativeClient> | null>(null);
   const [connection, setConnection] = useState("connecting");
   const [connectionInfo, setConnectionInfo] = useState<NativeConnectionConfig | null>(null);
@@ -64,7 +71,17 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
     window.addEventListener("storage", storage);
     return () => { stopTheme(); stopFrost(); window.removeEventListener("storage", storage); };
   }, []);
-  const [error, setError] = useState("");
+  const [error, setErrorState] = useState("");
+  const [errorKind, setErrorKind] = useState<RecoveryErrorKind>("generic");
+  const [recovery, setRecovery] = useState<PersistenceRecovery | null>(null);
+  const clearRecovery = useCallback(() => setRecovery(null), []);
+  // B07: the banner keeps the error's structured category so its action can
+  // match the cause instead of always offering a reconnect.
+  const setError = useCallback((input: string | unknown) => {
+    if (typeof input === "string") { setErrorState(input); setErrorKind(recoveryKindOfMessage(input)); return; }
+    setErrorState(errorText(input));
+    setErrorKind(recoveryKindOf(input));
+  }, []);
   const [notice, setNotice] = useState("");
   const [workspaces, setWorkspaces] = useState<Workspace[]>([]);
   const [threads, setThreads] = useState<Thread[]>([]);
@@ -75,7 +92,14 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
   const workspaceRef = useRef("");
   const [snapshots, setSnapshots] = useState<Record<string, ThreadSnapshot>>({});
   const snapshotsRef = useRef(snapshots);
+  // B12: full session snapshots live in a bounded cache; the threads index
+  // keeps light rows only, so an entry's history is reclaimable and recovery
+  // after reconnect is budgeted instead of a Promise.all over every task.
+  const snapshotsCache = useRef(new ThreadCache({ maxEntries: 30, maxItems: 6000 }));
+  const pinnedThreads = useRef(new Set<string>());
   const [live, setLive] = useState<LiveText[]>([]);
+  const activeThreadId = pathname?.startsWith("/workbench/task/") ? decodeURIComponent(pathname.slice("/workbench/task/".length)) : null;
+  activeThreadIdRef.current = activeThreadId;
   const readGeneration = useRef(new Map<string, number>());
   const itemNotificationGeneration = useRef(new Map<string, number>());
   const refreshGeneration = useRef(0);
@@ -101,13 +125,36 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
   const applySnapshot = useCallback((snapshot: ThreadSnapshot, options: SnapshotMergeOptions = {}) => {
     threadSnapshotGeneration.current.set(snapshot.id, (threadSnapshotGeneration.current.get(snapshot.id) ?? 0) + 1);
     const merged = mergeSnapshot(snapshotsRef.current[snapshot.id], snapshot, options);
-    const next = { ...snapshotsRef.current, [snapshot.id]: merged };
+    const cache = snapshotsCache.current;
+    cache.set(snapshot.id, merged);
+    // Tasks waiting for the user are never evicted; everything else yields to
+    // the entry/item budgets, oldest touch first.
+    const evicted = cache.evict((id, entry) => id === activeThreadIdRef.current
+      || pinnedThreads.current.has(id)
+      || Boolean(entry.snapshot.pendingApprovals?.some(approval => approval.status === "pending"))
+      || Boolean(entry.snapshot.pendingUserInputs?.length));
+    const next = cache.record();
     snapshotsRef.current = next;
     setSnapshots(next);
     setLive(current => reconcileLive(current, merged));
-    setThreads(current => current.some(thread => thread.id === merged.id)
-      ? current.map(thread => thread.id === merged.id ? { ...thread, ...merged } : thread)
-      : [merged, ...current]);
+    // An authoritative snapshot for the thread ends its persistence recovery:
+    // durable state is confirmed again, so the transient hint must disappear
+    // instead of pretending the task is still unconfirmed.
+    setRecovery(current => current?.threadId === snapshot.id ? null : current);
+    if (evicted.includes(snapshot.id)) return;
+    const row = lightThread(merged);
+    setThreads(current => current.some(thread => thread.id === row.id)
+      ? current.map(thread => thread.id === row.id ? { ...thread, ...row } : thread)
+      : [row, ...current]);
+  }, []);
+
+  const pinThread = useCallback((id: string) => {
+    pinnedThreads.current.add(id);
+    snapshotsCache.current.pin(id, true);
+    return () => {
+      pinnedThreads.current.delete(id);
+      snapshotsCache.current.pin(id, false);
+    };
   }, []);
 
   const readThread = useCallback(async (id: string, beforeItemSeq?: number) => {
@@ -160,6 +207,16 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
     }
     return snapshot;
   }, [request, applySnapshot]);
+
+  // B12: reconnect recovery re-reads cached tasks with a small worker pool,
+  // visible task first; one failing task never blocks the others.
+  const readBackCached = useCallback(async () => {
+    const cache = snapshotsCache.current;
+    const priority = (id: string) => (id === activeThreadIdRef.current ? 0 : pinnedThreads.current.has(id) ? 1 : 2);
+    const ordered = cache.keys().sort((a, b) => priority(a) - priority(b) || (cache.get(b)?.updatedAt ?? "").localeCompare(cache.get(a)?.updatedAt ?? ""));
+    const { failed } = await readThreadsBounded(ordered, id => readThread(id), { concurrency: 3 });
+    if (Object.keys(failed).length > 0) setError(Object.values(failed)[0]);
+  }, [readThread, setError]);
 
   const refresh = useCallback((): Promise<void> => {
     // Poll/reconnect/manual refresh share one walk. Starting a new walk every
@@ -224,7 +281,7 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
         await refresh();
         if (disposed) return;
         setError("");
-        await Promise.all(Object.keys(snapshotsRef.current).map(id => readThread(id)));
+        await readBackCached();
       } catch (error) { if (!disposed) setError(errorText(error)); }
       try {
         await request<NativeConnectionConfig>("connection/read");
@@ -262,7 +319,12 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
         itemNotificationGeneration.current.set(id, (itemNotificationGeneration.current.get(id) ?? 0) + 1);
         applySnapshot({ ...snapshotsRef.current[id], items: [item] }, { source: "notification" });
       }
-      if (event.method === "turn/persistenceError") setError(String(p.message ?? "Task state needs recovery"));
+      if (event.method === "turn/persistenceError") {
+        // A persistence error is not a connection problem: reconnecting cannot
+        // fix it and the turn's durable outcome is unconfirmed. Surface it as
+        // its own recovery state; the next authoritative snapshot clears it.
+        setRecovery({ threadId: typeof p.threadId === "string" ? p.threadId : undefined, message: String(p.message ?? "Task state needs recovery") });
+      }
       reconcile(id);
     });
     void client.connect().catch(error => { if (!disposed) setError(errorText(error)); });
@@ -283,7 +345,7 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
       client.close();
       if (clientRef.current === client) clientRef.current = null;
     };
-  }, [request, refresh, readThread, applySnapshot, setWorkspaceId]);
+  }, [request, refresh, readThread, readBackCached, applySnapshot, setWorkspaceId]);
 
   const sendTurn = useCallback(async (id: string, input: string, options: Omit<StartOptions, "workspaceId">) => {
     setError("");
@@ -327,13 +389,13 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
     await clientRef.current?.connect();
     if (wasConnected) {
       await refresh();
-      await Promise.all(Object.keys(snapshotsRef.current).map(id => readThread(id)));
+      await readBackCached();
       setError("");
       const response = await request<Model[] | { data: Model[] }>("model/list");
       setModels(Array.isArray(response) ? response : response.data ?? []);
       setModelError("");
     }
-  }, [refresh, readThread, request]);
+  }, [refresh, readBackCached, request]);
   const toggleLocale = () => {
     const next = locale === "zh" ? "en" : "zh";
     setLocale(next);
@@ -341,7 +403,7 @@ export function NativeWorkbenchProvider({ children }: { children: React.ReactNod
   };
   const toggleTheme = () => setTheme(isDarkTheme(theme) ? "snow" : "dark");
 
-  return <Context.Provider value={{ locale, t, toggleLocale, theme, toggleTheme, chooseTheme: setTheme, frost, setFrost: saveWindowFrost, connection, connectionInfo, error, notice, setError, setNotice, workspaces, threads, threadIndexComplete, models, modelError, workspaceId, setWorkspaceId, snapshots, live, request, refresh, readThread, newTask, sendTurn, saveResult, reconnect }}>
+  return <Context.Provider value={{ locale, t, toggleLocale, theme, toggleTheme, chooseTheme: setTheme, frost, setFrost: saveWindowFrost, connection, connectionInfo, error, errorKind, notice, recovery, clearRecovery, setError, setNotice, workspaces, threads, threadIndexComplete, models, modelError, workspaceId, setWorkspaceId, snapshots, live, request, refresh, readThread, newTask, sendTurn, saveResult, reconnect, pinThread }}>
     <I18nProvider language={locale}><WorkbenchBackground><DesktopChrome /><WorkbenchArrival />{children}</WorkbenchBackground></I18nProvider>
   </Context.Provider>;
 }

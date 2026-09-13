@@ -1,9 +1,9 @@
 import type { Item } from './native-workbench-state';
 
-export type ToolCategory = 'terminal' | 'read' | 'edit' | 'search' | 'browser' | 'image' | 'video' | 'agent' | 'library' | 'automation' | 'goal' | 'document' | 'spreadsheet' | 'presentation' | 'usage' | 'reasoning' | 'folder' | 'tool';
+export type ToolCategory = 'canvas' | 'terminal' | 'read' | 'edit' | 'search' | 'browser' | 'image' | 'video' | 'agent' | 'library' | 'automation' | 'goal' | 'document' | 'spreadsheet' | 'presentation' | 'usage' | 'reasoning' | 'folder' | 'tool';
 export type ToolState = 'running' | 'done' | 'failed' | 'stopped' | 'waiting' | undefined;
 const captions: Record<ToolCategory, [string, string]> = {
-  video: ['创作视频', 'Create video'], terminal: ['运行命令', 'Run command'], read: ['读取文件', 'Read file'], edit: ['修改文件', 'Edit file'], search: ['搜索', 'Search'], browser: ['浏览网页', 'Browse page'], image: ['处理图片', 'Work with images'], agent: ['协作任务', 'Agent collaboration'], library: ['操作资料库', 'Personal library'], automation: ['管理自动化', 'Manage automations'], goal: ['更新目标', 'Update goal'], document: ['处理文档', 'Work with documents'], spreadsheet: ['处理表格', 'Work with spreadsheets'], presentation: ['处理演示文稿', 'Work with presentations'], usage: ['本轮用量', 'Run usage'], reasoning: ['工作思路', 'Approach'], folder: ['查看目录', 'Browse files'], tool: ['调用工具', 'Use tool'],
+  canvas: ['操作创作画布', 'Creative canvas'], video: ['创作视频', 'Create video'], terminal: ['运行命令', 'Run command'], read: ['读取文件', 'Read file'], edit: ['修改文件', 'Edit file'], search: ['搜索', 'Search'], browser: ['浏览网页', 'Browse page'], image: ['处理图片', 'Work with images'], agent: ['协作任务', 'Agent collaboration'], library: ['操作资料库', 'Personal library'], automation: ['管理自动化', 'Manage automations'], goal: ['更新目标', 'Update goal'], document: ['处理文档', 'Work with documents'], spreadsheet: ['处理表格', 'Work with spreadsheets'], presentation: ['处理演示文稿', 'Work with presentations'], usage: ['本轮用量', 'Run usage'], reasoning: ['工作思路', 'Approach'], folder: ['查看目录', 'Browse files'], tool: ['调用工具', 'Use tool'],
 };
 
 export function toolPresentation(item: Pick<Item, 'kind' | 'status' | 'payload'>) {
@@ -24,6 +24,7 @@ export function toolPresentation(item: Pick<Item, 'kind' | 'status' | 'payload'>
   else if (kind.includes('image')) category = 'image';
   else if (kind === 'subagent' || kind.includes('collab') || /spawn_agent|send_message_to_agent|wait_agent/.test(name)) category = 'agent';
   else if (kind === 'plan' || /(?:create|update|get)_goal/.test(name)) category = 'goal';
+  else if (/media_canvas|studio.canvas/.test(name)) category = 'canvas';
   else if (/library|资料库/.test(name)) category = 'library';
   else if (/automation|schedule|定时/.test(name)) category = 'automation';
   else if (/spreadsheet|excel|xlsx/.test(name)) category = 'spreadsheet';

@@ -972,3 +972,512 @@ fn non_member_mention_transfers_to_dm_and_routes_reply_to_source_room() {
     assert_eq!(envelope["targetBotId"], outsider["id"]);
     assert_eq!(envelope["sourceRoomId"], room["id"]);
 }
+
+// ---------------------------------------------------------------- A12: the
+// plan that `room/send` admits from is identity-based, explainable and inert
+// on ambiguous or quoted text. Everything below drives the real RPC surface
+// with a scripted executor, so no Kernel process is ever started.
+
+/// Two agents literally named `Ops`: the text cannot say which one, so the
+/// send must admit nobody and must still explain the candidates.
+#[test]
+fn ambiguous_duplicate_name_dispatches_nothing_and_names_candidates() {
+    let (mut plane, _) = plane("must never run");
+    init(&mut plane);
+    let first = plane
+        .store
+        .create_bot("Ops", "soul", "kernel", None)
+        .unwrap();
+    let second = plane
+        .store
+        .create_bot("Ops", "soul", "kernel", None)
+        .unwrap();
+    let workspace = result_of(&rpc(
+        &mut plane,
+        "w",
+        "workspace/create",
+        json!({"title":"ambiguous"}),
+    ));
+    let room = plane
+        .store
+        .create_room("group", "ops desk", &[first.id.clone(), second.id.clone()])
+        .unwrap();
+
+    let send = result_of(&rpc(
+        &mut plane,
+        "s",
+        "room/send",
+        json!({"conversationId":room.id,"content":"@Ops please look","workspaceId":workspace["id"]}),
+    ));
+    assert!(send["dispatched"].as_array().unwrap().is_empty());
+    let plan = &send["mentions"];
+    assert_eq!(plan["ambiguous"][0]["text"], "@Ops");
+    assert_eq!(plan["ambiguous"][0]["reason"], "duplicateName");
+    let mut candidates: Vec<&str> = plan["ambiguous"][0]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|candidate| candidate["botId"].as_str().unwrap())
+        .collect();
+    candidates.sort_unstable();
+    assert_eq!(candidates, vec![first.id.as_str(), second.id.as_str()]);
+
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(5)));
+    let messages = plane.store.latest_room_messages(&room.id, 200).unwrap();
+    assert_eq!(
+        messages.iter().filter(|m| m.sender == "bot").count(),
+        0,
+        "an ambiguous name must never start a turn"
+    );
+    // The routing receipt is durable on the user's own message row.
+    let receipt = messages[0].meta["mentions"].clone();
+    assert!(receipt["memberBotIds"].as_array().unwrap().is_empty());
+    assert_eq!(receipt["ambiguous"][0]["text"], "@Ops");
+
+    // Naming one of them explicitly does dispatch, and only that one.
+    let direct = result_of(&rpc(
+        &mut plane,
+        "s2",
+        "room/send",
+        json!({"conversationId":room.id,"content":format!("@bot:{} now", second.id),"workspaceId":workspace["id"]}),
+    ));
+    let dispatched = direct["dispatched"].as_array().unwrap();
+    assert_eq!(dispatched.len(), 1);
+    assert_eq!(dispatched[0]["botId"], second.id);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(20)));
+}
+
+/// An explicit id is a durable identity, not a rendering of the current name.
+#[test]
+fn explicit_id_mention_survives_a_rename_and_ignores_the_old_name() {
+    let (mut plane, _) = plane("the named one");
+    init(&mut plane);
+    let ann = plane
+        .store
+        .create_bot("Ann", "soul", "kernel", None)
+        .unwrap();
+    let anna = plane
+        .store
+        .create_bot("Anna", "soul", "kernel", None)
+        .unwrap();
+    let workspace = result_of(&rpc(
+        &mut plane,
+        "w",
+        "workspace/create",
+        json!({"title":"rename"}),
+    ));
+    let room = plane
+        .store
+        .create_room("group", "prefixes", &[ann.id.clone(), anna.id.clone()])
+        .unwrap();
+
+    // Longest whole-token match: `@Anna` is Anna, `@Ann` is Ann.
+    let long = result_of(&rpc(
+        &mut plane,
+        "s1",
+        "room/send",
+        json!({"conversationId":room.id,"content":"@Anna please","workspaceId":workspace["id"]}),
+    ));
+    assert_eq!(long["dispatched"].as_array().unwrap().len(), 1);
+    assert_eq!(long["dispatched"][0]["botId"], anna.id);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(20)));
+    let short = result_of(&rpc(
+        &mut plane,
+        "s2",
+        "room/mentions",
+        json!({"conversationId":room.id,"content":"@Ann please"}),
+    ));
+    assert_eq!(short["mentions"]["resolvedMemberBotIds"][0], ann.id);
+
+    // The label inside the link is decorative; the id is the authority.
+    result_of(&rpc(
+        &mut plane,
+        "r",
+        "bot/rename",
+        json!({"botId":anna.id,"name":"Zeta","expectedRevision":anna.revision}),
+    ));
+    let renamed = result_of(&rpc(
+        &mut plane,
+        "s3",
+        "room/send",
+        json!({"conversationId":room.id,"content":"@[Anna](bot:Anna_id_placeholder)","workspaceId":workspace["id"]}),
+    ));
+    assert!(renamed["dispatched"].as_array().unwrap().is_empty());
+    assert_eq!(
+        renamed["mentions"]["unresolved"][0]["reason"],
+        "unknownBotId"
+    );
+
+    let by_id = result_of(&rpc(
+        &mut plane,
+        "s4",
+        "room/send",
+        json!({"conversationId":room.id,"content":format!("@[Anna](bot:{})", anna.id),"workspaceId":workspace["id"]}),
+    ));
+    assert_eq!(by_id["dispatched"][0]["botId"], anna.id);
+    assert_eq!(by_id["mentions"]["mentions"][0]["outcome"], "resolved");
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(20)));
+    let answers = plane.store.latest_room_messages(&room.id, 200).unwrap();
+    let answered = |bot_id: &str| {
+        answers
+            .iter()
+            .filter(|message| message.sender == "bot" && message.bot_id.as_deref() == Some(bot_id))
+            .count()
+    };
+    // Exactly the two sends that named Anna by id reached her; Ann was never
+    // reachable from this text at all.
+    assert_eq!(answered(anna.id.as_str()), 2);
+    assert_eq!(
+        answered(ann.id.as_str()),
+        0,
+        "the prefix collision must stay idle"
+    );
+    // The old display name no longer routes anywhere.
+    let stale = result_of(&rpc(
+        &mut plane,
+        "s5",
+        "room/mentions",
+        json!({"conversationId":room.id,"content":"@Anna please"}),
+    ));
+    assert_eq!(stale["mentions"]["unresolved"][0]["reason"], "notFound");
+}
+
+/// Quoted and address-like text is an example, not a routing instruction.
+#[test]
+fn quoted_emails_escapes_and_code_blocks_stay_inert() {
+    let (mut plane, _) = plane("should not answer");
+    init(&mut plane);
+    let alice = plane
+        .store
+        .create_bot("Alice", "soul", "kernel", None)
+        .unwrap();
+    let workspace = result_of(&rpc(
+        &mut plane,
+        "w",
+        "workspace/create",
+        json!({"title":"quotes"}),
+    ));
+    let room = plane
+        .store
+        .create_room("group", "docs", &[alice.id.clone()])
+        .unwrap();
+    let content =
+        "ping ops@alice.dev, not \\@Alice, never `@Alice` in code,\n> @Alice in a quoted example";
+    let send = result_of(&rpc(
+        &mut plane,
+        "s",
+        "room/send",
+        json!({"conversationId":room.id,"content":content,"workspaceId":workspace["id"]}),
+    ));
+    assert!(send["dispatched"].as_array().unwrap().is_empty());
+    assert!(send["mentions"]["mentions"].as_array().unwrap().is_empty());
+    let dry = result_of(&rpc(
+        &mut plane,
+        "m",
+        "room/mentions",
+        json!({"conversationId":room.id,"content":content}),
+    ));
+    assert_eq!(dry["mentions"], send["mentions"]);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(5)));
+    assert_eq!(
+        plane
+            .store
+            .latest_room_messages(&room.id, 200)
+            .unwrap()
+            .iter()
+            .filter(|m| m.sender == "bot")
+            .count(),
+        0
+    );
+
+    // A fenced example is inert, and the same handle outside it still works.
+    let mixed = "```\n@Alice\n```\nthen @Alice now";
+    let after = result_of(&rpc(
+        &mut plane,
+        "s2",
+        "room/send",
+        json!({"conversationId":room.id,"content":mixed,"workspaceId":workspace["id"]}),
+    ));
+    assert_eq!(after["dispatched"].as_array().unwrap().len(), 1);
+    assert_eq!(after["dispatched"][0]["botId"], alice.id);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(20)));
+}
+
+/// `room/mentions` is a pure read: same plan, no transcript growth.
+#[test]
+fn mention_dry_run_matches_send_and_writes_nothing() {
+    let (mut plane, _) = plane("unused");
+    init(&mut plane);
+    let alice = plane
+        .store
+        .create_bot("Alice", "soul", "kernel", None)
+        .unwrap();
+    let bob = plane
+        .store
+        .create_bot("Bob", "soul", "kernel", None)
+        .unwrap();
+    let room = plane
+        .store
+        .create_room("group", "dry", &[alice.id.clone(), bob.id.clone()])
+        .unwrap();
+    let content = "@Alice and @Bob and @Nobody";
+    let first = result_of(&rpc(
+        &mut plane,
+        "d1",
+        "room/mentions",
+        json!({"conversationId":room.id,"content":content}),
+    ));
+    let second = result_of(&rpc(
+        &mut plane,
+        "d2",
+        "room/mentions",
+        json!({"conversationId":room.id,"content":content}),
+    ));
+    assert_eq!(first, second);
+    assert_eq!(
+        first["mentions"]["resolvedMemberBotIds"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(first["mentions"]["unresolved"][0]["text"], "@Nobody");
+    assert!(
+        plane
+            .store
+            .latest_room_messages(&room.id, 200)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(!plane.room_dispatches.lock().unwrap().contains_key(&room.id));
+}
+
+/// The member budget is a dispatch cap, not a silent rewrite of the plan.
+#[test]
+fn mention_budget_caps_dispatch_and_reports_truncation() {
+    let (mut plane, _) = plane("[PASS]");
+    init(&mut plane);
+    let mut ids = Vec::new();
+    for index in 0..5 {
+        ids.push(
+            plane
+                .store
+                .create_bot(&format!("B{index}"), "soul", "kernel", None)
+                .unwrap()
+                .id,
+        );
+    }
+    let workspace = result_of(&rpc(
+        &mut plane,
+        "w",
+        "workspace/create",
+        json!({"title":"caps"}),
+    ));
+    let room = plane.store.create_room("group", "caps", &ids).unwrap();
+    let send = result_of(&rpc(
+        &mut plane,
+        "s",
+        "room/send",
+        json!({"conversationId":room.id,"content":"@B0 @B1 @B2 @B3 @B4","workspaceId":workspace["id"]}),
+    ));
+    assert_eq!(send["dispatched"].as_array().unwrap().len(), 3);
+    assert_eq!(send["mentions"]["truncated"], true);
+    let capped: Vec<&str> = send["mentions"]["mentions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|mention| mention["reason"] == "overMentionCap")
+        .map(|mention| mention["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(capped, vec!["@B3", "@B4"]);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(20)));
+}
+
+#[test]
+fn send_admission_failure_is_zero_message_and_transfer_capacity_is_shared() {
+    let (mut plane, _) = plane("reply");
+    init(&mut plane);
+    let bot = plane.store.ensure_default_bot().unwrap();
+    let other = plane
+        .store
+        .create_bot("Outside", "soul", "kernel", None)
+        .unwrap();
+    let room = plane
+        .store
+        .create_room("group", "source", &[bot.id.clone()])
+        .unwrap();
+    let request = json!({"conversationId":room.id,"content":"@Outside hi","workspaceId":"missing","idempotencyKey":"zero_admit"});
+    assert!(
+        rpc(&mut plane, "bad", "room/send", request.clone())
+            .get("error")
+            .is_some()
+    );
+    assert!(
+        plane
+            .store
+            .list_room_messages(&room.id, 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !plane
+            .store
+            .list_rooms()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == "dm" && r.members.iter().any(|m| m.bot_id == other.id))
+    );
+    let ws = plane.store.create_workspace("fixture").unwrap();
+    let mut request = request;
+    request["workspaceId"] = json!(ws.id);
+    for n in 0..4 {
+        plane
+            .room_dispatches
+            .lock()
+            .unwrap()
+            .insert(format!("busy{n}"), Arc::new(AtomicBool::new(false)));
+    }
+    assert!(
+        rpc(&mut plane, "full", "room/send", request.clone())
+            .get("error")
+            .is_some()
+    );
+    assert!(
+        plane
+            .store
+            .list_room_messages(&room.id, 0, 200)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        !plane
+            .store
+            .list_rooms()
+            .unwrap()
+            .iter()
+            .any(|r| r.kind == "dm" && r.members.iter().any(|m| m.bot_id == other.id))
+    );
+    plane.room_dispatches.lock().unwrap().clear();
+    let accepted = result_of(&rpc(&mut plane, "retry", "room/send", request.clone()));
+    assert!(plane.room_dispatches.lock().unwrap().len() <= 4);
+    let replay = result_of(&rpc(&mut plane, "replay", "room/send", request));
+    assert_eq!(accepted["receiptId"], replay["receiptId"]);
+    assert_eq!(accepted["userMessage"]["id"], replay["userMessage"]["id"]);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(10)));
+    assert_eq!(
+        plane
+            .store
+            .list_room_messages(&room.id, 0, 200)
+            .unwrap()
+            .iter()
+            .filter(|m| m.sender == "user")
+            .count(),
+        1
+    );
+}
+#[test]
+fn spawn_failure_keeps_one_durable_receipt_and_retry_runs_once() {
+    let (mut plane, _) = plane("one execution");
+    init(&mut plane);
+    let bot = plane.store.ensure_default_bot().unwrap();
+    let room = plane.store.ensure_dm(&bot.id).unwrap();
+    let ws = plane.store.create_workspace("fixture").unwrap();
+    let request = json!({"conversationId":room.id,"content":"hello","workspaceId":ws.id,"idempotencyKey":"spawn_failure"});
+    room_dispatch::FAIL_ROOM_SPAWN.with(|flag| flag.set(true));
+    let accepted = result_of(&rpc(&mut plane, "first", "room/send", request.clone()));
+    assert!(plane.room_dispatches.lock().unwrap().is_empty());
+    let status = result_of(&rpc(
+        &mut plane,
+        "status",
+        "room/send/status",
+        json!({"receiptId":accepted["receiptId"]}),
+    ));
+    assert_eq!(status["receipt"]["work"][0]["status"], "queued");
+    assert!(
+        status["receipt"]["work"][0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("Thread not started")
+    );
+    let retry = result_of(&rpc(&mut plane, "retry", "room/send", request.clone()));
+    assert_eq!(retry["receiptId"], accepted["receiptId"]);
+    assert!(plane.wait_room_dispatches(&room.id, Duration::from_secs(10)));
+    let retry = result_of(&rpc(
+        &mut plane,
+        "lost_response_retry",
+        "room/send",
+        request,
+    ));
+    assert_eq!(retry["receiptId"], accepted["receiptId"]);
+    let messages = plane.store.list_room_messages(&room.id, 0, 200).unwrap();
+    assert_eq!(messages.iter().filter(|m| m.sender == "user").count(), 1);
+    assert_eq!(messages.iter().filter(|m| m.sender == "bot").count(), 1);
+}
+#[test]
+fn restarted_running_receipt_is_needs_check_while_queued_work_and_other_room_continue() {
+    let (mut plane, home) = plane("reply");
+    init(&mut plane);
+    let bot = plane.store.ensure_default_bot().unwrap();
+    let room = plane.store.ensure_dm(&bot.id).unwrap();
+    let ws = plane.store.create_workspace("fixture").unwrap();
+    room_dispatch::FAIL_ROOM_SPAWN.with(|flag| flag.set(true));
+    let accepted = result_of(&rpc(
+        &mut plane,
+        "first",
+        "room/send",
+        json!({"conversationId":room.id,"content":"started","workspaceId":ws.id,"idempotencyKey":"restart_started"}),
+    ));
+    let id = accepted["receiptId"].as_str().unwrap().to_string();
+    plane
+        .store
+        .update_room_send(&id, |r| r.work[0].status = "running".into())
+        .unwrap();
+    // Persisted claim is the conservative boundary, including a process death
+    // immediately before or after its native start_turn call.
+    drop(plane);
+    let mut reopened = ControlPlane::open_with_executor(
+        layout(home),
+        Box::new(RunnerExecutor::new("new room continues")),
+    )
+    .unwrap();
+    init(&mut reopened);
+    let resumed = result_of(&rpc(
+        &mut reopened,
+        "resume",
+        "room/send/resume",
+        json!({"receiptId":id}),
+    ));
+    assert_eq!(resumed["receipt"]["work"][0]["status"], "needs_check");
+    assert!(reopened.room_dispatches.lock().unwrap().is_empty());
+    let other = reopened
+        .store
+        .create_room("group", "other", &[bot.id.clone()])
+        .unwrap();
+    result_of(&rpc(
+        &mut reopened,
+        "other",
+        "room/send",
+        json!({"conversationId":other.id,"content":format!("@{} hi",bot.name),"workspaceId":ws.id}),
+    ));
+    assert!(reopened.wait_room_dispatches(&other.id, Duration::from_secs(10)));
+    assert_eq!(
+        reopened
+            .store
+            .list_room_messages(&room.id, 0, 200)
+            .unwrap()
+            .iter()
+            .filter(|m| m.sender == "bot")
+            .count(),
+        0
+    );
+    assert_eq!(
+        reopened
+            .store
+            .list_room_messages(&other.id, 0, 200)
+            .unwrap()
+            .iter()
+            .filter(|m| m.sender == "bot")
+            .count(),
+        1
+    );
+}

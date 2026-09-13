@@ -310,15 +310,15 @@ fn idempotency_keys_are_scoped_to_their_method() {
     let store = ProductStore::open(paths).unwrap();
     let result = serde_json::json!({"workspace": {"id": "ws_1"}});
     store
-        .remember_idempotent("client-op-1", "workspace/create", &result)
+        .remember_idempotent("client-op-1", "workspace/create", "fp-op-1", &result)
         .unwrap();
     let recalled = store
-        .recall_idempotent("client-op-1", "workspace/create")
+        .recall_idempotent("client-op-1", "workspace/create", "fp-op-1")
         .unwrap();
     assert_eq!(recalled, Some(result));
 
     let conflict = store
-        .recall_idempotent("client-op-1", "turn/start")
+        .recall_idempotent("client-op-1", "turn/start", "fp-turn")
         .err()
         .expect("a foreign method must not reuse another method's key");
     let protocol = conflict.into_protocol();
@@ -329,7 +329,9 @@ fn idempotency_keys_are_scoped_to_their_method() {
     );
 
     assert_eq!(
-        store.recall_idempotent("never-seen", "turn/start").unwrap(),
+        store
+            .recall_idempotent("never-seen", "turn/start", "fp-any")
+            .unwrap(),
         None,
         "an unseen key must not fake a cached result"
     );
@@ -345,13 +347,13 @@ fn pending_idempotent_record_demands_a_query_instead_of_a_replay() {
     let store = ProductStore::open(paths).unwrap();
     assert_eq!(
         store
-            .begin_idempotent("crash-key", "workspace/create")
+            .begin_idempotent("crash-key", "workspace/create", "fp-crash")
             .unwrap(),
         None,
         "a fresh key starts pending with no cached result"
     );
     let conflict = store
-        .recall_idempotent("crash-key", "workspace/create")
+        .recall_idempotent("crash-key", "workspace/create", "fp-crash")
         .err()
         .expect("a pending record must not look like a missing one");
     assert_eq!(
@@ -364,12 +366,13 @@ fn pending_idempotent_record_demands_a_query_instead_of_a_replay() {
         .remember_idempotent(
             "crash-key",
             "workspace/create",
+            "fp-crash",
             &serde_json::json!({"ok": true}),
         )
         .unwrap();
     assert_eq!(
         store
-            .recall_idempotent("crash-key", "workspace/create")
+            .recall_idempotent("crash-key", "workspace/create", "fp-crash")
             .unwrap(),
         Some(serde_json::json!({"ok": true}))
     );
@@ -383,12 +386,19 @@ fn pending_idempotent_record_demands_a_query_instead_of_a_replay() {
 fn failed_idempotent_attempts_are_attributable_and_clean_failures_stay_retryable() {
     let (paths, home) = temp_paths();
     let store = ProductStore::open(paths).unwrap();
-    store.begin_idempotent("dirty-key", "turn/start").unwrap();
     store
-        .fail_idempotent("dirty-key", "turn/start", "provider exploded mid-turn")
+        .begin_idempotent("dirty-key", "turn/start", "fp-dirty")
+        .unwrap();
+    store
+        .fail_idempotent(
+            "dirty-key",
+            "turn/start",
+            "fp-dirty",
+            "provider exploded mid-turn",
+        )
         .unwrap();
     let replay = store
-        .recall_idempotent("dirty-key", "turn/start")
+        .recall_idempotent("dirty-key", "turn/start", "fp-dirty")
         .err()
         .expect("a failed attempt must not be silently replayed");
     assert_eq!(
@@ -397,12 +407,12 @@ fn failed_idempotent_attempts_are_attributable_and_clean_failures_stay_retryable
     );
 
     store
-        .begin_idempotent("clean-key", "workspace/create")
+        .begin_idempotent("clean-key", "workspace/create", "fp-clean")
         .unwrap();
     store.clear_idempotent("clean-key").unwrap();
     assert_eq!(
         store
-            .recall_idempotent("clean-key", "workspace/create")
+            .recall_idempotent("clean-key", "workspace/create", "fp-clean")
             .unwrap(),
         None,
         "a cleared key is honestly retryable"
@@ -718,9 +728,11 @@ fn crash_recovery_atomically_closes_pending_input_and_approval() {
         reopened.read_item(&approval_item.id).unwrap().status,
         "interrupted"
     );
+    // A restart proves the owner is gone, not that the user denied: the
+    // recovery records the owner_lost system resolution (A03).
     assert_eq!(
         reopened.read_approval(&approval.id).unwrap().status,
-        "denied"
+        "owner_lost"
     );
     assert!(reopened.recover_incomplete_turns().unwrap().is_empty());
     let events = reopened.replay(&thread.id, 0).unwrap();
@@ -728,7 +740,7 @@ fn crash_recovery_atomically_closes_pending_input_and_approval() {
     assert!(
         events
             .iter()
-            .any(|event| event.kind == "approval.recovered")
+            .any(|event| event.kind == "approval.systemResolved")
     );
     assert!(events.iter().any(|event| event.kind == "item.interrupted"));
     assert!(events.iter().any(|event| {
@@ -894,4 +906,373 @@ fn append_history_benchmark() {
 
     drop(store);
     let _ = fs::remove_dir_all(home);
+}
+
+/// A03 contract: the idempotency identity includes a request fingerprint.
+/// Same key + same method + a different payload is a recycled key - a typed
+/// conflict, never a foreign replayed result.
+#[test]
+fn idempotency_key_recycled_for_a_different_payload_is_a_conflict() {
+    let (paths, home) = temp_paths();
+    let store = ProductStore::open(paths).unwrap();
+    store
+        .remember_idempotent(
+            "shared-key",
+            "workspace/create",
+            "fp-for-title-a",
+            &serde_json::json!({"id": "ws_a"}),
+        )
+        .unwrap();
+    let err = store
+        .recall_idempotent("shared-key", "workspace/create", "fp-for-title-b")
+        .err()
+        .expect("recycled key must not serve the old result");
+    assert_eq!(
+        err.into_protocol().category,
+        knorvia_protocol::ErrorCategory::Conflict
+    );
+    // The genuine replay still hits the cached result.
+    assert_eq!(
+        store
+            .recall_idempotent("shared-key", "workspace/create", "fp-for-title-a")
+            .unwrap()
+            .unwrap()["id"],
+        serde_json::json!("ws_a")
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A03 contract: record file names are a hash of the key, so hostile or
+/// pathological keys (traversal, separators, Windows device names) can never
+/// escape the idempotency directory or create illegal files, and bounded
+/// empty/oversize keys are typed rejections.
+#[test]
+fn hostile_and_pathological_keys_stay_bounded_and_safe() {
+    let (paths, home) = temp_paths();
+    let store = ProductStore::open(paths).unwrap();
+    let idem_dir = home.join("state").join("idempotency");
+
+    // Empty and oversize keys are rejected before touching the disk.
+    for bad in ["", "x".repeat(257).as_str()] {
+        let err = store
+            .begin_idempotent(bad, "workspace/create", "fp")
+            .err()
+            .expect("bounded keys are enforced");
+        assert_eq!(
+            err.into_protocol().category,
+            knorvia_protocol::ErrorCategory::InvalidArgument
+        );
+    }
+
+    // Hostile but in-bounds keys are made safe by the hashed layout.
+    for hostile in ["../escape", r"back\slash", "CON", "a/b/c"] {
+        store
+            .remember_idempotent(
+                hostile,
+                "workspace/create",
+                "fp",
+                &serde_json::json!({"ok": true}),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .recall_idempotent(hostile, "workspace/create", "fp")
+                .unwrap()
+                .unwrap()["ok"],
+            serde_json::json!(true)
+        );
+    }
+    let records_dir = idem_dir.join("records");
+    let entries: Vec<_> = std::fs::read_dir(&records_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .collect();
+    assert_eq!(
+        entries.len(),
+        4,
+        "one hashed file per hostile key, in the records namespace: {entries:?}"
+    );
+    for name in &entries {
+        assert_eq!(
+            name.len(),
+            64 + 5,
+            "hex sha256 stem + .json, never a key-derived name: {name}"
+        );
+    }
+    // The hostile keys must not have produced anything in the legacy
+    // namespace either (no traversal artifacts, no device files).
+    let legacy: Vec<_> = std::fs::read_dir(&idem_dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().to_string())
+        .filter(|n| n.ends_with(".json"))
+        .collect();
+    assert!(
+        legacy.is_empty(),
+        "hostile keys never write legacy-named records: {legacy:?}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A03 contract: pre-fingerprint records written by older builds (stored as
+/// `{key}.json` for safe keys) stay replayable and migrate to the hashed
+/// layout on the next write instead of being lost or duplicated.
+#[test]
+fn legacy_idempotency_records_remain_replayable_and_migrate() {
+    let (paths, home) = temp_paths();
+    let store = ProductStore::open(paths).unwrap();
+    let idem_dir = home.join("state").join("idempotency");
+    let legacy = serde_json::json!({
+        "key": "old-key",
+        "method": "workspace/create",
+        "state": "completed",
+        "result": {"id": "ws_old"}
+    });
+    std::fs::write(
+        idem_dir.join("old-key.json"),
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .recall_idempotent("old-key", "workspace/create", "any-fingerprint")
+            .unwrap()
+            .unwrap()["id"],
+        serde_json::json!("ws_old"),
+        "legacy record replays regardless of fingerprint (compat)"
+    );
+    // The next write migrates the outcome to the hashed name.
+    store
+        .remember_idempotent(
+            "old-key",
+            "workspace/create",
+            "fp-new",
+            &serde_json::json!({"id": "ws_new"}),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .recall_idempotent("old-key", "workspace/create", "fp-new")
+            .unwrap()
+            .unwrap()["id"],
+        serde_json::json!("ws_new")
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A03 contract: concurrent replays of one COMPLETED key serialize on
+/// the store mutation lock - every racer is served the durable result
+/// instead of re-executing, records stay coherent under concurrent
+/// remember, and a pending record from an interrupted attempt is never
+/// blindly replayed (typed conflict demands a state query instead).
+#[test]
+fn concurrent_replays_of_one_key_converge_to_one_outcome() {
+    let (paths, home) = temp_paths();
+    let store = std::sync::Arc::new(ProductStore::open(paths).unwrap());
+    store
+        .remember_idempotent(
+            "race-key",
+            "workspace/create",
+            "fp-race",
+            &serde_json::json!({"round": 0}),
+        )
+        .unwrap();
+    let mut handles = Vec::new();
+    for t in 0..8u32 {
+        let store = std::sync::Arc::clone(&store);
+        handles.push(std::thread::spawn(move || {
+            for round in 0..8u32 {
+                let cached = store
+                    .begin_idempotent("race-key", "workspace/create", "fp-race")
+                    .unwrap();
+                assert!(
+                    cached.is_some(),
+                    "a completed key serves its durable result, never re-executes"
+                );
+                store
+                    .remember_idempotent(
+                        "race-key",
+                        "workspace/create",
+                        "fp-race",
+                        &serde_json::json!({"winner": t, "round": round}),
+                    )
+                    .unwrap();
+            }
+        }));
+    }
+    for h in handles {
+        h.join().unwrap();
+    }
+    let value = store
+        .recall_idempotent("race-key", "workspace/create", "fp-race")
+        .unwrap()
+        .expect("a durable outcome exists");
+    assert!(value["round"].is_u64(), "one coherent record, got {value}");
+
+    // A pending record left by an interrupted attempt must not be
+    // blindly replayed by a racing thread: typed conflict only.
+    store
+        .begin_idempotent("interrupted-key", "workspace/create", "fp-i")
+        .unwrap();
+    let err = store
+        .begin_idempotent("interrupted-key", "workspace/create", "fp-i")
+        .err()
+        .expect("pending record must not look replayable");
+    assert_eq!(
+        err.into_protocol().category,
+        knorvia_protocol::ErrorCategory::Conflict
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// CODEX-0030-A #2: a key whose text equals another key's hashed file name
+/// (k2 = hex(sha256(k1))) must not read k1's record through the legacy
+/// fallback, and a legacy record named as a 64-hex key must not shadow k1's
+/// namespaced record. Namespaces are disjoint and records carry their key.
+#[test]
+fn hash_and_legacy_namespaces_cannot_shadow_each_other() {
+    use sha2::{Digest, Sha256};
+    let (paths, home) = temp_paths();
+    let store = ProductStore::open(paths).unwrap();
+    let idem_dir = home.join("state").join("idempotency");
+    let k1 = "review-original";
+    let k2 = hex::encode(Sha256::digest(k1.as_bytes()));
+    assert_eq!(
+        k2.len(),
+        64,
+        "k2 is a 64-hex string, exactly the legacy-safe shape"
+    );
+
+    // k1 records normally (namespaced file records/<sha256(k1)>.json).
+    store
+        .remember_idempotent(
+            k1,
+            "workspace/create",
+            "fp-k1",
+            &serde_json::json!({"id": "ws_k1"}),
+        )
+        .unwrap();
+
+    // k2 has NO record: it must not hit k1's record via the legacy lookup
+    // (old code read idempotency/<k2>.json = k1's hashed file).
+    assert_eq!(
+        store
+            .recall_idempotent(&k2, "workspace/create", "fp-k1")
+            .unwrap(),
+        None,
+        "k2 must not replay k1's record through the legacy fallback"
+    );
+
+    // Reverse shadow: a legacy-format record whose file name IS k2 must not
+    // hide k1's namespaced record from k1.
+    let legacy_of_k2 = serde_json::json!({
+        "key": k2,
+        "method": "workspace/create",
+        "state": "completed",
+        "result": {"id": "ws_k2"}
+    });
+    std::fs::write(
+        idem_dir.join(format!("{k2}.json")),
+        serde_json::to_vec_pretty(&legacy_of_k2).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .recall_idempotent(k1, "workspace/create", "fp-k1")
+            .unwrap()
+            .unwrap()["id"],
+        serde_json::json!("ws_k1"),
+        "k1 still reads its own namespaced record"
+    );
+    // And k2's own legacy record still works for k2 (compat preserved).
+    assert_eq!(
+        store
+            .recall_idempotent(&k2, "workspace/create", "any-fp")
+            .unwrap()
+            .unwrap()["id"],
+        serde_json::json!("ws_k2"),
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// CODEX-0030-A #2: a record file that does not declare the requested key
+/// is absent for that key — never leaked, never replayed.
+#[test]
+fn record_key_is_verified_before_any_replay() {
+    let (paths, home) = temp_paths();
+    let store = ProductStore::open(paths).unwrap();
+    store
+        .remember_idempotent(
+            "key-a",
+            "workspace/create",
+            "fp-a",
+            &serde_json::json!({"id": "ws_a"}),
+        )
+        .unwrap();
+
+    // A key whose hashed file exists but whose record claims another key.
+    let forged = serde_json::json!({
+        "key": "key-b",
+        "method": "workspace/create",
+        "state": "completed",
+        "result": {"id": "ws_b"}
+    });
+    let hashed_for_a = store_key_file(&home, "key-a");
+    std::fs::write(&hashed_for_a, serde_json::to_vec_pretty(&forged).unwrap()).unwrap();
+    assert_eq!(
+        store
+            .recall_idempotent("key-a", "workspace/create", "fp-a")
+            .unwrap(),
+        None,
+        "a record claiming another key is absent for this key"
+    );
+
+    // Same verification on the legacy namespace: the record must declare
+    // the requested key, including for dotted legal legacy names.
+    let dotted = "client.request.1";
+    let mut dotted_record = forged.clone();
+    dotted_record["key"] = serde_json::json!(dotted);
+    dotted_record["result"] = serde_json::json!({"id": "ws_dotted"});
+    std::fs::write(
+        home.join("state")
+            .join("idempotency")
+            .join(format!("{dotted}.json")),
+        serde_json::to_vec_pretty(&dotted_record).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .recall_idempotent(dotted, "workspace/create", "any-fp")
+            .unwrap()
+            .unwrap()["id"],
+        serde_json::json!("ws_dotted"),
+        "dotted legal legacy keys stay compatibly readable"
+    );
+    // And a dotted legacy file claiming a different key is not served.
+    let mut lying = dotted_record.clone();
+    lying["key"] = serde_json::json!("someone-else");
+    std::fs::write(
+        home.join("state")
+            .join("idempotency")
+            .join("other.request.2.json"),
+        serde_json::to_vec_pretty(&lying).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        store
+            .recall_idempotent("other.request.2", "workspace/create", "any-fp")
+            .unwrap(),
+        None,
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Helper: the namespaced record file path for a key (mirrors the store).
+fn store_key_file(home: &std::path::Path, key: &str) -> std::path::PathBuf {
+    home.join("state")
+        .join("idempotency")
+        .join("records")
+        .join(format!(
+            "{}.json",
+            hex::encode(Sha256::digest(key.as_bytes()))
+        ))
 }

@@ -3,6 +3,8 @@ use knorvia_daemon::SharedClient;
 use knorvia_protocol::{PRODUCT_NAME, ProtocolError};
 use serde_json::{Value, json};
 use std::path::Path;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const CLI_NAME: &str = "knorvia";
 pub const CLI_VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -88,6 +90,104 @@ pub fn rpc(
     Ok(v["result"].clone())
 }
 
+/// Retry an explicitly idempotent mutation once after a transport failure.
+/// The new client attaches to the same Home owner and reuses the exact method,
+/// key, and fingerprint, so the control ledger returns the original admission
+/// rather than creating a second Turn.
+pub fn rpc_idempotent_once(
+    plane: &mut SharedClient,
+    home: Option<&Path>,
+    id: &str,
+    method: &str,
+    params: Value,
+) -> Result<Value, ProtocolError> {
+    match rpc(plane, id, method, params.clone()) {
+        Ok(value) => Ok(value),
+        Err(error) if error.category == knorvia_protocol::ErrorCategory::Transient => {
+            let mut reattached = open_control(home)?;
+            ready_session(&mut reattached, "knorvia_cli_retry")?;
+            let result = rpc(&mut reattached, id, method, params);
+            *plane = reattached;
+            result
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Stable machine states emitted by the native Turn CLI. A pending approval or
+/// user-input request is surfaced as attention instead of being answered by the
+/// CLI; this keeps non-interactive use fail closed.
+pub fn turn_machine_status(snapshot: &Value) -> &'static str {
+    let durable = snapshot["status"].as_str().unwrap_or("unknown");
+    if durable == "running"
+        && (snapshot["pendingApprovals"]
+            .as_array()
+            .is_some_and(|values| !values.is_empty())
+            || snapshot["pendingUserInputs"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty()))
+    {
+        "needs_attention"
+    } else {
+        match durable {
+            "running" => "running",
+            "completed" => "completed",
+            "failed" => "failed",
+            "interrupted" => "interrupted",
+            "cancelled" => "cancelled",
+            _ => "unknown",
+        }
+    }
+}
+
+pub fn turn_output(command: &str, snapshot: Value, wait_timed_out: bool) -> Value {
+    let status = if wait_timed_out {
+        "timed_out"
+    } else {
+        turn_machine_status(&snapshot)
+    };
+    json!({
+        "schemaVersion": 1,
+        "command": command,
+        "accepted": true,
+        "status": status,
+        "turn": snapshot,
+    })
+}
+
+/// Poll one durable Turn until it is terminal, needs human attention, or the
+/// caller's monotonic deadline expires. Expiry is observational: it never sends
+/// `turn/interrupt`, so a script can attach again with the same Turn id.
+pub fn wait_turn(
+    plane: &mut impl ProtocolConnection,
+    turn_id: &str,
+    timeout: Duration,
+    mut observed: impl FnMut(&Value),
+) -> Result<(Value, bool), ProtocolError> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let snapshot = rpc(plane, "turn-wait-read", "turn/read", json!({"id": turn_id}))?;
+        observed(&snapshot);
+        match turn_machine_status(&snapshot) {
+            "completed" | "failed" | "interrupted" | "cancelled" | "needs_attention" => {
+                return Ok((snapshot, false));
+            }
+            _ if Instant::now() >= deadline => return Ok((snapshot, true)),
+            _ => thread::sleep(Duration::from_millis(100)),
+        }
+    }
+}
+
+pub fn turn_exit_code(status: &str) -> u8 {
+    match status {
+        "completed" | "running" => 0,
+        "needs_attention" | "timed_out" => 2,
+        "failed" | "unknown" => 3,
+        "interrupted" | "cancelled" => 4,
+        _ => 3,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -125,5 +225,22 @@ mod tests {
         assert!(ws["id"].as_str().unwrap().starts_with("ws_"));
         assert!(base.join("state").is_dir());
         let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn turn_status_never_treats_an_approval_as_success() {
+        let waiting = json!({
+            "status": "running",
+            "pendingApprovals": [{"id": "approval_1"}],
+            "pendingUserInputs": []
+        });
+        assert_eq!(turn_machine_status(&waiting), "needs_attention");
+        assert_eq!(turn_exit_code(turn_machine_status(&waiting)), 2);
+        assert_eq!(
+            turn_machine_status(&json!({"status":"completed"})),
+            "completed"
+        );
+        assert_eq!(turn_exit_code("failed"), 3);
+        assert_eq!(turn_exit_code("interrupted"), 4);
     }
 }

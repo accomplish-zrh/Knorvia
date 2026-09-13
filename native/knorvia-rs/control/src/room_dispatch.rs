@@ -8,6 +8,7 @@
 //! binding's delivery watermark. `pass` answers and errors are both visible
 //! facts, never silently swallowed.
 
+use super::room_mentions::resolve_mentions;
 use super::{ControlPlane, TurnExecutor, TurnRequest};
 use knorvia_protocol::{ErrorCategory, ProtocolError};
 use knorvia_store::{BindingIdentity, RoomMessageInput, SessionBinding};
@@ -20,6 +21,7 @@ use std::time::{Duration, Instant};
 mod room_cli_dispatch;
 
 const MAX_MENTION_ROUNDS: usize = 3;
+const MAX_CROSS_ROOM_TARGETS: usize = 2;
 /// Global cap on concurrently running dispatch threads. Serial per
 /// conversation (the registry) plus a bounded total keeps the backend and
 /// the Kernel process pool stable even if many rooms light up at once.
@@ -36,274 +38,433 @@ fn internal(message: impl Into<String>) -> ProtocolError {
     ProtocolError::new(ErrorCategory::Internal, message)
 }
 
-fn mentions_of(
-    content: &str,
-    members: &[knorvia_store::RoomMember],
-    bots: &[knorvia_store::BotProfile],
-) -> Vec<String> {
-    let lowered = content.to_lowercase();
-    let mut mentioned = Vec::new();
-    for member in members {
-        let Some(bot) = bots.iter().find(|bot| bot.id == member.bot_id) else {
-            continue;
-        };
-        let handle = format!("@{}", bot.name.trim().to_lowercase());
-        if lowered.contains(&handle) && !mentioned.contains(&member.bot_id) {
-            mentioned.push(member.bot_id.clone());
-        }
+const MAX_RECEIPT_ENTRIES: usize = 32;
+
+fn mention_receipt(plan: &knorvia_protocol::MentionPlan) -> Value {
+    let mut bounded = plan.clone();
+    let mut truncated = bounded.mentions.len() > MAX_RECEIPT_ENTRIES
+        || bounded.ambiguous.len() > MAX_RECEIPT_ENTRIES
+        || bounded.unresolved.len() > MAX_RECEIPT_ENTRIES;
+    bounded.mentions.truncate(MAX_RECEIPT_ENTRIES);
+    bounded.ambiguous.truncate(MAX_RECEIPT_ENTRIES);
+    bounded.unresolved.truncate(MAX_RECEIPT_ENTRIES);
+    for mention in bounded
+        .mentions
+        .iter_mut()
+        .chain(bounded.ambiguous.iter_mut())
+        .chain(bounded.unresolved.iter_mut())
+    {
+        truncated |= mention.candidates.len() > MAX_RECEIPT_ENTRIES;
+        mention.candidates.truncate(MAX_RECEIPT_ENTRIES);
     }
-    mentioned
+    bounded.truncated |= truncated;
+    let mut value = json!(bounded);
+    if let Some(object) = value.as_object_mut() {
+        object.insert("memberBotIds".into(), json!(bounded.resolved_member_bot_ids));
+        object.insert("externalBotIds".into(), json!(bounded.resolved_external_bot_ids));
+    }
+    value
+}
+
+#[cfg(test)]
+thread_local! { pub(super) static FAIL_ROOM_SPAWN:std::cell::Cell<bool>=const{std::cell::Cell::new(false)}; }
+fn reservation_key(room: &knorvia_store::Room) -> String {
+    if room.kind == "dm" && room.members.len() == 1 {
+        format!("dm:{}", room.members[0].bot_id)
+    } else {
+        room.id.clone()
+    }
+}
+fn work_keys(work: &[knorvia_store::RoomSendWork], source: &str) -> Vec<String> {
+    if work.is_empty() {
+        return vec![];
+    }
+    let mut keys = vec![source.into()];
+    keys.extend(work.iter().map(|w| w.reservation_key.clone()));
+    keys.sort();
+    keys.dedup();
+    keys
+}
+fn receipt_response(receipt: &knorvia_store::RoomSendReceipt) -> Value {
+    json!({"userMessage":receipt.user_message,"dispatched":receipt.work.iter().map(|w|json!({"botId":w.bot_id,"viaTransfer":w.via_transfer,"conversationId":w.conversation_id})).collect::<Vec<_>>(),"mentions":receipt.user_message.meta.get("mentions").cloned().unwrap_or(Value::Null),"receiptId":receipt.id,"receipt":receipt})
+}
+type RoomRegistry = Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<AtomicBool>>>>;
+fn release_rooms(registry: &RoomRegistry, keys: &[String]) {
+    let mut registry = registry.lock().unwrap_or_else(|e| e.into_inner());
+    for key in keys {
+        registry.remove(key);
+    }
+}
+struct RoomLease {
+    registry: RoomRegistry,
+    keys: Vec<String>,
+}
+impl Drop for RoomLease {
+    fn drop(&mut self) {
+        release_rooms(&self.registry, &self.keys);
+    }
 }
 
 impl ControlPlane {
     pub(super) fn rpc_room_send(&mut self, params: &Value) -> Result<Value, ProtocolError> {
+        use sha2::{Digest, Sha256};
         let conversation_id = super::required_str(params, "conversationId")?;
         let content = super::required_str(params, "content")?;
+        if content.trim().is_empty() || content.len() > 16_000 {
+            return Err(invalid("send content must contain 1..16000 UTF-8 bytes"));
+        }
+        let fingerprint = super::idempotency_fingerprint("room/send", params);
+        let id = if let Some(key) = params["idempotencyKey"].as_str() {
+            if key.is_empty() || key.len() > 256 {
+                return Err(invalid("idempotencyKey must contain 1..256 bytes"));
+            }
+            format!("send_{:x}", Sha256::digest(key.as_bytes()))
+        } else {
+            static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+            format!(
+                "send_{}_{}_{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_nanos(),
+                SEQ.fetch_add(1, Ordering::Relaxed)
+            )
+        };
+        if let Some(receipt) = self
+            .store
+            .read_room_send(&id)
+            .map_err(|e| e.into_protocol())?
+        {
+            if receipt.fingerprint != fingerprint {
+                return Err(ProtocolError::new(
+                    ErrorCategory::Conflict,
+                    "send key belongs to different request",
+                ));
+            }
+            return self.resume_room_receipt(receipt);
+        }
         let room = self
             .store
             .read_room(conversation_id)
             .map_err(|e| e.into_protocol())?;
-
-        if self
-            .room_dispatches
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .contains_key(conversation_id)
-        {
-            return Err(ProtocolError::new(
-                ErrorCategory::Conflict,
-                "conversation has an active dispatch; interrupt or wait before sending",
-            ));
-        }
-
-        let user_message = self
-            .store
-            .append_room_message(conversation_id, RoomMessageInput::user_message(content))
-            .map_err(|e| e.into_protocol())?;
-
-        // Mention resolution. A DM always dispatches its single member; a
-        // group dispatches only @-mentioned members (≤ MAX_MENTION_ROUNDS).
         let bots = self.store.list_bots().map_err(|e| e.into_protocol())?;
-        let mentioned = if room.kind == "dm" {
-            room.members.iter().map(|m| m.bot_id.clone()).collect()
-        } else {
-            mentions_of(content, &room.members, &bots)
-                .into_iter()
-                .take(MAX_MENTION_ROUNDS)
-                .collect::<Vec<_>>()
-        };
-
-        let workspace_id = match super::bots::opt_str(params, "workspaceId")? {
-            Some(id) => id,
-            None => self
+        let workspace = super::bots::opt_str(params, "workspaceId")?
+            .or(self
                 .store
                 .list_workspaces()
                 .map_err(|e| e.into_protocol())?
                 .first()
-                .map(|workspace| workspace.id.clone())
-                .ok_or_else(|| {
-                    invalid("no workspace exists; create one before dispatching bots")
-                })?,
+                .map(|w| w.id.clone()))
+            .ok_or_else(|| invalid("no workspace exists"))?;
+        self.store
+            .read_workspace(&workspace)
+            .map_err(|e| e.into_protocol())?;
+        let account = super::bots::opt_str(params, "accountFingerprint")?;
+        let timeout = params["timeoutSecs"]
+            .as_u64()
+            .unwrap_or(DEFAULT_DISPATCH_TIMEOUT.as_secs())
+            .clamp(5, 3600);
+        let plan = resolve_mentions(
+            content,
+            &room.members,
+            &bots,
+            MAX_MENTION_ROUNDS,
+            MAX_CROSS_ROOM_TARGETS,
+        );
+        let mentioned: Vec<_> = if room.kind == "dm" {
+            room.members.iter().map(|m| m.bot_id.clone()).collect()
+        } else {
+            plan.resolved_member_bot_ids.clone()
         };
-        let account_fingerprint = super::bots::opt_str(params, "accountFingerprint")?;
-        let host_id = host_fingerprint();
-        let timeout_secs = params
-            .get("timeoutSecs")
-            .and_then(Value::as_u64)
-            .map(|secs| Duration::from_secs(secs.clamp(5, 3_600)))
-            .unwrap_or(DEFAULT_DISPATCH_TIMEOUT);
-
-        // Cross-room invocation (A07): a bot that is NOT a member can still
-        // be @-mentioned. The message is transferred into that bot's DM with
-        // the source room recorded, and the bot's reply is routed back to
-        // this room by the dispatch. Store budgets (hop/correlation) and
-        // messageId idempotency apply to these transfers.
-        let mentioned_non_members: Vec<String> = {
-            let member_set: std::collections::HashSet<&str> =
-                room.members.iter().map(|m| m.bot_id.as_str()).collect();
-            bots.iter()
-                .filter(|bot| !member_set.contains(bot.id.as_str()))
-                .filter(|bot| {
-                    content
-                        .to_lowercase()
-                        .contains(&format!("@{}", bot.name.trim().to_lowercase()))
-                })
-                .take(2)
-                .map(|bot| bot.id.clone())
-                .collect()
+        let mut work = Vec::new();
+        let source_key = reservation_key(&room);
+        for bot in mentioned {
+            self.store.read_bot(&bot).map_err(|e| e.into_protocol())?;
+            work.push(knorvia_store::RoomSendWork {
+                bot_id: bot,
+                conversation_id: room.id.clone(),
+                reservation_key: source_key.clone(),
+                via_transfer: false,
+                status: "queued".into(),
+                error: None,
+                up_to_seq: 0,
+            });
+        }
+        for bot_id in &plan.resolved_external_bot_ids {
+            work.push(knorvia_store::RoomSendWork {
+                bot_id: bot_id.clone(),
+                conversation_id: String::new(),
+                reservation_key: format!("dm:{bot_id}"),
+                via_transfer: true,
+                status: "queued".into(),
+                error: None,
+                up_to_seq: 0,
+            });
+        }
+        // Capacity is reserved before the first durable message or DM transfer.
+        // All work in this bounded receipt queue uses this one admission path.
+        let keys = work_keys(&work, &source_key);
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.reserve_rooms(&keys, &cancel)?;
+        let accepted = self.store.accept_room_send_with_meta(
+            &id,
+            &fingerprint,
+            &room.id,
+            content,
+            &workspace,
+            account,
+            timeout,
+            work,
+            json!({"mentions":mention_receipt(&plan)}),
+        );
+        let receipt = match accepted {
+            Ok(receipt) => receipt,
+            Err(error) => {
+                release_rooms(&self.room_dispatches, &keys);
+                return Err(error.into_protocol());
+            }
         };
-        let mut transfers = Vec::new();
-        for target_bot_id in &mentioned_non_members {
-            let transfer_message_id = format!("xfer_{}", user_message.id);
-            match self.store.send_room_transfer(
-                target_bot_id,
-                "user",
-                None,
-                content,
-                &user_message.id,
-                None,
-                conversation_id,
-                Vec::new(),
-                1,
-                &transfer_message_id,
-            ) {
-                Ok((_envelope, true)) => transfers.push(target_bot_id.clone()),
-                Ok((_envelope, false)) => {
-                    // Duplicate messageId: the transfer already exists from a
-                    // retry; dispatch it once more only if nothing is active.
-                    transfers.push(target_bot_id.clone());
-                }
+        let receipt = self.prepare_receipt_destinations(receipt);
+        self.spawn_room_receipt(receipt.clone(), keys, cancel);
+        Ok(receipt_response(&receipt))
+    }
+    fn prepare_receipt_destinations(
+        &self,
+        mut receipt: knorvia_store::RoomSendReceipt,
+    ) -> knorvia_store::RoomSendReceipt {
+        for index in 0..receipt.work.len() {
+            if !receipt.work[index].via_transfer || !receipt.work[index].conversation_id.is_empty()
+            {
+                continue;
+            }
+            match self.store.ensure_dm(&receipt.work[index].bot_id) {
+                Ok(room) => receipt.work[index].conversation_id = room.id,
                 Err(error) => {
-                    let _ = self.store.append_room_message(
-                        conversation_id,
-                        RoomMessageInput {
-                            sender: "system",
-                            bot_id: None,
-                            content: &format!("互传未送达 {target_bot_id}：{}", error),
-                            reply_to_message_id: None,
-                            correlation_id: None,
-                            source_room_id: None,
-                            target_bot_id: None,
-                            artifact_refs: Vec::new(),
-                            hop_count: 0,
-                            transfer_message_id: None,
-                            meta: Value::Null,
-                        },
-                    );
+                    receipt.work[index].status = "failed".into();
+                    receipt.work[index].error = Some(error.to_string());
                 }
             }
         }
-
-        let mut scheduled = Vec::new();
-        if !mentioned.is_empty() {
-            // One active dispatch per conversation. A second send while one
-            // is running returns busy instead of interleaving turns.
-            let mut registry = self
-                .room_dispatches
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if registry.contains_key(conversation_id) {
-                return Err(ProtocolError::new(
-                    ErrorCategory::Conflict,
-                    format!("conversation {conversation_id} already has an active dispatch"),
-                ));
-            }
-            if registry.len() >= MAX_CONCURRENT_DISPATCHES {
-                return Err(ProtocolError::new(
-                    ErrorCategory::Conflict,
-                    format!(
-                        "backend concurrency cap reached ({MAX_CONCURRENT_DISPATCHES} active dispatches); try again shortly"
-                    ),
-                ));
-            }
+        self.store
+            .update_room_send(&receipt.id, |r| r.work = receipt.work.clone())
+            .unwrap_or(receipt)
+    }
+    fn reserve_rooms(
+        &self,
+        keys: &[String],
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<(), ProtocolError> {
+        let mut registry = self
+            .room_dispatches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if keys.iter().any(|key| registry.contains_key(key)) {
+            return Err(ProtocolError::new(
+                ErrorCategory::Conflict,
+                "conversation has an active dispatch",
+            ));
+        }
+        if registry.len() + keys.len() > MAX_CONCURRENT_DISPATCHES {
+            return Err(ProtocolError::new(
+                ErrorCategory::Conflict,
+                "room dispatch capacity is full",
+            ));
+        }
+        for key in keys {
+            registry.insert(key.clone(), Arc::clone(cancel));
+        }
+        Ok(())
+    }
+    pub(super) fn rpc_room_send_status(
+        &mut self,
+        params: &Value,
+        resume: bool,
+    ) -> Result<Value, ProtocolError> {
+        let id = super::required_str(params, "receiptId")?;
+        let receipt = self
+            .store
+            .read_room_send(id)
+            .map_err(|e| e.into_protocol())?
+            .ok_or_else(|| ProtocolError::new(ErrorCategory::NotFound, "send receipt not found"))?;
+        if resume {
+            return self.resume_room_receipt(receipt);
+        }
+        let receipt = self.reconcile_room_receipt(receipt)?;
+        Ok(receipt_response(&receipt))
+    }
+    fn reconcile_room_receipt(
+        &self,
+        receipt: knorvia_store::RoomSendReceipt,
+    ) -> Result<knorvia_store::RoomSendReceipt, ProtocolError> {
+        let registry = self
+            .room_dispatches
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if receipt
+            .work
+            .iter()
+            .any(|work| work.status == "running" && !registry.contains_key(&work.reservation_key))
+        {
+            return self.store.update_room_send(&receipt.id,|receipt|for work in &mut receipt.work {if work.status=="running"&&!registry.contains_key(&work.reservation_key){work.status="needs_check".into();work.error=Some("Previous process stopped after dispatch started; this attempt will not be replayed".into());}}).map_err(|e|e.into_protocol());
+        }
+        Ok(receipt)
+    }
+    fn resume_room_receipt(
+        &self,
+        receipt: knorvia_store::RoomSendReceipt,
+    ) -> Result<Value, ProtocolError> {
+        let receipt = self.reconcile_room_receipt(receipt)?;
+        let room = self
+            .store
+            .read_room(&receipt.user_message.conversation_id)
+            .map_err(|e| e.into_protocol())?;
+        let pending: Vec<_> = receipt
+            .work
+            .iter()
+            .filter(|w| w.status == "queued")
+            .cloned()
+            .collect();
+        if !pending.is_empty() {
+            let keys = work_keys(&pending, &reservation_key(&room));
             let cancel = Arc::new(AtomicBool::new(false));
-            registry.insert(conversation_id.to_string(), Arc::clone(&cancel));
-            drop(registry);
-
-            let store = Arc::clone(&self.store);
-            let executor = Arc::clone(&self.executor);
-            let registry_for_thread = Arc::clone(&self.room_dispatches);
-            let conversation = conversation_id.to_string();
-            let conversation_for_cleanup = conversation.clone();
-            let bot_ids = mentioned.clone();
-            let workspace = workspace_id.clone();
-            let room_title = room.title.clone();
-            let host = host_id.clone();
-            let fingerprint = account_fingerprint.clone();
-            let cancel_for_thread = Arc::clone(&cancel);
+            // Busy retries return the accepted receipt. No duplicate worker.
+            if self.reserve_rooms(&keys, &cancel).is_ok() {
+                self.spawn_room_receipt(receipt.clone(), keys, cancel);
+            }
+        }
+        Ok(receipt_response(&receipt))
+    }
+    fn spawn_room_receipt(
+        &self,
+        receipt: knorvia_store::RoomSendReceipt,
+        keys: Vec<String>,
+        cancel: Arc<AtomicBool>,
+    ) {
+        if keys.is_empty() {
+            return;
+        }
+        let registry = Arc::clone(&self.room_dispatches);
+        let store = Arc::clone(&self.store);
+        let executor = Arc::clone(&self.executor);
+        let cleanup_keys = keys.clone();
+        let cleanup_registry = Arc::clone(&registry);
+        let id = receipt.id.clone();
+        #[cfg(test)]
+        let should_fail = FAIL_ROOM_SPAWN.with(|flag| flag.replace(false));
+        #[cfg(not(test))]
+        let should_fail = false;
+        let spawned = if should_fail {
+            Err(std::io::Error::other("injected thread spawn failure"))
+        } else {
             std::thread::Builder::new()
-                .name(format!("room-dispatch-{conversation_id}"))
+                .name(format!("room-send-{}", receipt.id))
                 .spawn(move || {
-                    for bot_id in bot_ids {
-                        if cancel_for_thread.load(Ordering::SeqCst) {
+                    let _lease = RoomLease { registry, keys };
+                    for (index, item) in receipt.work.iter().enumerate() {
+                        if item.status != "queued" {
+                            continue;
+                        }
+                        if cancel.load(Ordering::SeqCst) {
+                            let _ = store.update_room_send(&receipt.id, |r| {
+                                r.work[index].status = "cancelled".into();
+                            });
+                            continue;
+                        }
+                        // Durable claim BEFORE transfer side effects or Kernel admission.
+                        if store
+                            .update_room_send(&receipt.id, |r| {
+                                r.work[index].status = "running".into();
+                                r.work[index].error = None;
+                            })
+                            .is_err()
+                        {
                             break;
                         }
-                        run_bot_dispatch::run(run_bot_dispatch::Args {
-                            store: Arc::clone(&store),
-                            executor: Arc::clone(&executor),
-                            cancel: Arc::clone(&cancel_for_thread),
-                            conversation_id: conversation.clone(),
-                            bot_id,
-                            room_title: room_title.clone(),
-                            workspace_id: workspace.clone(),
-                            host_id: host.clone(),
-                            account_fingerprint: fingerprint.clone(),
-                            up_to_seq: user_message.seq,
-                            timeout: timeout_secs,
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                            || -> Result<(), ProtocolError> {
+                                let (conversation, up_to_seq) = if item.via_transfer {
+                                    let (message, _) = store
+                                        .send_room_transfer(
+                                            &item.bot_id,
+                                            "user",
+                                            None,
+                                            &receipt.user_message.content,
+                                            &receipt.user_message.id,
+                                            None,
+                                            &receipt.user_message.conversation_id,
+                                            vec![],
+                                            1,
+                                            &format!(
+                                                "xfer_{}_{}",
+                                                receipt.user_message.id, item.bot_id
+                                            ),
+                                        )
+                                        .map_err(|e| e.into_protocol())?;
+                                    store
+                                        .update_room_send(&receipt.id, |r| {
+                                            r.work[index].conversation_id =
+                                                message.conversation_id.clone();
+                                            r.work[index].up_to_seq = message.seq;
+                                        })
+                                        .map_err(|e| e.into_protocol())?;
+                                    (message.conversation_id, message.seq)
+                                } else {
+                                    (item.conversation_id.clone(), item.up_to_seq)
+                                };
+                                let room = store
+                                    .read_room(&conversation)
+                                    .map_err(|e| e.into_protocol())?;
+                                run_bot_dispatch::run(run_bot_dispatch::Args {
+                                    store: Arc::clone(&store),
+                                    executor: Arc::clone(&executor),
+                                    cancel: Arc::clone(&cancel),
+                                    conversation_id: conversation,
+                                    bot_id: item.bot_id.clone(),
+                                    room_title: room.title,
+                                    workspace_id: receipt.workspace_id.clone(),
+                                    host_id: host_fingerprint(),
+                                    account_fingerprint: receipt.account_fingerprint.clone(),
+                                    up_to_seq,
+                                    timeout: Duration::from_secs(receipt.timeout_secs),
+                                })
+                            },
+                        ))
+                        .unwrap_or_else(|_| Err(internal("room dispatch thread panicked")));
+                        let _ = store.update_room_send(&receipt.id, |r| {
+                            r.work[index].status = if cancel.load(Ordering::SeqCst) {
+                                "cancelled"
+                            } else if outcome.is_ok() {
+                                "finished"
+                            } else {
+                                "failed"
+                            }
+                            .into();
+                            r.work[index].error = outcome.err().map(|e| e.message);
                         });
                     }
-                    let mut registry = registry_for_thread
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    registry.remove(&conversation_for_cleanup);
                 })
-                .map_err(|e| internal(format!("failed to start dispatch thread: {e}")))?;
-            scheduled.extend(mentioned.iter().map(|bot_id| json!({"botId": bot_id})));
+        };
+        if let Err(error) = spawned {
+            release_rooms(&cleanup_registry, &cleanup_keys);
+            let _ = self.store.update_room_send(&id, |r| {
+                for work in &mut r.work {
+                    if work.status == "queued" {
+                        work.error =
+                            Some(format!("Thread not started: {error}; resume this receipt"));
+                    }
+                }
+            });
         }
+    }
 
-        for target_bot_id in &transfers {
-            let dm_room = match self.store.ensure_dm(target_bot_id) {
-                Ok(room) => room,
-                Err(error) => return Err(error.into_protocol()),
-            };
-            let mut registry = self
-                .room_dispatches
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            if registry.contains_key(&dm_room.id) {
-                continue; // the DM is busy; the envelope is durable and the
-                // next send in that DM consumes it.
-            }
-            registry.insert(dm_room.id.clone(), Arc::new(AtomicBool::new(false)));
-            let cancel = Arc::clone(registry.get(&dm_room.id).unwrap());
-            drop(registry);
-
-            let store = Arc::clone(&self.store);
-            let executor = Arc::clone(&self.executor);
-            let registry_for_thread = Arc::clone(&self.room_dispatches);
-            let conversation = dm_room.id.clone();
-            let conversation_for_cleanup = dm_room.id.clone();
-            let bot_id_for_thread = target_bot_id.clone();
-            let workspace = workspace_id.clone();
-            let host = host_id.clone();
-            let fingerprint = account_fingerprint.clone();
-            // The DM's own stream sequence space governs its watermark and
-            // the delivery-window idempotency gate — never the source room's.
-            let dm_head = self
-                .store
-                .room_chat_head(&dm_room.id)
-                .map_err(|e| e.into_protocol())?;
-            std::thread::Builder::new()
-                .name(format!("room-dispatch-{conversation}"))
-                .spawn(move || {
-                    run_bot_dispatch::run(run_bot_dispatch::Args {
-                        store,
-                        executor,
-                        cancel,
-                        conversation_id: conversation,
-                        bot_id: bot_id_for_thread,
-                        room_title: dm_room.title,
-                        workspace_id: workspace,
-                        host_id: host,
-                        account_fingerprint: fingerprint,
-                        up_to_seq: dm_head,
-                        timeout: timeout_secs,
-                    });
-                    let mut registry = registry_for_thread
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    registry.remove(&conversation_for_cleanup);
-                })
-                .map_err(|e| internal(format!("failed to start transfer dispatch thread: {e}")))?;
-            scheduled.push(
-                json!({"botId": target_bot_id, "viaTransfer": true, "conversationId": dm_room.id}),
-            );
-        }
-
-        Ok(json!({
-            "userMessage": user_message,
-            "dispatched": scheduled,
-        }))
+    pub(super) fn rpc_room_mentions(&self, params: &Value) -> Result<Value, ProtocolError> {
+        let conversation_id = super::required_str(params, "conversationId")?;
+        let content = super::required_str(params, "content")?;
+        let room = self.store.read_room(conversation_id).map_err(|e| e.into_protocol())?;
+        let bots = self.store.list_bots().map_err(|e| e.into_protocol())?;
+        let plan = resolve_mentions(content, &room.members, &bots, MAX_MENTION_ROUNDS, MAX_CROSS_ROOM_TARGETS);
+        Ok(json!({"conversationId":room.id,"roomKind":room.kind,"mentions":mention_receipt(&plan)}))
     }
 
     pub(super) fn rpc_room_messages(&self, params: &Value) -> Result<Value, ProtocolError> {
@@ -338,7 +499,15 @@ impl ControlPlane {
                 .room_dispatches
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            registry.get(conversation_id).cloned()
+            let key = self
+                .store
+                .read_room(conversation_id)
+                .map(|r| reservation_key(&r))
+                .unwrap_or_else(|_| conversation_id.into());
+            registry
+                .get(&key)
+                .or_else(|| registry.get(conversation_id))
+                .cloned()
         };
         let Some(cancel) = cancel else {
             return Ok(json!({"interrupted": false, "reason": "no active dispatch"}));
@@ -373,7 +542,12 @@ impl ControlPlane {
                     .room_dispatches
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                registry.contains_key(conversation_id)
+                let key = self
+                    .store
+                    .read_room(conversation_id)
+                    .map(|r| reservation_key(&r))
+                    .unwrap_or_else(|_| conversation_id.into());
+                registry.contains_key(&key) || registry.contains_key(conversation_id)
             };
             if !active {
                 return true;
@@ -401,7 +575,7 @@ mod run_bot_dispatch {
         pub timeout: Duration,
     }
 
-    pub fn run(args: Args) {
+    pub fn run(args: Args) -> Result<(), ProtocolError> {
         let cli = args
             .store
             .read_bot(&args.bot_id)
@@ -411,9 +585,7 @@ mod run_bot_dispatch {
         } else {
             drive_dispatch(args)
         };
-        if let Err(error) = outcome {
-            eprintln!("knorvia room dispatch error: {error}");
-        }
+        outcome
     }
 
     fn executor_lock(
@@ -499,10 +671,10 @@ mod run_bot_dispatch {
         // failing every future dispatch, re-anchor explicitly: mark the old
         // generation lost with the reason visible, then start a fresh one.
         let mut binding: SessionBinding = resolve()?;
-        for _ in 0..2 {
+        'resolve_binding: {
             let Some(thread_id) = binding.knorvia_thread_id.clone() else {
                 binding = attach_fresh(&binding)?;
-                break;
+                break 'resolve_binding;
             };
             let mapped = executor_lock(&executor).has_kernel_thread(&thread_id)?;
             let has_history = !store
@@ -510,7 +682,7 @@ mod run_bot_dispatch {
                 .map_err(|e| e.into_protocol())?
                 .is_empty();
             if mapped || !has_history {
-                break; // anchor is intact, or the session never really started
+                break 'resolve_binding; // anchor is intact, or the session never really started
             }
             store
                 .mark_binding_lost(
@@ -523,7 +695,6 @@ mod run_bot_dispatch {
             if binding.knorvia_thread_id.is_none() {
                 binding = attach_fresh(&binding)?;
             }
-            break;
         }
         let thread_id = binding
             .knorvia_thread_id
@@ -640,6 +811,7 @@ mod run_bot_dispatch {
             prompt,
             read_only: false,
             settings: Default::default(),
+            advance: None,
         };
         if let Err(error) = executor_lock(&executor).start_turn(&request, Arc::clone(&store)) {
             let _ = store.append_item(
@@ -744,6 +916,7 @@ mod run_bot_dispatch {
                 let _ = store.mark_room_message_status(&conversation_id, &message_id, "acked");
             }
         }
+        let answer_missing = answer.is_none();
         match answer {
             Some(text) if is_pass(&text) => {
                 store.append_room_message(&conversation_id, RoomMessageInput {
@@ -808,6 +981,11 @@ mod run_bot_dispatch {
         store
             .record_binding_delivery(&binding.id, watermark, Some(binding.revision))
             .map_err(|e| e.into_protocol())?;
+        if status != "completed" || answer_missing {
+            return Err(internal(format!(
+                "Bot dispatch did not produce a completed answer: {status}"
+            )));
+        }
         Ok(())
     }
 

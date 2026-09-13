@@ -2,6 +2,7 @@
 
 const fs = require('fs');
 const path = require('path');
+const { performance } = require('node:perf_hooks');
 const { startKnorviaDaemon, encodeFrame, initializeRequest } = require('./knorvia-protocol-client');
 
 const { createChatBridge } = require('./kernel-chat-bridge');
@@ -124,7 +125,7 @@ async function createKernelEngine({
     throw new Error('refusing to spawn user-installed Codex CLI');
   }
   fs.mkdirSync(home, { recursive: true });
-  ensureBuiltinSkills(home);
+  const builtinSkills = ensureBuiltinSkills(home);
   const session = startKnorviaDaemon({ daemonBin, home, env });
   let reqSeq = 1;
   async function rpc(method, params) {
@@ -255,7 +256,18 @@ async function createKernelEngine({
       if (method === 'GET' && pathname === '/api/v1/knorvia/activity') {
         const qs = new URLSearchParams(urlPath.split('?')[1] || '');
         const streamId = body.streamId || qs.get('streamId') || workspace.id;
-        const events = await rpc('activity/list', { streamId });
+        const params = { streamId };
+        for (const [query, field] of [['afterSeq', 'afterSeq'], ['limit', 'limit'], ['maxBytes', 'maxBytes'], ['upperSeq', 'upperSeq']]) {
+          if (!qs.has(query)) continue;
+          const value = Number(qs.get(query));
+          if (!Number.isSafeInteger(value) || value < 0) return encodedHttp(400, { error: 'invalid_argument', message: `${query} must be an unsigned integer` });
+          params[field] = value;
+        }
+        if (qs.has('cursor')) params.cursor = qs.get('cursor');
+        // A08: this HTTP compatibility endpoint now proxies exactly one
+        // bounded frozen page. Callers continue with nextSeq/upperSeq/
+        // nextCursor instead of forcing the host to aggregate all history.
+        const events = await rpc('activity/list', params);
         return encodedHttp(200, events);
       }
       if (method === 'POST' && pathname === '/api/v1/workspace/create') {
@@ -285,13 +297,21 @@ async function createKernelEngine({
     // the KernelSession Drop implementation kills and reaps the App Server
     // before releasing the Home lock. A hard child kill is only a bounded
     // fallback for a sidecar that refuses to exit.
-    const graceful = waitForChildExit(child, timeoutMs);
+    const budget = Math.max(0, Number(timeoutMs) || 0);
+    const started = performance.now();
+    const gracefulMs = Math.max(1, Math.floor(budget * 0.7));
+    const graceful = waitForChildExit(child, gracefulMs);
     try { child.stdin?.end(); } catch {}
     try {
       await graceful;
       return;
     } catch {}
-    const forced = waitForChildExit(child, Math.max(1_000, Math.min(3_000, timeoutMs)));
+    const remaining = Math.max(0, budget - (performance.now() - started));
+    if (!(remaining > 0)) {
+      try { child.kill(); } catch {}
+      throw new Error('knorvia-daemon did not stop within the host shutdown deadline');
+    }
+    const forced = waitForChildExit(child, remaining);
     try { child.kill(); } catch {}
     await forced;
   }
@@ -315,6 +335,7 @@ async function createKernelEngine({
     identity: 'knorvia-daemon',
     workspace,
     initialize: init.result,
+    builtinSkills: Array.isArray(builtinSkills) ? builtinSkills : [],
     rpc,
     onNotification,
     handleHttp,

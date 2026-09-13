@@ -220,6 +220,54 @@ pub struct GoalCompletionEvidence {
     pub recorded_at: String,
 }
 
+/// One durable Goal execution batch. Created atomically with its first
+/// Turn projection so a retry with the same `request_key` can only ever
+/// observe (never re-execute) the batch it names.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalExecution {
+    pub id: String,
+    pub goal_id: String,
+    pub workspace_id: String,
+    pub thread_id: String,
+    /// Caller-chosen idempotency key. Reuse with different parameters is a
+    /// typed conflict; reuse with the same parameters returns this batch.
+    pub request_key: String,
+    /// Digest of every admission parameter that changes execution, so key
+    /// reuse is validated against the original input.
+    pub input_digest: String,
+    pub input_preview: String,
+    /// running | waitingUser | paused | completed | failed | interrupted | cancelled
+    pub status: String,
+    /// Why the batch stopped: roundsExhausted | deadlineReached | waitingUser
+    /// | cancelled | failed | interrupted | completed
+    #[serde(default)]
+    pub stop_reason: Option<String>,
+    pub attempt: u32,
+    pub rounds: Vec<GoalRound>,
+    /// The structured continuous-advance policy in force, echoed verbatim
+    /// for idempotent queries. Absent for single-round batches.
+    #[serde(default)]
+    pub advance: Option<Value>,
+    pub created_at: String,
+    pub updated_at: String,
+    #[serde(default)]
+    pub terminal_at: Option<String>,
+}
+
+/// One Turn inside a Goal execution batch. Status mirrors the durable Turn
+/// record; it is never inferred.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GoalRound {
+    pub index: u32,
+    pub turn_id: String,
+    /// running | completed | failed | interrupted | cancelled
+    pub status: String,
+    #[serde(default)]
+    pub completed_at: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Task {
@@ -324,6 +372,99 @@ pub struct Approval {
     pub digest: String,
     pub status: String,
     pub created_at: String,
+}
+
+/// How one parsed `@` token resolved against the room's bots (A12). The
+/// outcome is the dispatch decision: only `resolved` may ever start a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MentionOutcome {
+    Resolved,
+    Ambiguous,
+    Unresolved,
+}
+
+/// Which grammar produced the identity claim. An explicit bot id never
+/// re-resolves through display text, so renaming a bot cannot move an
+/// already-written mention to a different agent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MentionSource {
+    /// `@bot:<id>` or `@[label](bot:<id>)`.
+    ExplicitId,
+    /// `@[Display name]` — supports spaces and other non-ASCII labels.
+    BracketedName,
+    /// `@Name` — single-token display name with boundary rules.
+    BareName,
+}
+
+impl MentionSource {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::ExplicitId => "explicitId",
+            Self::BracketedName => "bracketedName",
+            Self::BareName => "bareName",
+        }
+    }
+}
+
+/// A bot that a parsed mention could refer to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionCandidate {
+    pub bot_id: String,
+    pub name: String,
+    /// False for a bot outside this room: it is only reachable through the
+    /// explicit cross-room routing rules, never by name-collision luck.
+    pub member: bool,
+}
+
+/// One parsed mention and why it resolved (or did not).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Mention {
+    /// The literal token as the user typed it.
+    pub text: String,
+    /// Byte offset of the token inside the message content.
+    pub offset: usize,
+    pub source: MentionSource,
+    pub outcome: MentionOutcome,
+    /// Machine-readable reason (`resolved`, `duplicateName`, `notFound`,
+    /// `unknownBotId`, `crossRoomNotPermitted`, `overMentionCap`, …).
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bot_id: Option<String>,
+    #[serde(default)]
+    pub member: bool,
+    /// Every bot this token could name — the candidates an operator can
+    /// disambiguate with an explicit id.
+    #[serde(default)]
+    pub candidates: Vec<MentionCandidate>,
+}
+
+/// The full resolution of one message. `room/send` admits dispatch from this
+/// plan; `room/mentions` returns it as a dry run without dispatching.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct MentionPlan {
+    pub mentions: Vec<Mention>,
+    /// Mentioned members in member order, ready to dispatch.
+    pub resolved_member_bot_ids: Vec<String>,
+    /// Mentioned bots outside the room that the cross-room route may carry.
+    pub resolved_external_bot_ids: Vec<String>,
+    #[serde(default)]
+    pub ambiguous: Vec<Mention>,
+    #[serde(default)]
+    pub unresolved: Vec<Mention>,
+    /// True when the member list was truncated by the per-message cap.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl MentionPlan {
+    pub fn is_empty(&self) -> bool {
+        self.resolved_member_bot_ids.is_empty() && self.resolved_external_bot_ids.is_empty()
+    }
 }
 
 pub const STABLE_CAPABILITIES: &[&str] = &[

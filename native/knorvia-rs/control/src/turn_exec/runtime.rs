@@ -14,7 +14,9 @@ pub const KERNEL_THREAD_MAP_FILE: &str = "kernel-threads.json";
 pub const KERNEL_THREAD_SETTINGS_FILE: &str = "kernel-thread-settings.json";
 
 struct ActiveTurn {
-    turn_id: String,
+    /// The currently executing round's turn. An advancing Goal batch starts
+    /// new turns on this thread; interrupt/steer must target the live one.
+    turn_id: Mutex<String>,
     cancelled: AtomicBool,
     done: AtomicBool,
     kernel: Mutex<Option<(Arc<ka::KernelSession>, String, String)>>,
@@ -22,6 +24,17 @@ struct ActiveTurn {
 }
 
 impl ActiveTurn {
+    fn current_turn(&self) -> String {
+        self.turn_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn set_current_turn(&self, turn_id: String) {
+        *self.turn_id.lock().unwrap_or_else(|e| e.into_inner()) = turn_id;
+    }
+
     fn request_cancelled(&self, payload: &Value) -> bool {
         self.cancelled.load(Ordering::SeqCst)
             || payload
@@ -52,6 +65,12 @@ struct Runtime {
     paths: KnorviaPaths,
     session: Mutex<Option<Arc<ka::KernelSession>>>,
     threads: Mutex<HashMap<String, String>>,
+    /// Shared product store backing durable Kernel bindings. Injected by the
+    /// daemon wiring; a runtime constructed without one opens its own on
+    /// first binding use.
+    bindings_store: Mutex<Option<Arc<ProductStore>>>,
+    /// One-shot import of the legacy sidecar map into durable bindings.
+    bindings_migrated: AtomicBool,
     active: Mutex<HashMap<String, Arc<ActiveTurn>>>,
     decisions: Mutex<HashMap<String, ApprovalOwner>>,
     user_inputs: Mutex<HashMap<String, UserInputOwner>>,
@@ -134,6 +153,54 @@ impl Runtime {
         self.read_json_map(&self.thread_map_path())
     }
 
+    /// The store instance backing durable bindings: the injected shared
+    /// store when the daemon wired one, or a lazily opened instance.
+    fn bindings_store(&self) -> Result<Arc<ProductStore>, ProtocolError> {
+        let mut slot = self
+            .bindings_store
+            .lock()
+            .map_err(|e| internal(e.to_string()))?;
+        if slot.is_none() {
+            let store = ProductStore::open(self.paths.clone()).map_err(|e| e.into_protocol())?;
+            *slot = Some(Arc::new(store));
+        }
+        Ok(Arc::clone(slot.as_ref().expect("initialized above")))
+    }
+
+    /// Durable product→Kernel bindings. On first use the legacy sidecar map
+    /// is imported idempotently (the sidecar file itself is never rewritten
+    /// or removed). A failed import leaves the flag unset so the next call
+    /// retries; until then reads may see only part of the legacy map, and
+    /// the missing-mapping defense fails closed.
+    fn durable_bindings(
+        &self,
+    ) -> Result<(Arc<ProductStore>, HashMap<String, String>), ProtocolError> {
+        let store = self.bindings_store()?;
+        if !self.bindings_migrated.load(Ordering::SeqCst) {
+            let legacy = self.thread_map()?;
+            if store.import_kernel_thread_bindings(&legacy).is_ok() {
+                self.bindings_migrated.store(true, Ordering::SeqCst);
+            }
+        }
+        let map = store
+            .list_kernel_thread_bindings()
+            .map_err(|e| e.into_protocol())?;
+        Ok((store, map))
+    }
+
+    /// Import the legacy sidecar into the caller's store (the same instance
+    /// the surrounding flow already uses). Idempotent per process.
+    fn ensure_bindings_migrated(&self, store: &ProductStore) -> Result<(), ProtocolError> {
+        if self.bindings_migrated.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        let legacy = self.thread_map()?;
+        if store.import_kernel_thread_bindings(&legacy).is_ok() {
+            self.bindings_migrated.store(true, Ordering::SeqCst);
+        }
+        Ok(())
+    }
+
     fn settings_map(&self) -> Result<HashMap<String, KernelTurnSettings>, ProtocolError> {
         self.read_json_map(&self.thread_settings_path())
     }
@@ -186,7 +253,10 @@ impl Runtime {
         req: &TurnRequest,
         store: &ProductStore,
     ) -> Result<HashMap<String, String>, ProtocolError> {
-        let saved = self.thread_map()?;
+        self.ensure_bindings_migrated(store)?;
+        let saved = store
+            .list_kernel_thread_bindings()
+            .map_err(|e| e.into_protocol())?;
         if !saved.contains_key(&req.thread_id) {
             if store
                 .has_items_outside_turn(&req.thread_id, &req.turn_id)
@@ -261,7 +331,12 @@ impl Runtime {
         }
         .map_err(|e| internal(e.to_string()))?;
         saved.insert(thread.clone(), id.clone());
-        self.write_json_map(&self.thread_map_path(), &saved)?;
+        // The new binding is a durable product record committed through the
+        // WAL, not a sidecar rewrite: a restart recovers it, and a racing
+        // writer cannot drop it.
+        store
+            .bind_kernel_thread(thread, &id)
+            .map_err(|e| e.into_protocol())?;
         live.insert(thread.clone(), id.clone());
         Ok((session, id, settings))
     }
@@ -277,12 +352,17 @@ impl Runtime {
         if let Some(kernel_thread) = live.get(thread_id) {
             return Ok((session, kernel_thread.clone(), settings));
         }
-        let kernel_thread = self.thread_map()?.get(thread_id).cloned().ok_or_else(|| {
-            ProtocolError::new(
-                ErrorCategory::CapabilityUnavailable,
-                "thread has no Kernel history mapping",
-            )
-        })?;
+        let kernel_thread = self
+            .durable_bindings()?
+            .1
+            .get(thread_id)
+            .cloned()
+            .ok_or_else(|| {
+                ProtocolError::new(
+                    ErrorCategory::CapabilityUnavailable,
+                    "thread has no Kernel history mapping",
+                )
+            })?;
         let resumed = session
             .resume_thread_with_settings(&kernel_thread, &Self::adapter_settings(&settings))
             .map_err(|e| internal(e.to_string()))?;
@@ -316,6 +396,8 @@ impl KernelTurnExecutor {
                 paths,
                 session: Mutex::new(None),
                 threads: Mutex::new(HashMap::new()),
+                bindings_store: Mutex::new(None),
+                bindings_migrated: AtomicBool::new(false),
                 active: Mutex::new(HashMap::new()),
                 decisions: Mutex::new(HashMap::new()),
                 user_inputs: Mutex::new(HashMap::new()),
@@ -323,6 +405,24 @@ impl KernelTurnExecutor {
                 _ownership: None,
             }),
         }
+    }
+
+    /// Daemon wiring: the production executor shares the control plane's
+    /// store instance, so bindings are written through the same durable
+    /// state every other product record uses.
+    pub(crate) fn with_ownership_and_store(
+        paths: KnorviaPaths,
+        ownership: Arc<fs::File>,
+        store: Arc<ProductStore>,
+    ) -> Self {
+        let mut executor = Self::new(paths);
+        {
+            let runtime = Arc::get_mut(&mut executor.runtime)
+                .expect("new executor is exclusively owned");
+            runtime.bindings_store = Mutex::new(Some(store));
+            runtime._ownership = Some(ownership);
+        }
+        executor
     }
 
     pub(crate) fn with_ownership(paths: KnorviaPaths, ownership: Arc<fs::File>) -> Self {
@@ -339,7 +439,7 @@ impl KernelTurnExecutor {
         store: Arc<ProductStore>,
     ) -> Result<WriteTurnStream, ProtocolError> {
         let active = Arc::new(ActiveTurn {
-            turn_id: req.turn_id.clone(),
+            turn_id: Mutex::new(req.turn_id.clone()),
             cancelled: AtomicBool::new(false),
             done: AtomicBool::new(false),
             kernel: Mutex::new(None),
@@ -351,13 +451,14 @@ impl KernelTurnExecutor {
                 .active
                 .lock()
                 .map_err(|e| internal(e.to_string()))?;
+            // A live runner owns its thread until it exits. Between the
+            // rounds of an advancing Goal batch its current Turn is already
+            // terminal while the next round is still being admitted;
+            // replacing the entry here would strand that admission's
+            // conflicts and run two Kernel rounds on one thread. Rejecting
+            // is recoverable: the caller retries after the batch stops.
             if let Some(previous) = registry.get(&req.thread_id)
                 && !previous.done.load(Ordering::SeqCst)
-                && store
-                    .read_turn(&previous.turn_id)
-                    .map_err(|e| e.into_protocol())?
-                    .status
-                    == "running"
             {
                 return Err(ProtocolError::new(
                     ErrorCategory::Conflict,
@@ -392,7 +493,27 @@ impl KernelTurnExecutor {
     }
 }
 
+impl KernelTurnExecutor {
+    /// True while this runtime still owns a runner whose current round is
+    /// `turn_id` (advancing batches move the pointer as rounds begin).
+    fn runner_alive_locked(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.runtime
+            .active
+            .lock()
+            .map(|registry| {
+                registry.get(thread_id).is_some_and(|active| {
+                    !active.done.load(Ordering::SeqCst) && active.current_turn() == turn_id
+                })
+            })
+            .unwrap_or(false)
+    }
+}
+
 impl TurnExecutor for KernelTurnExecutor {
+    fn has_live_turn(&self, thread_id: &str, turn_id: &str) -> bool {
+        self.runner_alive_locked(thread_id, turn_id)
+    }
+
     fn configure_thread(
         &mut self,
         thread_id: &str,
@@ -431,7 +552,7 @@ impl TurnExecutor for KernelTurnExecutor {
     }
 
     fn has_kernel_thread(&self, thread_id: &str) -> Result<bool, ProtocolError> {
-        Ok(self.runtime.thread_map()?.contains_key(thread_id))
+        Ok(self.runtime.durable_bindings()?.1.contains_key(thread_id))
     }
 
     fn fork_kernel_thread(
@@ -453,19 +574,16 @@ impl TurnExecutor for KernelTurnExecutor {
         kernel_thread_id: &str,
         settings: &KernelTurnSettings,
     ) -> Result<(), ProtocolError> {
-        let mut threads = self.runtime.thread_map()?;
-        if threads.contains_key(thread_id) {
-            return Err(ProtocolError::new(
-                ErrorCategory::Conflict,
-                "product thread already has a Kernel mapping",
-            ));
-        }
         // Save settings before exposing the new mapping. A failed settings
         // write leaves no product route to the successfully forked rollout.
         self.runtime.persist_settings(thread_id, settings)?;
-        threads.insert(thread_id.to_string(), kernel_thread_id.to_string());
+        // The durable bind rejects a different existing target (Conflict),
+        // accepts the same target idempotently, and is atomic: no sidecar
+        // read-modify-write can drop another thread's binding.
         self.runtime
-            .write_json_map(&self.runtime.thread_map_path(), &threads)?;
+            .bindings_store()?
+            .bind_kernel_thread(thread_id, kernel_thread_id)
+            .map_err(|e| e.into_protocol())?;
         self.runtime
             .threads
             .lock()
@@ -498,7 +616,7 @@ impl TurnExecutor for KernelTurnExecutor {
             .ok_or_else(|| {
                 ProtocolError::new(ErrorCategory::Conflict, "thread has no active Kernel turn")
             })?;
-        if active.turn_id != turn_id || active.done.load(Ordering::SeqCst) {
+        if active.current_turn() != turn_id || active.done.load(Ordering::SeqCst) {
             return Err(ProtocolError::new(
                 ErrorCategory::Conflict,
                 "turn is no longer active",
@@ -577,7 +695,7 @@ impl TurnExecutor for KernelTurnExecutor {
     }
 
     fn unarchive_kernel_thread(&mut self, thread_id: &str) -> Result<(), ProtocolError> {
-        let kernel_thread = match self.runtime.thread_map()?.get(thread_id) {
+        let kernel_thread = match self.runtime.durable_bindings()?.1.get(thread_id) {
             Some(kernel_thread) => kernel_thread.clone(),
             None => return Ok(()),
         };
@@ -628,7 +746,7 @@ impl TurnExecutor for KernelTurnExecutor {
             .get(thread_id)
             .cloned()
             .filter(|active| {
-                active.turn_id == turn_id
+                active.current_turn() == turn_id
                     && !active.done.load(Ordering::SeqCst)
                     && !active.cancelled.load(Ordering::SeqCst)
             })
@@ -786,7 +904,7 @@ impl TurnExecutor for KernelTurnExecutor {
             .lock()
             .map_err(|e| internal(e.to_string()))?
             .get(thread_id)
-            .map(|turn| turn.turn_id.clone());
+            .map(|turn| turn.current_turn());
         match turn_id {
             Some(turn_id) => self.interrupt_turn(thread_id, &turn_id),
             None => Ok(false),
@@ -842,7 +960,7 @@ impl TurnExecutor for KernelTurnExecutor {
         let Some(active) = active else {
             return Ok(false);
         };
-        if active.turn_id != turn_id || active.done.load(Ordering::SeqCst) {
+        if active.current_turn() != turn_id || active.done.load(Ordering::SeqCst) {
             return Ok(false);
         }
         // Latch even before startup or the Kernel turn ID exists. The runner

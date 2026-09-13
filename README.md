@@ -24,6 +24,11 @@ show the current development workbench with local demonstration data.
   goals inside conversations, archives, workspaces and a right-side preview panel.
 - **Personal library:** import, preview, edit and organize files and outputs;
   Agent and CLI access share the same scoped operations.
+- **Learning and creation:** open study materials from the library, practice one
+  question at a time, save written answers and self-assessments, and return to
+  mistakes or due questions. Versioned creative briefs connect cited sources,
+  learning records, saved outputs and review criteria. Six editable work plans
+  cover guided study, review, teach-back, briefs, articles and storyboards.
 - **Creation studio:** image references, video first/last frames, tail-frame
   extraction, shot queues, shared prompts and image/video workflow continuity.
   Optional composition, subtitles, article-video and Remotion workflows extend
@@ -49,6 +54,14 @@ Download a published Windows installer or portable archive from
 For the portable version, extract the complete archive before opening
 `Knorvia.exe`. Add your provider in Settings, choose a workspace and start a task.
 Read that release's notes for the exact included features.
+
+In the development workbench, use a text file's **Study this source** action
+in the library, or open **Work plans** from the task composer's add menu. Plans
+fill an editable draft before you send it. Objective questions are graded by
+the practice tool; written answers keep the learner's explicit self-assessment.
+Review intervals use a simple rule, not FSRS. Creative review records who
+evaluated the saved output and requests another review when its sources or
+outputs change. See the [domain goal and validation record](docs/architecture/KN-GOAL-LEARNING-CREATION-001.md).
 
 ## Develop the native desktop
 

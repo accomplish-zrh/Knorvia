@@ -56,7 +56,9 @@
     ".next-memory-redesign/types/**/*.ts",
     ".next-memory-redesign/dev/types/**/*.ts",
     ".next-taste/types/**/*.ts",
-    ".next-taste/dev/types/**/*.ts"
+    ".next-taste/dev/types/**/*.ts",
+    ".next-integration-20260911/types/**/*.ts",
+    ".next-integration-20260911/dev/types/**/*.ts"
   ],
   "exclude": [
     "node_modules",

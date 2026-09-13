@@ -14,6 +14,15 @@ function directory(value) {
 function hostableRoot(candidate) {
   if (!directory(candidate)) return null;
   const distCandidates = ['.next', '.next-knorvia'];
+  const manifestPath = path.join(candidate, 'renderer.json');
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+      if (manifest.schemaVersion !== 1 || typeof manifest.distDir !== 'string'
+        || !/^\.next(?:-[a-zA-Z0-9_-]+)?$/.test(manifest.distDir)) return null;
+      distCandidates.unshift(manifest.distDir);
+    } catch { return null; }
+  }
   for (const distDir of distCandidates) {
     const required = path.join(candidate, distDir, 'required-server-files.json');
     if (fs.existsSync(required) && fs.existsSync(path.join(candidate, 'node_modules', 'next'))) {

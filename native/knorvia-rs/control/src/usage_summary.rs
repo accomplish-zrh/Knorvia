@@ -69,6 +69,25 @@ impl ControlPlane {
         if conversation_kind.is_some_and(|kind| !["group", "dm"].contains(&kind)) {
             return Err(invalid("Invalid conversation kind"));
         }
+        let mut query_params = params.clone();
+        for key in ["offset", "limit", "snapshot", "idempotencyKey"] {
+            query_params
+                .as_object_mut()
+                .ok_or_else(|| invalid("usage filters must be an object"))?
+                .remove(key);
+        }
+        let query_key = super::idempotency_fingerprint("usage/summary", &query_params);
+        if let Some(snapshot) = optional_text(params, "snapshot")? {
+            return self
+                .store
+                .cached_usage_summary(Some(snapshot), &query_key, None, offset, limit)
+                .map_err(|e| e.into_protocol())?
+                .ok_or_else(|| invalid("usage snapshot missing"));
+        }
+        let generation = self
+            .store
+            .usage_index_generation()
+            .map_err(|e| e.into_protocol())?;
         // Include superseded bindings: historical usage keeps its original
         // room attribution after a Bot changes backend or starts a new session.
         let bindings = self
@@ -119,10 +138,36 @@ impl ControlPlane {
                         .is_none_or(|kind| room_kinds.get(room_id.as_str()) == Some(&kind))
             })
         };
+        let owner_filter: Option<std::collections::HashSet<String>> = if let Some(thread) = thread {
+            Some([thread.to_string()].into_iter().collect())
+        } else if bot.is_some() || conversation.is_some() || conversation_kind.is_some() {
+            Some(
+                ownership
+                    .keys()
+                    .filter(|id| matches_owner(id))
+                    .cloned()
+                    .collect(),
+            )
+        } else {
+            None
+        };
+        let snapshot = self
+            .store
+            .usage_query_snapshot(from, to, owner_filter.as_ref(), Some(&generation))
+            .map_err(|e| e.into_protocol())?;
+        if let Some(cached) = self
+            .store
+            .cached_usage_summary(None, &query_key, Some(&snapshot.generation), offset, limit)
+            .map_err(|e| e.into_protocol())?
+        {
+            return Ok(cached);
+        }
         let mut records = Vec::new();
         let mut thread_workspaces = HashMap::<String, String>::new();
-        self.store
-            .visit_usage_in_range(from, to, |record| {
+        snapshot
+            .records
+            .into_iter()
+            .try_for_each(|record| -> Result<(), knorvia_store::StoreError> {
                 if model.is_some_and(|value| value != record.model)
                     || provider.is_some_and(|value| value != record.provider_id)
                     || !matches_owner(&record.thread_id)
@@ -297,7 +342,7 @@ impl ControlPlane {
         let mut media_jobs = 0u64;
         let mut unknown_jobs = 0u64;
         let mut legacy_dates = 0u64;
-        self.store.visit_usage_jobs(|job| {
+        snapshot.jobs.into_iter().try_for_each(|job| -> Result<(),knorvia_store::StoreError> {
             if !["media.image", "media.video"].contains(&job.r#type.as_str()) { return Ok(()); }
             // Jobs without an attributable thread cannot be claimed by a Bot
             // or room filter. Their usage remains visible in the global view.
@@ -345,9 +390,8 @@ impl ControlPlane {
                 .then_with(|| a.turn_id.cmp(&b.turn_id))
         });
         let total = records.len();
-        let page: Vec<_> = records.into_iter().skip(offset).take(limit).collect();
-        Ok(
-            json!({"totals":totals,"cache":cache,"byModel":by_model.into_values().collect::<Vec<_>>(),
+        let page = records;
+        let summary = json!({"totals":totals,"cache":cache,"byModel":by_model.into_values().collect::<Vec<_>>(),
             "byAgentRole":by_agent.into_values().collect::<Vec<_>>(),
             "byBot":by_bot.into_values().collect::<Vec<_>>(),"byConversation":by_conversation.into_values().collect::<Vec<_>>(),
             "billingRows":billing_rows.into_values().collect::<Vec<_>>(),
@@ -361,14 +405,60 @@ impl ControlPlane {
                 "Cached input and reasoning output are subsets and are not added twice.",
                 "Unknown usage is not a measured zero. No provider prices or billing amounts are inferred.",
                 "Cache hit ratio only counts turns whose provider actually reported cache fields; a null ratio means unknown, not zero.",
-                "The daily chart uses the requested local timezone offset; historical DST changes require an explicit UTC view."]}),
-        )
+                "The daily chart uses the requested local timezone offset; historical DST changes require an explicit UTC view."]});
+        self.store
+            .cache_usage_summary(&query_key, &snapshot.generation, summary, offset, limit)
+            .map_err(|e| e.into_protocol())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn detail_pages_and_aggregates_stay_on_the_same_snapshot_during_usage_and_media_updates() {
+        let plane = crate::tests::plane();
+        let make = |n| {
+            serde_json::from_value::<UsageRecord>(json!({"threadId":"snapshot_thread","turnId":format!("snapshot_turn_{n}"),"turnStatus":"completed","model":"historic","providerId":"fixture","inputTokens":100,"cachedInputTokens":0,"cacheWriteInputTokens":0,"outputTokens":1,"reasoningOutputTokens":0,"totalTokens":101,"modelContextWindow":null,"completeness":"unknown","recordedAtMs":n})).unwrap()
+        };
+        plane.store.record_usage(&make(1)).unwrap();
+        plane.store.record_usage(&make(2)).unwrap();
+        let first = plane.rpc_usage_summary(&json!({"limit":1})).unwrap();
+        let snapshot = first["paging"]["snapshot"].clone();
+        assert_eq!(first["totals"]["unknownTurns"], 2);
+        assert!(first["cache"]["hitRatio"].is_null());
+        let store = Arc::clone(&plane.store);
+        std::thread::spawn(move || store.record_usage(&make(3)).unwrap())
+            .join()
+            .unwrap();
+        let next = plane
+            .rpc_usage_summary(&json!({"limit":1,"offset":1,"snapshot":snapshot}))
+            .unwrap();
+        assert_eq!(next["totals"], first["totals"]);
+        assert_eq!(next["paging"]["total"], 2);
+        assert_ne!(first["records"][0]["turnId"], next["records"][0]["turnId"]);
+        let fresh = plane.rpc_usage_summary(&json!({"limit":1})).unwrap();
+        assert_eq!(fresh["paging"]["total"], 3);
+        assert_ne!(fresh["paging"]["generation"], first["paging"]["generation"]);
+        assert!(
+            plane
+                .rpc_usage_summary(&json!({"model":"foreign","snapshot":snapshot}))
+                .is_err()
+        );
+        let ws = plane.store.create_workspace("media fixture").unwrap();
+        let job = plane.store.create_job(&ws.id, "media.image").unwrap();
+        plane.store.run_job(&job.id).unwrap();
+        plane.store.checkpoint_job(&job.id,json!({"usage":{"providerId":"fixture","model":"media-model","attempts":[{"recordedAtMs":4,"known":false}]}})).unwrap();
+        let media = plane.rpc_usage_summary(&json!({"limit":1})).unwrap();
+        assert_eq!(media["media"]["unknownJobs"], 1);
+        assert_eq!(media["media"]["jobsScanned"], 1);
+        let still_frozen = plane
+            .rpc_usage_summary(&json!({"snapshot":snapshot}))
+            .unwrap();
+        assert_eq!(still_frozen["media"]["jobsScanned"], 0);
+        assert_eq!(still_frozen["paging"]["total"], 2);
+    }
+
     #[test]
     fn local_day_crosses_utc_boundary_and_offsets_are_explicit() {
         assert_eq!(day_at(0, 0), "1970-01-01");

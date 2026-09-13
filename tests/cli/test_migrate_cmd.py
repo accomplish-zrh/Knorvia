@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,8 @@ from knorvia_cli.main import app
 @pytest.fixture
 def daemon_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Path:
     bin_path = Path(
-        r"D:\tools\knorvia-kernel\knorvia-rs\target\debug\knorvia-daemon.exe"
+        os.environ.get("KNORVIA_DAEMON_BIN")
+        or r"D:\tools\knorvia-kernel\knorvia-rs\target\debug\knorvia-daemon.exe"
     )
     if not bin_path.is_file():
         pytest.skip("knorvia-daemon binary missing")

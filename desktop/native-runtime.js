@@ -31,6 +31,7 @@ const READ_ONLY_DAEMON_METHODS = new Set([
   'thread/read',
   'thread/list',
   'turn/read',
+  'turnQueue/read',
   'model/list',
   'skills/list',
   'capability/list',
@@ -301,6 +302,8 @@ async function createNativeRuntime({
   let engine;
   let phase = 'starting';
   let stopping = false;
+  let closePromise = null;
+  let closingPid = null;
   let restartRequested = false;
   let restartPromise = null;
   let removeEngineNotification = null;
@@ -656,25 +659,40 @@ async function createNativeRuntime({
     return () => engineListeners.delete(listener);
   }
 
-  async function close() {
-    if (stopping) return;
-    stopping = true;
-    restartRequested = true;
-    phase = 'stopping';
-    emitConnectionState();
-    const current = engine;
-    try { removeEngineNotification?.(); } catch {}
-    removeEngineNotification = null;
-    engine = undefined;
-    emitEngineChange(undefined);
-    try { await stopEngine(current, shutdownTimeoutMs); } finally {
-      notificationListeners.clear();
-      engineListeners.clear();
+  async function close(context = {}) {
+    if (!closePromise) {
+      stopping = true;
+      restartRequested = true;
+      phase = 'stopping';
+      emitConnectionState();
+      const current = engine;
+      closingPid = current?.child?.pid ?? current?.pid ?? null;
+      try { removeEngineNotification?.(); } catch {}
+      removeEngineNotification = null;
+      engine = undefined;
+      emitEngineChange(undefined);
+      const timeoutMs = Number.isFinite(context.remainingMs) ? Math.max(0, context.remainingMs) : shutdownTimeoutMs;
+      closePromise = (async () => {
+        try {
+          await stopEngine(current, timeoutMs);
+          closingPid = null;
+          return { confirmed: true, ownedPids: [], detail: 'native runtime daemon confirmed exit' };
+        } finally {
+          notificationListeners.clear();
+          engineListeners.clear();
+        }
+      })();
     }
+    if (!context.signal) return closePromise;
+    if (context.signal.aborted) return { confirmed: false, ownedPids: [closingPid].filter(Boolean), detail: 'native runtime exit remained unconfirmed at shutdown deadline' };
+    const aborted = new Promise(resolve => context.signal.addEventListener('abort', () => resolve(null), { once: true }));
+    const outcome = await Promise.race([closePromise, aborted]);
+    return outcome || { confirmed: false, ownedPids: [closingPid].filter(Boolean), detail: 'native runtime exit remained unconfirmed at shutdown deadline' };
   }
 
   return {
     get engine() { return engine; },
+    get pid() { return engine?.child?.pid ?? engine?.pid ?? closingPid; },
     get restarting() { return restartRequested; },
     get connection() { return metadata(); },
     connectionRead: async (params = {}) => {

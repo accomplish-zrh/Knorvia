@@ -198,3 +198,104 @@ fn real_kernel_turn_completes_with_agent_message() {
     drop(session);
     let _ = std::fs::remove_dir_all(home);
 }
+
+/// A mock that answers with `response.created` and then never completes the
+/// response, keeping the model request (and the Kernel turn) in flight.
+struct StallingResponsesServer {
+    port: u16,
+}
+
+impl StallingResponsesServer {
+    fn spawn() -> Self {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind stalling server");
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                std::thread::spawn(move || {
+                    let created = json!({
+                        "type": "response.created",
+                        "response": {"id": "resp_stall"}
+                    });
+                    // Unicode escapes keep the SSE framing intact regardless
+                    // of how this file's line endings are stored.
+                    let crlf = "\u{000d}\u{000a}";
+                    let body = format!(
+                        "event: response.created{s}data: {created}{s}{s}",
+                        s = crlf
+                    );
+                    let head = format!(
+                        "HTTP/1.1 200 OK{s}Content-Type: text/event-stream{s}Connection: close{s}{s}",
+                        s = crlf
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                    let _ = stream.flush();
+                    // Hold the connection open far beyond the test deadline.
+                    std::thread::sleep(std::time::Duration::from_secs(60));
+                });
+            }
+        });
+        Self { port }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://127.0.0.1:{}/v1", self.port)
+    }
+}
+
+#[test]
+fn real_kernel_deadline_interrupt_keeps_the_kernel_terminal_not_failed() {
+    let Some(bin) = resolve_kernel_bin().ok() else {
+        panic!("kernel binary missing; build codex-rs/target/debug/codex-app-server first");
+    };
+    let server = StallingResponsesServer::spawn();
+    let _lock = ENV_LOCK.lock().unwrap();
+    unsafe { std::env::set_var(PROVIDER_MODEL_ENV, MODEL) };
+    unsafe { std::env::set_var(PROVIDER_BASE_URL_ENV, server.base_url()) };
+    unsafe { std::env::set_var(PROVIDER_API_KEY_ENV, "test-key-knorvia") };
+    // One second of work budget, then the adapter interrupts cooperatively.
+    unsafe { std::env::set_var(knorvia_kernel_adapter::TURN_TIMEOUT_ENV, "1") };
+
+    let home = std::env::temp_dir().join(format!(
+        "knorvia-kernel-deadline-{}",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let paths = layout(home.clone());
+    let provider = ProviderEnv {
+        model: MODEL.into(),
+        base_url: Some(server.base_url()),
+        api_key_env: PROVIDER_API_KEY_ENV.into(),
+    };
+    ensure_kernel_config(&paths, &provider).unwrap();
+
+    let session = KernelSession::spawn(&paths, &bin).expect("spawn kernel session");
+    let thread_id = session.create_thread().expect("kernel thread");
+    let result = session
+        .run_turn(
+            &thread_id,
+            "Say hello to Knorvia",
+            knorvia_kernel_adapter::TurnRunOptions::read_only(),
+        )
+        .expect("the adapter must return the kernel's terminal, not a timeout error");
+    assert_eq!(
+        result.status, "interrupted",
+        "the kernel's interrupted terminal must survive the deadline: {:?}",
+        result
+    );
+    assert!(
+        result.deadline_exceeded,
+        "the deadline diagnostic must be preserved"
+    );
+
+    unsafe { std::env::remove_var(knorvia_kernel_adapter::TURN_TIMEOUT_ENV) };
+    unsafe { std::env::remove_var(PROVIDER_MODEL_ENV) };
+    unsafe { std::env::remove_var(PROVIDER_BASE_URL_ENV) };
+    unsafe { std::env::remove_var(PROVIDER_API_KEY_ENV) };
+    drop(session);
+    let _ = std::fs::remove_dir_all(home);
+}

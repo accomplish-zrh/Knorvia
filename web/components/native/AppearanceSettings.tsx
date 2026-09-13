@@ -8,6 +8,7 @@ import { useWorkbench } from "./NativeWorkbenchProvider";
 import { ReadingSettings } from './ReadingSettings';
 import { BackgroundSettings } from './BackgroundSettings';
 import { PetSettings } from './PetSettings';
+import { WorkbenchStyleChoices } from './WorkbenchStyle';
 
 const subscribe = () => () => {};
 const environment = () => !window.knorviaDesktop ? "browser" : window.knorviaDesktop.chrome?.backdropSupported === false ? "unsupported" : "desktop";
@@ -17,6 +18,7 @@ export function AppearanceSettings() {
   const host = useSyncExternalStore(subscribe, environment, () => "browser");
   const palette = THEME_PALETTES[theme];
   return <>
+    <WorkbenchStyleChoices />
     <section className="nw-preference-section">
       <div className="nw-appearance-heading"><h2>{t("主题", "Theme")}</h2><span>{t("切换即生效", "Changes apply instantly")}</span></div>
       <div className="nw-theme-choices" role="group" aria-label={t("主题", "Theme")}>

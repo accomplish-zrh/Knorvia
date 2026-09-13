@@ -64,13 +64,21 @@ function createCliDispatchBridge({ rpc, handlers, backendIds, intervalMs = 1000,
     return polling;
   }
 
-  async function close() {
+  async function close(context = {}) {
     closed = true;
     clearTimeout(timer);
-    try { await polling; } catch {}
-    await Promise.allSettled([...running.keys()].map(runId => handlers['cliBackend/cancel']({ runId })));
-    await Promise.allSettled([...running.values()]);
-    await acknowledge();
+    const work = (async () => {
+      try { await polling; } catch {}
+      await Promise.allSettled([...running.keys()].map(runId => handlers['cliBackend/cancel']({ runId })));
+      await Promise.allSettled([...running.values()]);
+      await acknowledge();
+      return true;
+    })();
+    if (!context.signal) { await work; return { confirmed: true, ownedPids: [], detail: 'CLI dispatch stopped and outstanding acknowledgements drained' }; }
+    if (context.signal.aborted) return { confirmed: false, ownedPids: [], detail: `${running.size} CLI dispatch run(s) remained at shutdown deadline` };
+    const aborted = new Promise(resolve => context.signal.addEventListener('abort', () => resolve(false), { once: true }));
+    if (!await Promise.race([work, aborted])) return { confirmed: false, ownedPids: [], detail: `${running.size} CLI dispatch run(s) remained at shutdown deadline` };
+    return { confirmed: true, ownedPids: [], detail: 'CLI dispatch stopped and outstanding acknowledgements drained' };
   }
 
   return { start: tick, close, get activeCount() { return running.size; } };

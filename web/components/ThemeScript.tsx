@@ -8,9 +8,11 @@
  * hydration.
  */
 import { THEME_PALETTES } from "@/lib/theme";
+import { WORKBENCH_STYLE_BOOTSTRAP, WORKBENCH_STYLE_KEY } from "@/lib/native-workbench-style";
 
 export default function ThemeScript() {
   const themeScript = `
+    ${WORKBENCH_STYLE_BOOTSTRAP}
     (function() {
       try {
         // One-way migration from the predecessor's browser namespace. Building
@@ -23,6 +25,7 @@ export default function ThemeScript() {
         }
         for (const key of keys) {
           const nextKey = 'knorvia' + key.slice(legacyPrefix.length);
+          if (nextKey === ${JSON.stringify(WORKBENCH_STYLE_KEY)}) continue;
           if (localStorage.getItem(nextKey) === null) {
             localStorage.setItem(nextKey, localStorage.getItem(key) || '');
           }

@@ -19,6 +19,7 @@ const {
   KNOWN_BACKENDS,
   parseCodexJsonLines,
   parseClaudeJson,
+  JsonlAnswerTracker,
 } = require('../cli-backends');
 const { createNativeRpcRouter } = require('../native-rpc-router');
 
@@ -160,27 +161,68 @@ test('paths with spaces and CJK survive spawn and become the process cwd', async
   assert.equal(result.text, `cwd:${weirdCwd}`);
 });
 
-test('cancel terminates a run this host owns and reports the pid', async () => {
+test('cancel keeps the run until real exit, confirms the tree is gone, and keeps a receipt', async () => {
   const dir = makeTempDir('cancel');
-  const script = writeFixtureCli(dir);
-  const host = fixtureHost(script);
-  const runPromise = host.runTurn({ backendId: 'cli:fixture', prompt: 'ignored', timeoutMs: 60_000 })
-    .catch((error) => error);
-  // The turn exits quickly; to exercise cancel we start a hanging argv
-  // through the same host using the script directly.
-  const hanging = new Promise((resolve) => {
-    const { spawn } = require('node:child_process');
-    const child = spawn(process.execPath, [script, 'hang'], { shell: false });
-    const runId = 'clirun_manual';
-    host._runs.set(runId, { runId, backendId: 'cli:fixture', pid: child.pid, child, finished: false });
-    setTimeout(() => resolve(host.cancel({ runId })), 100);
-  });
-  const cancelResult = await hanging;
+  const script = path.join(dir, 'hang-tree.js');
+  fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+  const runId = 'clirun_cancel_real';
+  let settlements = 0;
+  const pending = host.runTurn({ backendId: 'cli:fixture', prompt: 'wait', runId })
+    .then(() => { settlements += 1; return 'resolved'; })
+    .catch((error) => { settlements += 1; return String(error); });
+  await delay(200);
+  // Before cancel the run is still live and tracked.
+  assert.deepEqual(host.activeRuns(), [runId]);
+  const cancelResult = host.cancel({ runId });
   assert.equal(cancelResult.canceled, true);
-  await runPromise;
-  assert.equal(host.activeRuns().length, 0);
-  assert.equal(host.cancel({ runId: 'clirun_manual' }).canceled, false);
+  assert.equal(typeof cancelResult.pid, 'number');
+  // A run stays owned until its close event fires; a second cancel reports
+  // the in-flight kill instead of pretending to cancel again.
+  assert.deepEqual(host.activeRuns(), [runId]);
+  const repeat = host.cancel({ runId });
+  assert.equal(repeat.canceled, true);
+  assert.equal(repeat.alreadyCanceling, true);
+  // Cancel is only confirmed once the process actually exited.
+  const exitResult = await cancelResult.exitWait;
+  assert.equal(exitResult.directChildExited, true);
+  assert.equal(exitResult.treeConfirmed, true, 'no-descendant trees are trivially confirmed');
+  assert.deepEqual(exitResult.unconfirmedPids, []);
+  assert.ok(pidAlive(cancelResult.pid) === false, 'process should be gone after exitWait');
+  const outcome = await pending;
+  assert.match(outcome, /canceled/);
+  assert.equal(settlements, 1, 'runTurn promise must settle exactly once');
+  assert.deepEqual(host.activeRuns(), []);
+  const receipt = host.getRunReceipt(runId);
+  assert.equal(receipt.outcome, 'canceled');
+  assert.equal(receipt.canceled, true);
+  assert.ok(receipt.killEvents.length >= 1);
+  assert.equal(host.getRunReceipt('clirun_missing'), null);
 });
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function pidAlive(pid) {
+  if (!pid) return false;
+  try {
+    const out = execFileSync('tasklist', ['/FO', 'CSV', '/NH', '/FI', `PID eq ${pid}`], { encoding: 'utf8', timeout: 10_000 });
+    return out.includes(`"${pid}"`);
+  } catch {
+    return false;
+  }
+}
+
+async function waitUntilDead(pids, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const alive = pids.filter(pidAlive);
+    if (!alive.length) return;
+    if (Date.now() > deadline) throw new Error(`processes still alive after ${timeoutMs}ms: ${alive.join(', ')}`);
+    await delay(250);
+  }
+}
 
 test('detection reports honest states: installed+connected, needs-user, not-installed', async () => {
   const dir = makeTempDir('detect');
@@ -457,4 +499,339 @@ test('available backend IDs do not run login, version or inference probes', () =
   const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: KNOWN_BACKENDS });
   host._spawnCapture = () => { throw new Error('probe should not run'); };
   assert.deepEqual(host.availableBackendIds(), ['cli:codex', 'cli:claude']);
+});
+
+// ---- C01 nightshift additions: bounded lifecycle, real cancel, receipts ----
+
+test('a multi-megabyte JSONL stream keeps the final answer while raw output stays bounded', async () => {
+  const dir = makeTempDir('flood');
+  const script = path.join(dir, 'flood.js');
+  fs.writeFileSync(script, [
+    'const filler = JSON.stringify({ type: "agent_message", message: "f".repeat(4096) });',
+    'for (let i = 0; i < 5100; i++) process.stdout.write(filler + "\\n");',
+    'process.stdout.write(JSON.stringify({ type: "agent_message", message: "FINAL_ANSWER_survived" }) + "\\n");',
+  ].join('\n'));
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+  const result = await host.runTurn({ backendId: 'cli:fixture', prompt: 'flood' });
+  assert.equal(result.text, 'FINAL_ANSWER_survived', 'the final answer must survive a >20MiB stream');
+  assert.ok(!result.answerTruncatedBytes, 'no answer truncation expected for many smaller events');
+  const receipt = result.receipt;
+  assert.equal(receipt.outcome, 'completed');
+  assert.ok(receipt.outputBytes > 20 * 1024 * 1024, `expected >20MiB output, got ${receipt.outputBytes}`);
+  assert.ok(receipt.outputDroppedBytes > 0, 'raw bytes beyond the parse window must be counted, not hoarded');
+  assert.ok(receipt.stdoutExcerpt.length < 64 * 1024, `receipt excerpt must stay bounded, got ${receipt.stdoutExcerpt.length}`);
+  assert.ok(receipt.stderrExcerpt.length < 64 * 1024);
+});
+
+test('oversized plain-text output is rejected loudly instead of silently truncated', async () => {
+  const dir = makeTempDir('flood-plain');
+  const script = path.join(dir, 'flood-plain.js');
+  fs.writeFileSync(script, 'process.stdout.write("x".repeat(9 * 1024 * 1024));');
+  const claudeBackend = {
+    ...fixtureBackend(script),
+    id: 'cli:floodplain',
+    run: () => [script],
+    parse: parseClaudeJson,
+  };
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [claudeBackend] });
+  await assert.rejects(
+    () => host.runTurn({ backendId: 'cli:floodplain', prompt: 'flood' }),
+    /parse window; final answer withheld/,
+  );
+  assert.deepEqual(host.activeRuns(), []);
+});
+
+test('timeout terminates the process tree and the receipt records the kill', async () => {
+  const dir = makeTempDir('timeout');
+  const script = path.join(dir, 'hang.js');
+  fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+  const outcome = await host.runTurn({ backendId: 'cli:fixture', prompt: 'hang', runId: 'clirun_timeout_test', timeoutMs: 1500 })
+    .catch((error) => String(error));
+  assert.match(String(outcome), /timed out after 1500ms/);
+  assert.deepEqual(host.activeRuns(), []);
+  const receipt = host.getRunReceipt('clirun_timeout_test');
+  assert.equal(receipt.outcome, 'timeout');
+  assert.equal(receipt.timedOut, true);
+  await waitUntilDead([receipt.pid]);
+});
+
+test('startup failure is visible, settles once, and leaves a receipt without a lingering run', async () => {
+  const dir = makeTempDir('spawn-fail');
+  const missing = path.join(dir, 'missing-cli.exe');
+  const host = new CliBackendHost({ pathOverride: () => missing, backends: [{ ...fixtureBackend(missing), run: () => [missing] }] });
+  let settlements = 0;
+  const pending = host.runTurn({ backendId: 'cli:fixture', prompt: 'x', runId: 'clirun_spawn_fail' })
+    .then(() => { settlements += 1; return 'resolved'; })
+    .catch((error) => { settlements += 1; return String(error); });
+  const outcome = await pending;
+  assert.match(String(outcome), /failed to start/);
+  await delay(100);
+  assert.equal(settlements, 1, 'startup failure must settle the promise exactly once');
+  assert.deepEqual(host.activeRuns(), []);
+  const receipt = host.getRunReceipt('clirun_spawn_fail');
+  assert.equal(receipt.outcome, 'spawn-error');
+  assert.match(receipt.error, /failed to start/);
+});
+
+test('cancel empties a live parent/child/grandchild process tree and reports once', async () => {
+  const dir = makeTempDir('tree');
+  const script = path.join(dir, 'tree.js');
+  fs.writeFileSync(script, [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const { spawn } = require("node:child_process");',
+    'const mode = process.argv[2];',
+    'const dirPath = process.argv[3];',
+    'fs.writeFileSync(path.join(dirPath, mode + ".pid"), String(process.pid));',
+    'if (mode === "parent") spawn(process.execPath, [__filename, "child", dirPath], { shell: false });',
+    'if (mode === "child") spawn(process.execPath, [__filename, "grandchild", dirPath], { shell: false });',
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script, 'parent', dir] }] });
+  const runId = 'clirun_tree_parent';
+  const pending = host.runTurn({ backendId: 'cli:fixture', prompt: 'tree', runId }).catch((error) => String(error));
+  const pids = { parent: 0, child: 0, grandchild: 0 };
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    for (const level of Object.keys(pids)) {
+      try { pids[level] = Number(fs.readFileSync(path.join(dir, level + '.pid'), 'utf8')); } catch { /* not yet */ }
+    }
+    if (pids.parent && pids.child && pids.grandchild) break;
+    if (Date.now() > deadline) throw new Error('tree fixture never wrote its pid files');
+    await delay(100);
+  }
+  const cancelResult = host.cancel({ runId });
+  assert.equal(cancelResult.canceled, true);
+  const treeExit = await cancelResult.exitWait;
+  assert.equal(treeExit.directChildExited, true, 'cancel must wait for the direct child to actually exit');
+  assert.equal(treeExit.treeConfirmed, true, 'registered parent/child/grandchild identities all verified dead');
+  assert.deepEqual(treeExit.unconfirmedPids, []);
+  await waitUntilDead([pids.parent, pids.child, pids.grandchild]);
+  const outcome = await pending;
+  assert.match(String(outcome), /canceled/);
+  assert.deepEqual(host.activeRuns(), []);
+  const receipt = host.getRunReceipt(runId);
+  assert.equal(receipt.outcome, 'canceled');
+  assert.equal(receipt.killEvents.length, 1, 'a single cancel must issue exactly one kill sequence');
+  // The RPC surface on its own host stays JSON-serializable and honest:
+  // awaitExitMs yields a real-exit boolean, receipts are queryable, and no
+  // promise ever crosses the wire.
+  const { createCliBackendHandlers } = require('../cli-backends');
+  const wire = createCliBackendHandlers({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script, 'parent', dir] }] });
+  const wireRunId = 'clirun_wire_tree';
+  const wirePending = wire.handlers['cliBackend/runTurn']({ backendId: 'cli:fixture', prompt: 'tree', runId: wireRunId }).catch((error) => String(error));
+  const wirePidFile = path.join(dir, 'parent.pid');
+  const wireDeadline = Date.now() + 10_000;
+  while (!fs.existsSync(wirePidFile) && Date.now() < wireDeadline) await delay(100);
+  const wireCancel = await wire.handlers['cliBackend/cancel']({ runId: wireRunId, awaitExitMs: 15_000 });
+  assert.equal(wireCancel.canceled, true);
+  assert.equal(wireCancel.exited, true, 'RPC cancel with awaitExitMs must confirm the real exit');
+  assert.equal(wireCancel.exitWait === undefined, true, 'exitWait promise must never cross the RPC wire');
+  assert.match(String(await wirePending), /canceled/);
+  const wireReceipts = await wire.handlers['cliBackend/receipts']({ runId: wireRunId });
+  assert.equal(wireReceipts.receipts.length, 1);
+  assert.equal(wireReceipts.receipts[0].runId, wireRunId);
+  assert.equal(wireReceipts.receipts[0].outcome, 'canceled');
+  // A cancel for an unknown run reports honestly over RPC too.
+  const fresh = await wire.handlers['cliBackend/cancel']({ runId: 'clirun_never_started' });
+  assert.equal(fresh.canceled, false);
+  assert.match(fresh.reason, /no such active run/);
+});
+
+test('closeAll cancels every live run and waits for real exit', async () => {
+  const dir = makeTempDir('closeall');
+  const script = path.join(dir, 'hang.js');
+  fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+  const pendingA = host.runTurn({ backendId: 'cli:fixture', prompt: 'a', runId: 'clirun_close_run_a', timeoutMs: 60_000 }).catch((e) => String(e));
+  const pendingB = host.runTurn({ backendId: 'cli:fixture', prompt: 'b', runId: 'clirun_close_run_b', timeoutMs: 60_000 }).catch((e) => String(e));
+  await delay(200);
+  const summary = await host.closeAll({ timeoutMs: 15_000 });
+  assert.equal(summary.canceled, 2);
+  assert.equal(summary.exitedWithinTimeout, true);
+  assert.deepEqual(host.activeRuns(), []);
+  assert.match(String(await pendingA), /canceled/);
+  assert.match(String(await pendingB), /canceled/);
+  await waitUntilDead([host.getRunReceipt('clirun_close_run_a').pid, host.getRunReceipt('clirun_close_run_b').pid]);
+});
+
+test('detection probes are bounded: a flooding version banner cannot balloon memory', async () => {
+  const dir = makeTempDir('probe-flood');
+  const script = path.join(dir, 'probe-flood.js');
+  fs.writeFileSync(script, [
+    'if (process.argv[2] === "--version") {',
+    '  console.log("Fixture CLI 3.2.1 flood-probe");',
+    '  process.stdout.write("y".repeat(6 * 1024 * 1024));',
+    '  process.exit(0);',
+    '}',
+    'process.exit(2);',
+  ].join('\n'));
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script) }] });
+  const captured = await host._spawnCapture([process.execPath, script, '--version'], { timeoutMs: 20_000 });
+  assert.ok(captured.ok);
+  assert.match(captured.stdout, /Fixture CLI 3\.2\.1/);
+  assert.match(captured.stdout, /excerpt dropped/);
+  assert.ok(captured.stdout.length < 256 * 1024, `probe stdout must stay bounded, got ${captured.stdout.length}`);
+  assert.ok(captured.stderr.length < 256 * 1024);
+  // list() still extracts the version line from the bounded excerpt head.
+  const status = await host.status({ backendId: 'cli:fixture' });
+  assert.match(status.version, /Fixture CLI 3\.2\.1/);
+});
+
+test('a single answer larger than the text limit keeps its tail and reports the truncation', () => {
+  const tracker = new JsonlAnswerTracker({ textLimit: 1024 });
+  tracker.feedLine(JSON.stringify({ type: 'session_started', session_id: 'sess_big' }));
+  tracker.feedLine(JSON.stringify({ type: 'agent_message', message: 'A'.repeat(4096) }));
+  tracker.end();
+  const result = tracker.result();
+  assert.equal(result.sessionId, 'sess_big');
+  assert.equal(result.answerTruncatedBytes, 4096 - 1024);
+  assert.ok(result.text.startsWith('AAAA'), 'kept text is the tail of the oversized answer');
+});
+
+// ---- CODEX-0030-C-FIX additions: honest termination confirmation ----
+
+// A real, alive stand-in process so identity checks exercise the live path.
+function spawnSleeper() {
+  const { spawn } = require('node:child_process');
+  return spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { shell: false, stdio: 'ignore' });
+}
+
+test('a surviving registered descendant forces cancel and closeAll to report unconfirmed (repro of the false-all-exited lie)', { timeout: 60_000 }, async () => {
+  const dir = makeTempDir('survivor');
+  const script = path.join(dir, 'hang.js');
+  fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+  const spawnSleeperPid = spawnSleeper().pid;
+  // Injected product seams: the termination tool kills only a run's direct
+  // root (a real taskkill without /T) and REFUSES every registered survivor
+  // - exactly the "tool failed to clear the tree" shape. The fake process
+  // table keeps reporting the survivor even after the run record is deleted
+  // by the close event, because verification runs after that.
+  const fakeRowFor = rootPid => [{ pid: spawnSleeperPid, ppid: rootPid, creation: 'FIXED-IDENTITY' }];
+  const injectSeams = (host, runId) => {
+    let rootPid;
+    host._processTableOverride = async () => {
+      rootPid = rootPid ?? host._runs.get(runId)?.pid;
+      return rootPid ? fakeRowFor(rootPid) : [];
+    };
+    host._spawnTreeKill = async (pid) => {
+      rootPid = rootPid ?? host._runs.get(runId)?.pid;
+      if (pid === rootPid) {
+        require('node:child_process').spawnSync('taskkill', ['/pid', String(pid), '/F'], { windowsHide: true });
+        return { exitCode: 1, error: 'injected tool failure: tree kill unavailable' };
+      }
+      return { exitCode: 1, error: 'injected tool failure: survivor kill refused' };
+    };
+  };
+  try {
+    // Phase 1: cancel-level honesty - the direct child exits, the registered
+    // survivor keeps the tree unconfirmed.
+    const hostA = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+    const runIdA = 'clirun_survivor_cancel';
+    injectSeams(hostA, runIdA);
+    const pendingA = Promise.race([
+      hostA.runTurn({ backendId: 'cli:fixture', prompt: 'hang', runId: runIdA }).then(() => 'resolved', (error) => String(error)),
+      delay(20_000).then(() => 'PENDING-TIMEOUT'),
+    ]);
+    await delay(200);
+    const exitResult = await hostA.cancel({ runId: runIdA }).exitWait;
+    assert.equal(exitResult.directChildExited, true, 'the direct child itself did exit');
+    assert.equal(exitResult.treeConfirmed, false, 'the surviving registered descendant must keep the tree unconfirmed');
+    assert.deepEqual(exitResult.unconfirmedPids, [spawnSleeperPid]);
+    assert.match(String(await pendingA), /canceled/);
+
+    // Phase 2: the direct prototype call the review used - a run that ends
+    // unconfirmed must surface in closeAll instead of being swallowed into
+    // exitedWithinTimeout:true.
+    const hostB = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+    const runIdB = 'clirun_survivor_closeall';
+    injectSeams(hostB, runIdB);
+    void hostB.runTurn({ backendId: 'cli:fixture', prompt: 'hang', runId: runIdB }).catch(() => {});
+    await delay(200);
+    const summary = await hostB.closeAll({ timeoutMs: 20_000 });
+    assert.equal(summary.exitedWithinTimeout, false, 'closeAll must not lie when a run was unconfirmed');
+    assert.deepEqual(summary.unconfirmedRuns, [runIdB]);
+  } finally {
+    try { require('node:child_process').spawnSync('taskkill', ['/pid', String(spawnSleeperPid), '/T', '/F'], { windowsHide: true }); } catch { /* already gone */ }
+  }
+  await waitUntilDead([spawnSleeperPid]);
+});
+
+test('a reused PID with a different creation identity counts as confirmed dead', { timeout: 60_000 }, async () => {
+  const dir = makeTempDir('reuse');
+  const script = path.join(dir, 'hang.js');
+  fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+  const runId = 'clirun_reuse_identity';
+  const sleeper = spawnSleeper();
+  const pending = host.runTurn({ backendId: 'cli:fixture', prompt: 'hang', runId }).catch((error) => String(error));
+  await delay(200);
+  host._processTableOverride = async () => {
+    const run = host._runs.get(runId);
+    // Same PID, different creation identity: an unrelated successor process.
+    return run ? [{ pid: sleeper.pid, ppid: run.pid, creation: 'REUSED-IDENTITY' }] : [];
+  };
+  try {
+    const exitResult = await host.cancel({ runId }).exitWait;
+    assert.equal(exitResult.treeConfirmed, true, 'identity mismatch means our process is gone');
+    assert.deepEqual(exitResult.unconfirmedPids, []);
+  } finally {
+    try { sleeper.kill('SIGKILL'); } catch { /* already gone */ }
+  }
+  await waitUntilDead([sleeper.pid]);
+  await pending;
+});
+
+test('failed descendant enumeration reports unconfirmed instead of a blind true', { timeout: 60_000 }, async () => {
+  const dir = makeTempDir('enumfail');
+  const script = path.join(dir, 'hang.js');
+  fs.writeFileSync(script, 'setInterval(() => {}, 1000);');
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script] }] });
+  const pending = host.runTurn({ backendId: 'cli:fixture', prompt: 'hang', runId: 'clirun_enumfail' }).catch((error) => String(error));
+  await delay(200);
+  host._processTableOverride = async () => null;
+  const exitResult = await host.cancel({ runId: 'clirun_enumfail' }).exitWait;
+  assert.equal(exitResult.directChildExited, true);
+  assert.equal(exitResult.treeConfirmed, false);
+  assert.match(exitResult.reason || '', /enumeration/);
+  await pending;
+});
+
+test('real tree cancel registers descendant identities and confirms the whole tree through the product path', { timeout: 60_000 }, async () => {
+  const dir = makeTempDir('tree-identity');
+  const script = path.join(dir, 'tree.js');
+  fs.writeFileSync(script, [
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const { spawn } = require("node:child_process");',
+    'const mode = process.argv[2];',
+    'const dirPath = process.argv[3];',
+    'fs.writeFileSync(path.join(dirPath, mode + ".pid"), String(process.pid));',
+    'if (mode === "parent") spawn(process.execPath, [__filename, "child", dirPath], { shell: false });',
+    'if (mode === "child") spawn(process.execPath, [__filename, "grandchild", dirPath], { shell: false });',
+    'setInterval(() => {}, 1000);',
+  ].join('\n'));
+  const host = new CliBackendHost({ pathOverride: () => process.execPath, backends: [{ ...fixtureBackend(script), run: () => [script, 'parent', dir] }] });
+  const runId = 'clirun_tree_identity';
+  const pending = host.runTurn({ backendId: 'cli:fixture', prompt: 'tree', runId }).catch((error) => String(error));
+  const pids = { parent: 0, child: 0, grandchild: 0 };
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    for (const level of Object.keys(pids)) {
+      try { pids[level] = Number(fs.readFileSync(path.join(dir, level + '.pid'), 'utf8')); } catch { /* not yet */ }
+    }
+    if (pids.parent && pids.child && pids.grandchild) break;
+    if (Date.now() > deadline) throw new Error('tree fixture never wrote its pid files');
+    await delay(100);
+  }
+  const exitResult = await host.cancel({ runId }).exitWait;
+  assert.equal(exitResult.directChildExited, true);
+  assert.equal(exitResult.treeConfirmed, true, 'registered identities verified dead through the real process table');
+  assert.deepEqual(exitResult.unconfirmedPids, []);
+  const receipt = host.getRunReceipt(runId);
+  assert.ok(receipt.registeredDescendantPids.includes(pids.child), 'descendants were registered before the kill');
+  assert.ok(receipt.registeredDescendantPids.includes(pids.grandchild));
+  assert.match(String(await pending), /canceled/);
+  await waitUntilDead([pids.parent, pids.child, pids.grandchild]);
 });

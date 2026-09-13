@@ -11,7 +11,16 @@ import { settingSections } from "./SettingsLayout";
 import { UsageSettings } from "./UsageSettings";
 import { NotificationSettings } from "./NotificationSettings";
 import { FileLocationSettings } from "./FileLocationSettings";
+import { LibraryStorageSettings } from "./LibraryStorageSettings";
+import { UpdateDownloadSettings } from "./UpdateDownloadSettings";
+import { HomeBackupSettings } from "./HomeBackupSettings";
+import { RuntimeIntegritySettings } from "./RuntimeIntegritySettings";
+import { PowerSettings } from "./PowerSettings";
+// C18: the terminal profile panel itself is delivered by lane D; the
+// settings entry and section registration below are C-owned wiring.
+import { TerminalSettings } from "./TerminalSettings";
 import { RemoteWorkspace } from "./RemoteWorkspace";
+import { RuntimeDiagnosticsPanel } from "./RuntimeDiagnosticsPanel";
 import { WorkbenchMark } from "./WorkbenchMark";
 
 function SettingRow({ title, description, children }: { title: string; description?: string; children: React.ReactNode }) {
@@ -32,6 +41,12 @@ export function SettingsView({ section = "general" }: { section?: string }) {
     connection: t("保存和管理你的模型服务连接。", "Save and manage your model service connections."),
     usage: t("了解每个模型的用量与缓存表现。", "Understand model usage and cache performance."),
     ssh: t("连接远程环境，继续手边的工作。", "Connect to a remote environment and keep working."),
+    storage: t("预览并回收资料库的历史版本与回收站空间。", "Preview and reclaim library history and trash space."),
+    update: t("在应用内下载并校验更新安装包。", "Download and verify update installers inside the app."),
+    backup: t("备份整个应用数据并恢复到新的位置。", "Back up all app data and restore it to a new location."),
+    integrity: t("核对本机安装的引擎与页面构建是否与打包清单一致。", "Verify the installed engine and web build against the packaging manifest."),
+    power: t("控制长任务期间是否保持电脑唤醒。", "Control whether long tasks keep the computer awake."),
+    terminal: t("选择检测到的终端 shell 与默认终端。", "Pick a detected terminal shell and the default terminal."),
     about: t("从想法到结果的通用工作台。", "A general workspace for turning ideas into results."),
   };
   const shortcuts = [
@@ -51,11 +66,18 @@ export function SettingsView({ section = "general" }: { section?: string }) {
     {!current && <Link className="nw-button" href="/workbench/settings/general">{t("返回常规设置", "Back to general settings")}</Link>}
     {section === "general" && <><section className="nw-preference-section"><h2>{t("偏好", "Preferences")}</h2><div className="nw-preference-card"><SettingRow title={t("语言", "Language")} description={t("工作台的显示语言", "The language used in the workspace")}><select aria-label={t("界面语言", "Interface language")} value={locale} onChange={event => { if (event.target.value !== locale) toggleLocale(); }}><option value="zh">{"简体中文"}</option><option value="en">{"English"}</option></select></SettingRow><SettingRow title={t("外观", "Appearance")} description={t("主题、玻璃效果与透明度", "Themes, glass and transparency")}><Link className="nw-setting-link" href="/workbench/settings/appearance">{t(THEME_PALETTES[theme].zh, THEME_PALETTES[theme].en)}<ArrowUpRight size={14} /></Link></SettingRow></div></section><section className="nw-preference-section"><h2>{t("工作空间", "Workspace")}</h2><div className="nw-preference-card"><SettingRow title={t("当前项目", "Current project")} description={project?.cwd || t("新任务使用在侧栏或输入框中选择的项目", "New tasks use the project selected in the sidebar or composer")}><Link className="nw-setting-link" href={project ? `/workbench/project/${encodeURIComponent(project.id)}` : "/workbench/projects"}><FolderOpen size={15} /><span>{project?.title || t("选择项目", "Choose a project")}</span></Link></SettingRow><SettingRow title={t("整理侧栏", "Sidebar organization")} description={t("在侧栏菜单中选择分组与排序，置顶常用任务或创建分区。", "Use sidebar menus to group, sort, pin tasks or create sections.")}><span className="nw-muted-label">{t("保存在此设备", "Saved on this device")}</span></SettingRow></div></section></>}
     {section === "general" && <FileLocationSettings />}
+    {section === "storage" && <LibraryStorageSettings />}
+    {section === "update" && <UpdateDownloadSettings />}
+    {section === "backup" && <HomeBackupSettings />}
+    {section === "integrity" && <RuntimeIntegritySettings />}
+    {section === "power" && <PowerSettings />}
+    {section === "terminal" && <TerminalSettings />}
     {section === "appearance" && <AppearanceSettings />}
     {section === "shortcuts" && <section className="nw-preference-section"><label className="nw-shortcut-search"><Search size={16} /><input aria-label={t("搜索快捷键", "Search shortcuts")} placeholder={t("搜索操作或按键…", "Search actions or keys…")} value={shortcutQuery} onChange={event => setShortcutQuery(event.target.value)} /></label><div className="nw-preference-card">{shortcuts.map(item => <SettingRow key={item.title} title={item.title} description={item.description}><span className="nw-shortcut-keys">{item.keys.map(key => <kbd key={key}>{key}</kbd>)}</span></SettingRow>)}{!shortcuts.length && <p className="nw-settings-no-results" role="status">{t("没有匹配的快捷键", "No matching shortcuts")}</p>}</div></section>}
     <div hidden={section !== "connection"}>
       <ConnectionSettings />
       <section className="nw-preference-section"><h2>{t("运行环境", "Runtime")}</h2><div className="nw-preference-card"><SettingRow title={t("本地连接", "Local connection")} description={connection === "connected" ? t("任务与执行状态已连接", "Connected to tasks and their execution state") : t("尚未连接到工作引擎", "Not connected to the task engine")}><button className="nw-button" disabled={reconnecting} onClick={async () => { setReconnecting(true); try { await reconnect(); } catch (error) { setError(errorText(error)); } finally { setReconnecting(false); } }}>{reconnecting ? <Loader2 className="nw-spin" size={15} /> : <RefreshCw size={15} />}{t("重新连接", "Reconnect")}</button></SettingRow><details className="nw-model-catalog"><summary>{t("查看可用模型", "Available models")}<span>{models.length}</span></summary><p className="nw-help">{t("模型清单来自工作引擎，服务支持情况取决于连接配置。", "Models come from the engine. Provider support depends on your connection.")}</p>{modelError && <p className="nw-inline-error" role="alert">{modelError}</p>}<div className="nw-model-list">{models.map(model => <div key={model.id}><strong>{model.displayName ?? model.model ?? model.id}</strong><p>{model.description}</p>{model.isDefault && <span>{t("默认", "Default")}</span>}</div>)}</div></details></div></section>
+      <RuntimeDiagnosticsPanel />
     </div>
     {section === "usage" && <UsageSettings />}
     {section === "notifications" && <NotificationSettings />}

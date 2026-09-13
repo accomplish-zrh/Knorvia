@@ -30,6 +30,7 @@ fn failed_error_item_does_not_leave_a_writable_turn_running() {
         prompt: "test".into(),
         read_only: true,
         settings: KernelTurnSettings::default(),
+        advance: None,
     };
     let result = persist_terminal(
         &executor.runtime,
@@ -74,6 +75,7 @@ fn terminal_failure_corrects_a_waiting_user_input_item() {
         prompt: "test".into(),
         read_only: true,
         settings: KernelTurnSettings::default(),
+        advance: None,
     };
 
     persist_terminal(&executor.runtime, &request, &store, "failed", None).unwrap();
@@ -82,4 +84,59 @@ fn terminal_failure_corrects_a_waiting_user_input_item() {
     assert_eq!(corrected.status, "delivery_failed");
     assert_eq!(corrected.payload["request"]["questions"][0]["id"], "mode");
     assert_eq!(store.read_turn(&turn.id).unwrap().status, "failed");
+}
+
+fn waiting_active() -> ActiveTurn {
+    ActiveTurn {
+        turn_id: Mutex::new("turn".into()),
+        cancelled: AtomicBool::new(false),
+        done: AtomicBool::new(false),
+        kernel: Mutex::new(None),
+        cancelled_agents: Mutex::new(std::collections::HashSet::new()),
+    }
+}
+
+#[test]
+fn approval_deadline_resolves_as_timed_out_not_denied() {
+    let (tx, rx) = channel();
+    let active = waiting_active();
+    let past = Instant::now() - Duration::from_secs(1);
+    let (decision, resolution) = await_approval_decision(&rx, &active, &json!({}), past);
+    assert!(matches!(decision, ka::TurnDecision::Decline));
+    assert_eq!(resolution, "timed_out");
+    drop(tx);
+}
+
+#[test]
+fn approval_cancellation_wins_over_a_queued_decision() {
+    let (tx, rx) = channel();
+    let active = waiting_active();
+    tx.send(ka::TurnDecision::Accept).unwrap();
+    active.cancelled.store(true, Ordering::SeqCst);
+    let (decision, resolution) =
+        await_approval_decision(&rx, &active, &json!({}), Instant::now() + Duration::from_secs(5));
+    assert!(matches!(decision, ka::TurnDecision::Decline));
+    assert_eq!(resolution, "cancelled");
+}
+
+#[test]
+fn approval_owner_loss_resolves_as_owner_lost() {
+    let (tx, rx) = channel();
+    let active = waiting_active();
+    drop(tx);
+    let (decision, resolution) =
+        await_approval_decision(&rx, &active, &json!({}), Instant::now() + Duration::from_secs(5));
+    assert!(matches!(decision, ka::TurnDecision::Decline));
+    assert_eq!(resolution, "owner_lost");
+}
+
+#[test]
+fn approval_user_decision_is_recorded_as_the_users() {
+    let (tx, rx) = channel();
+    let active = waiting_active();
+    tx.send(ka::TurnDecision::Accept).unwrap();
+    let (decision, resolution) =
+        await_approval_decision(&rx, &active, &json!({}), Instant::now() + Duration::from_secs(5));
+    assert!(matches!(decision, ka::TurnDecision::Accept));
+    assert_eq!(resolution, "user");
 }

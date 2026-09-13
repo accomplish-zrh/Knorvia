@@ -14,9 +14,7 @@ fn setup(tag: &str) -> ProductStore {
 }
 
 fn group(store: &ProductStore, bot_ids: &[String]) -> Room {
-    store
-        .create_room("group", "test group", bot_ids)
-        .unwrap()
+    store.create_room("group", "test group", bot_ids).unwrap()
 }
 
 #[test]
@@ -32,7 +30,11 @@ fn default_bot_is_idempotent_and_survives_reopen() {
     assert_eq!(first, second);
 
     let bots = store.list_bots().unwrap();
-    assert_eq!(bots.len(), 1, "two initializations must yield one default bot");
+    assert_eq!(
+        bots.len(),
+        1,
+        "two initializations must yield one default bot"
+    );
 
     // A fresh store over the same Home re-reads the durable profile.
     let reopened = ProductStore::open(paths).unwrap();
@@ -63,15 +65,20 @@ fn created_bots_and_soul_revisions_persist_with_history() {
     assert_eq!(updated.soul_history[0].revision, 1);
 
     // Stale revision is rejected instead of silently overwriting.
-    assert!(store
-        .update_bot_soul(&bot.id, "third soul", Some(bot.revision))
-        .is_err());
+    assert!(
+        store
+            .update_bot_soul(&bot.id, "third soul", Some(bot.revision))
+            .is_err()
+    );
 
     let renamed = store
         .rename_bot(&bot.id, "Renamed Researcher", Some(updated.revision))
         .unwrap();
     assert_eq!(renamed.name, "Renamed Researcher");
-    assert_eq!(renamed.soul_revision, 2, "renaming never bumps the soul revision");
+    assert_eq!(
+        renamed.soul_revision, 2,
+        "renaming never bumps the soul revision"
+    );
 
     let reopened = ProductStore::open(paths).unwrap();
     let persisted = reopened.read_bot(&bot.id).unwrap();
@@ -192,7 +199,10 @@ fn room_rename_keeps_the_binding_and_session() {
         .rename_room(&room.id, "new display name", Some(room.revision))
         .unwrap();
     assert_eq!(renamed.title, "new display name");
-    assert_eq!(renamed.id, room.id, "conversation id never changes on rename");
+    assert_eq!(
+        renamed.id, room.id,
+        "conversation id never changes on rename"
+    );
 
     let after = store
         .resolve_session_binding(&bot.id, &room.id, "kernel", BindingIdentity::default())
@@ -251,15 +261,15 @@ fn identity_change_starts_new_generation_without_recent_session_fallback() {
         second.binding.knorvia_thread_id, None,
         "a new generation must not inherit the previous session anchor"
     );
-    assert_eq!(
-        second.binding.canonical_cwd.as_deref(),
-        Some("D:/new")
-    );
+    assert_eq!(second.binding.canonical_cwd.as_deref(), Some("D:/new"));
 
     let superseded = store.read_binding(&first.binding.id).unwrap();
     assert_eq!(superseded.status, "superseded");
-    assert_eq!(superseded.knorvia_thread_id.as_deref(), Some("thr_old_cwd"),
-        "history stays attributable on the old generation");
+    assert_eq!(
+        superseded.knorvia_thread_id.as_deref(),
+        Some("thr_old_cwd"),
+        "history stays attributable on the old generation"
+    );
 
     // Attaching the fresh generation, then resolving with old identity again
     // regenerates once more — the cwd change is a real fact, not reversible.
@@ -338,9 +348,11 @@ fn attach_refuses_to_move_an_anchor_or_target_non_active_binding() {
             Some(resolved.binding.revision),
         )
         .unwrap();
-    assert!(store
-        .attach_binding_session(&resolved.binding.id, "thr_two", None, None)
-        .is_err());
+    assert!(
+        store
+            .attach_binding_session(&resolved.binding.id, "thr_two", None, None)
+            .is_err()
+    );
     // Re-attaching the same thread is idempotent.
     let same = store
         .attach_binding_session(&resolved.binding.id, "thr_one", None, None)
@@ -350,9 +362,11 @@ fn attach_refuses_to_move_an_anchor_or_target_non_active_binding() {
     store
         .mark_binding_lost(&resolved.binding.id, "test", None)
         .unwrap();
-    assert!(store
-        .attach_binding_session(&resolved.binding.id, "thr_three", None, None)
-        .is_err());
+    assert!(
+        store
+            .attach_binding_session(&resolved.binding.id, "thr_three", None, None)
+            .is_err()
+    );
 }
 
 #[test]
@@ -382,14 +396,22 @@ fn room_membership_validation_and_dm_rules() {
     let other = store.create_bot("Second", "soul", "kernel", None).unwrap();
 
     let dm = store.ensure_dm(&bot.id).unwrap();
-    assert!(store
-        .add_room_member(&dm.id, &other.id, Some(dm.revision))
-        .is_err());
-    assert!(store.create_room("dm", "bad dm", &[bot.id.clone(), other.id.clone()]).is_err());
+    assert!(
+        store
+            .add_room_member(&dm.id, &other.id, Some(dm.revision))
+            .is_err()
+    );
+    assert!(
+        store
+            .create_room("dm", "bad dm", &[bot.id.clone(), other.id.clone()])
+            .is_err()
+    );
     assert!(store.create_room("group", "empty", &[]).is_err());
-    assert!(store
-        .create_room("group", "ghost", &["bot_missing".to_string()])
-        .is_err());
+    assert!(
+        store
+            .create_room("group", "ghost", &["bot_missing".to_string()])
+            .is_err()
+    );
 
     let room = group(&store, &[bot.id.clone()]);
     let updated = store

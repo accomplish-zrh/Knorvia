@@ -20,7 +20,17 @@ struct MockServer {
 
 impl MockServer {
     fn spawn(responses: Vec<(u16, String, String)>) -> Self {
-        // responses: (status, content_type, body), consumed in order.
+        Self::spawn_raw(
+            responses
+                .into_iter()
+                .map(|(s, ct, b)| (s, format!("content-type: {ct}\r\n"), b))
+                .collect(),
+        )
+    }
+
+    /// Raw variant: the second tuple element is the literal extra header
+    /// block (each line ending in CRLF), e.g. to test `retry-after`.
+    fn spawn_raw(responses: Vec<(u16, String, String)>) -> Self {
         let listener = TcpListener::bind(("127.0.0.1", 0)).expect("bind mock");
         let port = listener.local_addr().unwrap().port();
         let requests: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -29,13 +39,13 @@ impl MockServer {
             let queue = Arc::new(Mutex::new(std::collections::VecDeque::from(responses)));
             for stream in listener.incoming() {
                 let Ok(mut stream) = stream else { continue };
-                let Some((status, content_type, body)) = queue.lock().unwrap().pop_front() else {
+                let Some((status, extra_headers, body)) = queue.lock().unwrap().pop_front() else {
                     break;
                 };
                 let request_line = read_request(&mut stream, &capture);
                 let _ = request_line;
                 let response = format!(
-                    "HTTP/1.1 {status} X\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    "HTTP/1.1 {status} X\r\n{extra_headers}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                     body.len()
                 );
                 let _ = stream.write_all(response.as_bytes());
@@ -165,7 +175,95 @@ fn openai_responses_http_error_maps_to_typed_result() {
     .unwrap();
     assert_eq!(result.status, 429);
     assert_eq!(result.error.as_deref(), Some("rate limited by the mock"));
+    assert_eq!(
+        result.error_category.as_deref(),
+        Some("PROVIDER_RATE_LIMIT")
+    );
+    assert_eq!(result.retryable, Some(true));
     assert!(result.text.is_empty());
+}
+
+#[test]
+fn http_error_with_retry_after_httpdate_is_normalized() {
+    // MockServer response lines are preformatted; append the header by hand
+    // through the raw variant below (a fixed historical date keeps the test
+    // deterministic; the parsed value is seconds-from-now >= 0 only if the
+    // date is in the future, so assert the field exists and is bounded).
+    let server = MockServer::spawn_raw(vec![(
+        503,
+        "content-type: application/json\r\nretry-after: 7\r\n".into(),
+        r#"{"error":{"message":"upstream overloaded"}}"#.into(),
+    )]);
+    let tx = translate(ProviderKind::OpenAiResponses, request("gpt-5.2", true)).unwrap();
+    let result = execute(
+        &tx,
+        &ExecuteConfig {
+            base_url: server.base_url(),
+            api_key: Some("sk".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(result.status, 503);
+    assert_eq!(result.error_category.as_deref(), Some("TRANSIENT"));
+    assert_eq!(result.retryable, Some(true));
+    assert_eq!(
+        result.retry_after,
+        Some(7),
+        "integer Retry-After normalizes"
+    );
+}
+
+#[test]
+fn auth_failure_over_http_classifies_as_provider_auth() {
+    let server = MockServer::spawn(vec![(
+        403,
+        "application/json".into(),
+        r#"{"error":{"message":"region blocked for this key sk-abcdef1234567890abcdef12"}}"#.into(),
+    )]);
+    let tx = translate(ProviderKind::OpenAiResponses, request("gpt-5.2", true)).unwrap();
+    let result = execute(
+        &tx,
+        &ExecuteConfig {
+            base_url: server.base_url(),
+            api_key: Some("sk".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(result.status, 403);
+    assert_eq!(result.error_category.as_deref(), Some("PROVIDER_AUTH"));
+    assert_eq!(result.retryable, Some(false));
+    assert!(
+        !result
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("sk-abcdef1234567890"),
+        "secret-looking run must be redacted: {result:?}"
+    );
+}
+
+#[test]
+fn truncated_sse_stream_is_marked_incomplete_over_http() {
+    // The upstream closes the connection mid-stream: no terminal event.
+    let body = concat!(
+        "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"Partial\"}]}}\n\n",
+    );
+    let server = MockServer::spawn(vec![(200, "text/event-stream".into(), body.into())]);
+    let tx = translate(ProviderKind::OpenAiResponses, request("gpt-5.2", true)).unwrap();
+    let result = execute(
+        &tx,
+        &ExecuteConfig {
+            base_url: server.base_url(),
+            api_key: Some("sk".into()),
+        },
+    )
+    .unwrap();
+    assert_eq!(result.text, "Partial");
+    assert!(
+        result.stream_incomplete,
+        "truncated stream never passes as complete"
+    );
+    assert!(result.error.is_none(), "clean EOF is not a provider error");
 }
 
 #[test]

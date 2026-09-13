@@ -17,3 +17,26 @@ export async function submissionAttempt(storage: DraftStorage | undefined, scope
 export function clearSubmission(storage: DraftStorage | undefined, scope: string, id: string) {
   try { if (JSON.parse(storage?.getItem(`${scope}:submission`) ?? 'null')?.id === id) storage?.removeItem(`${scope}:submission`); } catch { /* optional draft storage */ }
 }
+
+export type StoredSubmission = { id: string; fingerprint: string; action: { kind: 'start' | 'steer'; turnId?: string } };
+
+/** Read the retained attempt without changing its identity. */
+export function readStoredSubmission(storage: DraftStorage | undefined, scope: string): StoredSubmission | undefined {
+  try {
+    const stored = JSON.parse(storage?.getItem(`${scope}:submission`) ?? 'null');
+    if (stored && typeof stored.id === 'string' && typeof stored.fingerprint === 'string' && ['start', 'steer'].includes(stored.action?.kind)) return stored as StoredSubmission;
+  } catch { /* optional draft storage */ }
+  return undefined;
+}
+
+/**
+ * Record that a retained attempt failed so recovery flows can find it after a
+ * reload. The id and fingerprint stay untouched: the attempt must remain the
+ * same admission identity, whether it is retried or explicitly recovered.
+ */
+export function markSubmissionFailed(storage: DraftStorage | undefined, scope: string, id: string) {
+  try {
+    const stored = JSON.parse(storage?.getItem(`${scope}:submission`) ?? 'null');
+    if (stored?.id === id) storage?.setItem(`${scope}:submission`, JSON.stringify({ ...stored, outcome: 'failed' }));
+  } catch { /* optional draft storage */ }
+}

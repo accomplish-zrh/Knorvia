@@ -15,6 +15,7 @@
 //! - Unknown input item types are skipped rather than guessed into a shape
 //!   the upstream never asked for.
 
+use crate::budget::{BudgetBreach, StreamBudget, TOOL_ARGS_BUDGET};
 use serde_json::{Map, Value, json};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -317,14 +318,6 @@ fn anthropic_request(body: &Value) -> Result<Value, String> {
     Ok(Value::Object(request))
 }
 
-/// Extract the `data:` payload of one SSE line pair. Returns `None` for
-/// comments, `event:`/`id:` lines (callers track those separately) and the
-/// stream terminator.
-pub fn sse_data_payload(line: &str) -> Option<&str> {
-    let data = line.strip_prefix("data:")?;
-    Some(data.trim_start())
-}
-
 /// Streaming translation state machine: upstream Chat Completions SSE lines
 /// in, Kernel-consumable Responses SSE events out.
 #[derive(Debug, Default)]
@@ -336,6 +329,8 @@ pub struct ChatSseTranslator {
     finished: bool,
     emitted_created: bool,
     emitted_text: bool,
+    budget: Option<StreamBudget>,
+    breach: Option<BudgetBreach>,
 }
 
 impl ChatSseTranslator {
@@ -343,10 +338,33 @@ impl ChatSseTranslator {
         Self::default()
     }
 
+    /// Enforce the shared budgets while reassembling streamed tool calls. The
+    /// accumulated text is bounded by the reader's total-output meter (it can
+    /// only grow from bytes that were charged), so the translator itself
+    /// guards the one thing that must never be delivered half-formed: a
+    /// function call's arguments.
+    pub fn with_budget(mut self, budget: StreamBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Set when an upstream stream overflowed a budget. The translator then
+    /// goes silent — callers must report a failure, never a completion.
+    pub fn breach(&self) -> Option<BudgetBreach> {
+        self.breach.clone()
+    }
+
     /// Feed one `data:` payload (already stripped of the `data:` prefix).
     /// Returns the Responses events this chunk produced.
     pub fn feed(&mut self, payload: &str) -> Vec<Value> {
         let mut events = Vec::new();
+        if self.breach.is_some() {
+            return events;
+        }
+        let args_cap = self
+            .budget
+            .as_ref()
+            .map_or(usize::MAX, |b| b.max_tool_args_bytes);
         if payload.trim() == "[DONE]" {
             events.extend(self.complete());
             return events;
@@ -412,6 +430,19 @@ impl ChatSseTranslator {
                         .and_then(Value::as_str)
                     {
                         let existing = entry["arguments"].as_str().unwrap_or("").to_string();
+                        let received = existing.len() + args.len();
+                        if received > args_cap {
+                            self.breach = Some(BudgetBreach::new(
+                                TOOL_ARGS_BUDGET,
+                                args_cap as u64,
+                                received as u64,
+                                "bytes",
+                            ));
+                            // Drop the partial call: nothing truncated may
+                            // reach the executor.
+                            entry["arguments"] = json!("");
+                            return events;
+                        }
                         entry["arguments"] = json!(existing + args);
                     }
                 }
@@ -536,6 +567,8 @@ pub struct AnthropicSseTranslator {
     text_index: u64,
     blocks: Map<String, Value>,
     completed: bool,
+    budget: Option<StreamBudget>,
+    breach: Option<BudgetBreach>,
 }
 
 impl AnthropicSseTranslator {
@@ -543,8 +576,28 @@ impl AnthropicSseTranslator {
         Self::default()
     }
 
+    /// Enforce the shared tool-argument budget on streamed `partial_json`.
+    /// Text accumulation is bounded by the reader's total-output meter.
+    pub fn with_budget(mut self, budget: StreamBudget) -> Self {
+        self.budget = Some(budget);
+        self
+    }
+
+    /// Set when an upstream stream overflowed a budget; the translator then
+    /// produces no further events so the caller cannot report a completion.
+    pub fn breach(&self) -> Option<BudgetBreach> {
+        self.breach.clone()
+    }
+
     pub fn feed(&mut self, payload: &str) -> Vec<Value> {
         let mut events = Vec::new();
+        if self.breach.is_some() {
+            return events;
+        }
+        let args_cap = self
+            .budget
+            .as_ref()
+            .map_or(usize::MAX, |b| b.max_tool_args_bytes);
         let Ok(event) = serde_json::from_str::<Value>(payload) else {
             return events;
         };
@@ -623,6 +676,17 @@ impl AnthropicSseTranslator {
                             .and_then(Value::as_str)
                             .unwrap_or("");
                         let existing = entry["partial_json"].as_str().unwrap_or("").to_string();
+                        let received = existing.len() + piece.len();
+                        if received > args_cap {
+                            self.breach = Some(BudgetBreach::new(
+                                TOOL_ARGS_BUDGET,
+                                args_cap as u64,
+                                received as u64,
+                                "bytes",
+                            ));
+                            entry["partial_json"] = json!("");
+                            return events;
+                        }
                         entry["partial_json"] = json!(existing + piece);
                     }
                     _ => {}
@@ -1028,11 +1092,20 @@ mod bridge_tests {
         tiers.feed(r#"{"type":"message_delta","usage":{"output_tokens":3}}"#);
         let ended = tiers.feed(r#"{"type":"message_stop"}"#);
         let usage = &ended.last().unwrap()["response"]["usage"];
-        assert_eq!(usage["input_tokens"], 20, "raw + read + write, counted once");
+        assert_eq!(
+            usage["input_tokens"], 20,
+            "raw + read + write, counted once"
+        );
         assert_eq!(usage["input_tokens_details"]["cached_tokens"], 10);
         assert_eq!(usage["input_tokens_details"]["cache_write_tokens"], 6);
-        assert_eq!(usage["input_tokens_details"]["cache_creation_breakdown"]["ephemeral5m"], 4);
-        assert_eq!(usage["input_tokens_details"]["cache_creation_breakdown"]["ephemeral1h"], 2);
+        assert_eq!(
+            usage["input_tokens_details"]["cache_creation_breakdown"]["ephemeral5m"],
+            4
+        );
+        assert_eq!(
+            usage["input_tokens_details"]["cache_creation_breakdown"]["ephemeral1h"],
+            2
+        );
         assert_eq!(usage["total_tokens"], 23);
         // No tiers reported: breakdown stays null instead of fake zeros.
         let mut no_tiers = AnthropicSseTranslator::new();
@@ -1042,7 +1115,10 @@ mod bridge_tests {
         no_tiers.feed(r#"{"type":"message_delta","usage":{"output_tokens":1}}"#);
         let ended = no_tiers.feed(r#"{"type":"message_stop"}"#);
         let usage = &ended.last().unwrap()["response"]["usage"];
-        assert_eq!(usage["input_tokens_details"]["cache_creation_breakdown"], serde_json::Value::Null);
+        assert_eq!(
+            usage["input_tokens_details"]["cache_creation_breakdown"],
+            serde_json::Value::Null
+        );
         // No cache fields at all: details stay null (presence unknown).
         let mut bare = AnthropicSseTranslator::new();
         bare.feed(r#"{"type":"message_start","message":{"id":"bare","usage":{"input_tokens":4}}}"#);
@@ -1050,6 +1126,9 @@ mod bridge_tests {
         let ended = bare.feed(r#"{"type":"message_stop"}"#);
         let usage = &ended.last().unwrap()["response"]["usage"];
         assert_eq!(usage["input_tokens_details"], serde_json::Value::Null);
-        assert_eq!(usage["input_tokens"], 4, "no cache fields means no invented cache tokens");
+        assert_eq!(
+            usage["input_tokens"], 4,
+            "no cache fields means no invented cache tokens"
+        );
     }
 }

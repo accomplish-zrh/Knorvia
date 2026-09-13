@@ -1,5 +1,24 @@
 # Knorvia — Agent-Native Architecture
 
+> **Disk retention (user cleanup, 2026-09-13; supersedes 2026-09-11):** Keep the
+> latest verified full release and independently delivered skill packages. The
+> user explicitly requests removal of all backups, including the previously
+> retained rollback installer and development source/archive backup copies.
+> The user wants all old portable versions removed; preserve embedded
+> user data separately and verify it before deleting those program folders.
+> After a replacement is verified, remove superseded installers,
+> portable archives, redundant unpacked trees and task-owned packaging staging.
+> Preserve their small handoff reports, checksums, source manifests and evidence.
+> Do not retain a full runtime copy for every test case; reuse a compatible build
+> cache within each isolated workspace and clean finished task-owned caches.
+> Never classify `desktop-data`, `Knorvia-data`, sources, dirty worktrees, Git
+> history or recovered user data that exists only in a recovery directory as
+> backup/build waste. Check for embedded user data,
+> active processes and reparse points before deleting a generated directory.
+> Record actual drive space reclaimed, rather than summing duplicate/hardlinked
+> file sizes. `release/LATEST.md` identifies the active release; no rollback
+> installer is retained under the current user instruction.
+
 > **Public source snapshot (2026-09-09):** The current custom Rust runtime is
 > checked in at `native/knorvia-rs`. `native/README.md` pins the unchanged
 > upstream App Server source. This makes the public repository reproducible;

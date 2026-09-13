@@ -40,6 +40,50 @@ fn append(
     Ok(())
 }
 
+/// Approval wait budget. Tests shorten it through the environment; the
+/// default keeps today's five-minute window.
+fn approval_timeout_secs() -> u64 {
+    std::env::var("KNORVIA_APPROVAL_TIMEOUT_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(300)
+}
+
+/// Wait for a user decision, the deadline, a cancellation, or the owner's
+/// disappearance. Returns the Kernel-side decision plus the resolution to
+/// record: "user" when the decision came from the control plane (which
+/// records allowed/denied itself), otherwise the system close-out that
+/// actually happened. Cancellation always wins over a simultaneously
+/// delivered decision.
+fn await_approval_decision(
+    rx: &std::sync::mpsc::Receiver<ka::TurnDecision>,
+    active: &ActiveTurn,
+    payload: &Value,
+    deadline: Instant,
+) -> (ka::TurnDecision, &'static str) {
+    loop {
+        if active.request_cancelled(payload) {
+            return (ka::TurnDecision::Decline, "cancelled");
+        }
+        if Instant::now() >= deadline {
+            return (ka::TurnDecision::Decline, "timed_out");
+        }
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(decision) => {
+                if active.request_cancelled(payload) {
+                    return (ka::TurnDecision::Decline, "cancelled");
+                }
+                return (decision, "user");
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return (ka::TurnDecision::Decline, "owner_lost");
+            }
+        }
+    }
+}
+
 fn key(item: &ka::KernelTurnItem) -> String {
     item.payload
         .get("kernelItemId")
@@ -50,23 +94,99 @@ fn key(item: &ka::KernelTurnItem) -> String {
 
 pub(super) fn run(
     runtime: Arc<Runtime>,
-    req: TurnRequest,
+    mut req: TurnRequest,
     store: Arc<ProductStore>,
     active: Arc<ActiveTurn>,
     first: Sender<String>,
 ) {
-    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        execute(&runtime, &req, &store, &active, first)
-    }))
-    .unwrap_or_else(|_| Err(internal("kernel runner panicked")));
-    let (terminal, error) = match outcome {
-        Ok(value) => value,
-        Err(error) => (
-            "failed".to_string(),
-            Some(json!({"category": error.category, "message": error.message})),
-        ),
-    };
-    let persisted = persist_terminal(&runtime, &req, &store, &terminal, error.as_ref());
+    // One loop body per durable Turn. An explicit Goal advance policy keeps
+    // the batch running across rounds; every round is a full real turn with
+    // its own durable record - the existing executor, not a second loop.
+    let mut first_channel = Some(first);
+    loop {
+        let first = first_channel.take().unwrap_or_else(|| {
+            // Later rounds surface approvals through the durable approval
+            // store and the decisions map; the first-approval hint belongs
+            // to the initial admission reply only.
+            let (tx, _rx) = channel();
+            tx
+        });
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            execute(&runtime, &req, &store, &active, first)
+        }))
+        .unwrap_or_else(|_| Err(internal("kernel runner panicked")));
+        let (terminal, error) = match outcome {
+            Ok(value) => value,
+            Err(error) => (
+                "failed".to_string(),
+                Some(json!({"category": error.category, "message": error.message})),
+            ),
+        };
+        let persisted = persist_terminal(&runtime, &req, &store, &terminal, error.as_ref());
+        // Reflect the durable Turn terminal in any Goal execution batch (R02).
+        // Best effort: read-time reconciliation covers a failed close.
+        let _ = store.close_goal_round(&req.turn_id, &terminal);
+        runtime
+            .decisions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, owner| owner.turn_id != req.turn_id);
+        runtime
+            .user_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|_, owner| owner.turn_id != req.turn_id);
+        match persisted {
+            Ok(()) => runtime.emit("turn/event", json!({"threadId": req.thread_id, "turnId": req.turn_id, "status": terminal, "error": error})),
+            Err(error) => {
+                eprintln!("Knorvia turn persistence failed: {error}");
+                // No terminal notification without a durable terminal record.
+                runtime.emit("turn/persistenceError", json!({"threadId": req.thread_id, "turnId": req.turn_id,
+                    "message": "Turn state could not be saved; reconnect and inspect recovery state"}));
+            }
+        }
+        let cancelled = active.cancelled.load(Ordering::SeqCst);
+        let decision = if cancelled || error.is_some() {
+            let (status, reason) = if cancelled {
+                ("cancelled", "cancelled")
+            } else {
+                ("failed", "failed")
+            };
+            super::super::stop_batch(&store, &req.turn_id, status, reason);
+            None
+        } else {
+            crate::turn_exec::advance_decision(&store, &req, &terminal, false)
+        };
+        let Some(next_req) = decision else {
+            break;
+        };
+        match store.append_item(
+            &next_req.thread_id,
+            &next_req.turn_id,
+            "userMessage",
+            "completed",
+            json!({"text": next_req.prompt}),
+        ) {
+            Ok(item) => {
+                runtime.emit(
+                    "turn/event",
+                    json!({"threadId": next_req.thread_id, "turnId": next_req.turn_id,
+                    "kind": item.kind, "payload": item.payload, "item": item}),
+                );
+                active.set_current_turn(next_req.turn_id.clone());
+                req = next_req;
+            }
+            Err(_) => {
+                // The continuation round cannot accept its input: no runner
+                // will execute it, so record durable facts and stop instead
+                // of orphaning a Turn.
+                let _ = store.complete_turn_idempotent(&next_req.turn_id, "failed");
+                let _ = store.close_goal_round(&next_req.turn_id, "failed");
+                super::super::stop_batch(&store, &next_req.turn_id, "failed", "inputWriteFailed");
+                break;
+            }
+        }
+    }
     active.done.store(true, Ordering::SeqCst);
     {
         let mut registry = runtime.active.lock().unwrap_or_else(|e| e.into_inner());
@@ -75,25 +195,6 @@ pub(super) fn run(
             .is_some_and(|entry| Arc::ptr_eq(entry, &active))
         {
             registry.remove(&req.thread_id);
-        }
-    }
-    runtime
-        .decisions
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, owner| owner.turn_id != req.turn_id);
-    runtime
-        .user_inputs
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .retain(|_, owner| owner.turn_id != req.turn_id);
-    match persisted {
-        Ok(()) => runtime.emit("turn/event", json!({"threadId": req.thread_id, "turnId": req.turn_id, "status": terminal, "error": error})),
-        Err(error) => {
-            eprintln!("Knorvia turn persistence failed: {error}");
-            // No terminal notification without a durable terminal record.
-            runtime.emit("turn/persistenceError", json!({"threadId": req.thread_id, "turnId": req.turn_id,
-                "message": "Turn state could not be saved; reconnect and inspect recovery state"}));
         }
     }
 }
@@ -112,11 +213,17 @@ fn persist_terminal(
     match store.list_approvals(&req.thread_id) {
         Ok(approvals) => {
             for approval in approvals {
-                if approval.turn_id == req.turn_id
-                    && approval.status == "pending"
-                    && let Err(error) = store.respond_approval(&approval.id, "deny")
-                {
-                    failure.get_or_insert_with(|| error.into_protocol());
+                if approval.turn_id == req.turn_id && approval.status == "pending" {
+                    // The deciding owner is gone with the turn: record a
+                    // system close-out, never a forged user denial.
+                    let reason = if terminal == "cancelled" {
+                        "cancelled"
+                    } else {
+                        "owner_lost"
+                    };
+                    if let Err(error) = store.resolve_approval_system(&approval.id, reason) {
+                        failure.get_or_insert_with(|| error.into_protocol());
+                    }
                 }
             }
         }
@@ -430,17 +537,9 @@ fn execute(
                 let _ = first.send(approval.id.clone());
                 runtime.emit("approval/request", json!({"approvalId": approval.id, "threadId": req.thread_id, "turnId": req.turn_id,
                     "action": request.action, "digest": digest, "target": request.payload, "item": item}));
-                let deadline = Instant::now() + Duration::from_secs(300);
-                let decision = loop {
-                    if active.request_cancelled(&request.payload) || Instant::now() >= deadline {
-                        break ka::TurnDecision::Decline;
-                    }
-                    match rx.recv_timeout(Duration::from_millis(25)) {
-                        Ok(decision) => break decision,
-                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-                        Err(_) => break ka::TurnDecision::Decline,
-                    }
-                };
+                let deadline = Instant::now() + Duration::from_secs(approval_timeout_secs());
+                let (decision, resolution) =
+                    await_approval_decision(&rx, &active, &request.payload, deadline);
                 runtime
                     .decisions
                     .lock()
@@ -452,8 +551,11 @@ fn execute(
                     .status
                     == "pending"
                 {
+                    // The card is still pending only when no user decision
+                    // was recorded: close it out as the system resolution
+                    // that actually happened, never as a user denial.
                     store
-                        .respond_approval(&approval.id, "deny")
+                        .resolve_approval_system(&approval.id, resolution)
                         .map_err(|e| e.into_protocol())?;
                 }
                 // Cancellation always wins over a simultaneously delivered allow.
@@ -615,6 +717,20 @@ fn execute(
         {
             append(runtime, req, store, &item.kind, item.payload.clone())?;
         }
+    }
+    if result.deadline_exceeded {
+        // The deadline diagnostic stays durable while the Kernel's reported
+        // terminal above remains authoritative and untouched.
+        append(
+            runtime,
+            req,
+            store,
+            "notice",
+            json!({
+                "category": "DEADLINE_EXCEEDED",
+                "message": "The turn deadline fired; the Kernel's reported terminal is authoritative",
+            }),
+        )?;
     }
     Ok((status(&result.status).into(), result.error))
 }

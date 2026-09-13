@@ -6,7 +6,7 @@ const { NATIVE_METHODS, MAX_TRANSPORT_BYTES, createNativeRpcRouter, validateNati
 
 test('bulk studio documents cross one MiB without widening ordinary RPC limits', () => {
   const params = { document: '中'.repeat(700000) };
-  for (const method of ['studio/sequence/create', 'studio/sequence/update', 'studio/template/import']) {
+  for (const method of ['studio/sequence/create', 'studio/sequence/update', 'studio/template/import', 'studio/canvas/create', 'studio/canvas/save']) {
     assert.ok(validateNativeRequest({ jsonrpc: '2.0', id: 'bulk', method, params }).value, method);
   }
   assert.equal(validateNativeRequest({ jsonrpc: '2.0', id: 'ordinary', method: 'thread/read', params }).error.error.code, -32602);
@@ -63,6 +63,42 @@ test('native router forwards only approved JSON-RPC methods', async () => {
   } finally {
     router.dispose();
   }
+});
+
+test('beginClose atomically freezes admission and drains requests accepted before the freeze', async () => {
+  let release;
+  const gate = new Promise(resolve => { release = resolve; });
+  const calls = [];
+  const router = createNativeRpcRouter({
+    rpc: async (method) => { calls.push(method); await gate; return { ok: true }; },
+  });
+  const admitted = router.handle({ jsonrpc: '2.0', id: 'before', method: 'thread/read', params: { id: 't' } });
+  await Promise.resolve();
+  assert.equal(router.activeCount, 1);
+  const closing = router.beginClose();
+  const refused = await router.handle({ jsonrpc: '2.0', id: 'after', method: 'thread/read', params: { id: 't' } });
+  assert.equal(refused.error.code, -32000);
+  assert.deepEqual(calls, ['thread/read']);
+  release();
+  assert.equal((await admitted).result.ok, true);
+  assert.deepEqual(await closing, {
+    confirmed: true, admitted: 1, drained: 1,
+    detail: 'native RPC admissions frozen and admitted requests drained',
+  });
+  assert.equal(router.activeCount, 0);
+});
+
+test('beginClose reports an undrained request when its shutdown signal aborts', async () => {
+  const router = createNativeRpcRouter({ rpc: async () => new Promise(() => {}) });
+  void router.handle({ jsonrpc: '2.0', id: 'hang', method: 'thread/read', params: { id: 't' } });
+  await Promise.resolve();
+  const controller = new AbortController();
+  const closing = router.beginClose({ signal: controller.signal });
+  controller.abort();
+  const receipt = await closing;
+  assert.equal(receipt.confirmed, false);
+  assert.equal(receipt.admitted, 1);
+  assert.match(receipt.detail, /remained in flight/);
 });
 
 test('native router rejects unsafe params before daemon dispatch', async () => {

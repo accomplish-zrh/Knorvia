@@ -76,10 +76,10 @@ test('ZIP extraction rejects traversal, duplicate case names and links', async (
   for (const name of ['../file', '/file', 'C:/file', 'x\\file', 'nul.txt', 'a./b']) assert.throws(() => relative(name));
 });
 test('fixed GitHub commit download uses the same inspected ZIP content', async () => {
-  const f = fixture(), file = path.join(f.home, 'github.zip'); await zipFile(file, [['repo-commit/skill/SKILL.md', skill('github-sample')]]);
+  const f = fixture(), file = path.join(f.home, 'github.zip'); await zipFile(file, [['repo-commit/SKILL.md', skill('github-sample')]]);
   let observed;
   const manager = createExtensionManager({ home: path.join(f.home, 'github-home'), rpc: f.rpc, fetchImpl: async (url, options) => { observed = { url, options }; return new Response(fs.readFileSync(file), { status: 200 }); } });
-  const source = { type: 'github', repository: 'fixture/repository', commit: 'a'.repeat(40), subdirectory: 'skill' };
+  const source = { type: 'github', repository: 'fixture/repository', commit: 'a'.repeat(40) };
   const inspection = await manager.handlers['extension/inspect']({ source });
   const entry = await manager.handlers['extension/install']({ source, expectedSha256: inspection.sha256 }); assert.equal(entry.name, 'github-sample'); assert.match(observed.url, /^https:\/\/codeload.github.com\//); assert.equal(observed.options.redirect, 'error');
   await assert.rejects(manager.handlers['extension/inspect']({ source: { ...source, commit: 'main' } }));
@@ -122,4 +122,163 @@ test('provider switching awaits extension restoration on success and rollback, b
   assert.deepEqual(await handlers['connection/update']({}), { ready: true }); assert.deepEqual(events, ['switched', 'restored']);
   await assert.rejects(handlers['connection/provider/activate']({}), /candidate failed/); assert.deepEqual(events.slice(-2), ['rolled-back', 'restored']);
   runtime.connectionUpdate = async () => ({ ready: true }); await handlers['connection/update']({}); assert.equal(events.length, 4);
+});
+
+// ---- C02 nightshift additions: multi-instance ownership, CAS, recovery ----
+
+const { spawn } = require('node:child_process');
+async function untilC(read, label, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const value = await read();
+    if (value) return value;
+    if (Date.now() > deadline) throw new Error(`Timed out: ${label}`);
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+}
+
+test('a stale sibling instance is refused by revision CAS instead of overwriting the winner', async () => {
+  const f = fixture(); fs.writeFileSync(path.join(f.sourceDir, 'SKILL.md'), skill('cas'));
+  const entry = await f.install();
+  const staleRevision = entry.revision;
+  const sibling = createExtensionManager({ home: f.home, rpc: f.rpc });
+  // The sibling re-reads the shared catalog under the lock and wins first.
+  await sibling.handlers['extension/enable']({ id: entry.id, revision: staleRevision, enabled: true });
+  // This manager still holds the pre-update revision and must be refused...
+  await assert.rejects(
+    f.call('extension/enable', { id: entry.id, revision: staleRevision, enabled: false }),
+    e => e.rpc.code === -32005,
+  );
+  // ...the sibling's committed change stays intact, visible after refresh...
+  const view = await f.call('extension/list');
+  assert.equal(view.entries[0].enabled, true);
+  assert.equal(view.entries[0].revision, staleRevision + 1);
+  // ...and a retry with the refreshed revision succeeds.
+  await f.call('extension/enable', { id: entry.id, revision: view.entries[0].revision, enabled: false });
+  assert.equal(fs.existsSync(path.join(f.home, 'extensions', 'catalog.lock')), false, 'lock must be released after every transaction');
+});
+
+test('two instances installing different extensions under the same Home keep both entries', async () => {
+  const f = fixture(); fs.writeFileSync(path.join(f.sourceDir, 'SKILL.md'), skill('dual'));
+  let releaseGate = null;
+  const gatedRpc = async (method, p) => {
+    if (method === 'skills/list' && releaseGate === 'armed') { releaseGate = 'held'; await new Promise(resolve => { globalThis.__c02gate = resolve; }); releaseGate = 'done'; }
+    return f.rpc(method, p);
+  };
+  const managerA = createExtensionManager({ home: f.home, rpc: gatedRpc });
+  const managerB = createExtensionManager({ home: f.home, rpc: f.rpc });
+  const installWith = async manager => {
+    const inspected = await manager.handlers['extension/inspect']({ source: f.source });
+    return manager.handlers['extension/install']({ source: f.source, expectedSha256: inspected.sha256 });
+  };
+  const entryA = await installWith(managerA); // installs stay outside the gate
+  releaseGate = 'armed';
+  // A's enable holds the cross-instance lock while gated inside setActive.
+  const pendingA = managerA.handlers['extension/enable']({ id: entryA.id, revision: entryA.revision, enabled: true });
+  await untilC(() => releaseGate === 'held', 'A gated inside its locked transition');
+  const pendingB = installWith(managerB);
+  await new Promise(resolve => setTimeout(resolve, 300)); // B is blocked on the live lock
+  globalThis.__c02gate();
+  const [enabledA, entryB] = await Promise.all([pendingA, pendingB]);
+  assert.equal(enabledA.enabled, true);
+  assert.notEqual(enabledA.id, entryB.id);
+  const onDisk = JSON.parse(fs.readFileSync(path.join(f.home, 'extensions', 'catalog.json'), 'utf8'));
+  assert.equal(onDisk.entries.length, 2, 'both sibling installs must survive; neither may overwrite the other');
+  assert.deepEqual(onDisk.entries.map(e => e.id).sort(), [enabledA.id, entryB.id].sort());
+  assert.equal(onDisk.entries.find(e => e.id === enabledA.id).enabled, true);
+  assert.equal(fs.existsSync(path.join(f.home, 'extensions', 'catalog.lock')), false);
+});
+
+test('a live sibling lock is respected, reported, and retried after it finishes', async () => {
+  const f = fixture(); fs.writeFileSync(path.join(f.sourceDir, 'SKILL.md'), skill('live-lock'));
+  let releaseGate = null;
+  const gatedRpc = async (method, p) => {
+    if (method === 'skills/list' && releaseGate === 'armed') { releaseGate = 'held'; await new Promise(resolve => { globalThis.__c02gate2 = resolve; }); releaseGate = 'done'; }
+    return f.rpc(method, p);
+  };
+  const managerA = createExtensionManager({ home: f.home, rpc: gatedRpc });
+  const installWith = async manager => {
+    const inspected = await manager.handlers['extension/inspect']({ source: f.source });
+    return manager.handlers['extension/install']({ source: f.source, expectedSha256: inspected.sha256 });
+  };
+  const entry = await installWith(managerA);
+  releaseGate = 'armed';
+  const pendingA = managerA.handlers['extension/enable']({ id: entry.id, revision: entry.revision, enabled: true });
+  await untilC(() => releaseGate === 'held', 'A gated while holding the lock');
+  const sibling = createExtensionManager({ home: f.home, rpc: f.rpc, lockTimeoutMs: 800 });
+  await assert.rejects(
+    sibling.handlers['extension/enable']({ id: entry.id, revision: entry.revision, enabled: true }),
+    e => { assert.equal(e.rpc.code, -32095); assert.match(e.rpc.message, /extension store lock/); return true; },
+  );
+  globalThis.__c02gate2();
+  await pendingA;
+  const view = await sibling.handlers['extension/list']();
+  assert.equal(view.entries[0].enabled, true);
+  await sibling.handlers['extension/enable']({ id: entry.id, revision: view.entries[0].revision, enabled: false });
+});
+
+test('a crashed holder lock is stolen and its interrupted enable is recovered by a sibling', async () => {
+  const f = fixture(); fs.writeFileSync(path.join(f.sourceDir, 'SKILL.md'), skill('crash-recovery'));
+  const home = f.home, readyFile = path.join(home, 'crash-ready.txt');
+  const childScript = path.join(home, 'crash-child.cjs');
+  fs.writeFileSync(childScript, [
+    `const { createExtensionManager } = require(${JSON.stringify(path.resolve(__dirname, '../extension-manager.js'))});`,
+    'const fs = require("node:fs");',
+    'const path = require("node:path");',
+    'const home = process.argv[2], sourceDir = process.argv[3], readyFile = process.argv[4];',
+    'const rpc = async (method, p) => {',
+    '  if (method === "workspace/path/resolve") { const target = path.join(sourceDir, p.path); return { workspace: { id: "fixture", cwd: sourceDir }, absolutePath: target, kind: fs.statSync(target).isDirectory() ? "directory" : "file" }; }',
+    '  if (method === "skills/list") { fs.writeFileSync(readyFile, String(process.pid)); return new Promise(() => {}); }',
+    '  return { ok: true };',
+    '};',
+    '(async () => {',
+    '  const manager = createExtensionManager({ home, rpc });',
+    '  const source = { type: "local", workspaceId: "fixture", path: "" };',
+    '  const inspected = await manager.handlers["extension/inspect"]({ source });',
+    '  const entry = await manager.handlers["extension/install"]({ source, expectedSha256: inspected.sha256 });',
+    '  await manager.handlers["extension/enable"]({ id: entry.id, revision: entry.revision, enabled: true });',
+    '})().catch(() => process.exit(1));',
+  ].join('\n'));
+  const child = spawn(process.execPath, [childScript, home, f.sourceDir, readyFile], { shell: false, stdio: 'ignore' });
+  try {
+    const holderPid = Number(await untilC(async () => { try { return fs.readFileSync(readyFile, 'utf8'); } catch { return null; } }, 'crash child gated mid-enable'));
+    const journalFile = path.join(home, 'extensions', 'pending-transition.json');
+    await untilC(() => fs.existsSync(journalFile), 'interrupted journal written');
+    child.kill('SIGKILL');
+    await untilC(async () => { try { process.kill(holderPid, 0); return false; } catch { return true; } }, 'crash child is dead');
+    // The dead holder's lock is stolen immediately; recovery reconciles the
+    // interrupted enable against the committed catalog.
+    const recovered = createExtensionManager({ home, rpc: f.rpc, lockTimeoutMs: 30_000 });
+    const result = await recovered.restore();
+    assert.equal(result.restored, true);
+    assert.equal(fs.existsSync(journalFile), false, 'recovered journal must be cleared');
+    assert.equal(f.loaded.length, 0, 'the interrupted activation must not stay active');
+    const view = await recovered.handlers['extension/list']();
+    assert.equal(view.entries[0].enabled, false, 'catalog keeps the last committed (disabled) state');
+    assert.equal(view.entries[0].revision, 1);
+    assert.ok(fs.existsSync(path.join(home, 'extensions', 'marketplaces', view.entries[0].id, 'packages', view.entries[0].activeVersion, 'plugin')), 'installed package is preserved');
+    // The store is usable again for a normal change after recovery.
+    const entry = view.entries[0];
+    await recovered.handlers['extension/enable']({ id: entry.id, revision: entry.revision, enabled: true });
+    assert.equal(f.loaded.length, 1);
+  } finally {
+    try { child.kill('SIGKILL'); } catch { /* already dead */ }
+  }
+});
+
+test('a sibling cannot disable an extension whose active skill projection has user edits', async () => {
+  const f = fixture(); fs.writeFileSync(path.join(f.sourceDir, 'SKILL.md'), skill('protected-cross'));
+  const entry = await f.install();
+  await f.call('extension/enable', { id: entry.id, revision: entry.revision, enabled: true });
+  const sibling = createExtensionManager({ home: f.home, rpc: f.rpc });
+  const view = await sibling.handlers['extension/list']();
+  const projection = path.join(f.home, 'state', 'kernel', 'skills', `knorvia-${entry.id}-0`, 'SKILL.md');
+  fs.appendFileSync(projection, '\nuser edit from the field');
+  await assert.rejects(
+    sibling.handlers['extension/enable']({ id: entry.id, revision: view.entries[0].revision, enabled: false }),
+    e => { assert.ok([-32005, -32094].includes(e.rpc.code), `protection error expected, got ${e.rpc.code}`); return true; },
+  );
+  assert.match(fs.readFileSync(projection, 'utf8'), /user edit from the field/);
+  const onDisk = JSON.parse(fs.readFileSync(path.join(f.home, 'extensions', 'catalog.json'), 'utf8'));
+  assert.equal(onDisk.entries[0].enabled, true, 'the failed sibling transaction must not change the catalog');
 });

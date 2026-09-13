@@ -94,12 +94,9 @@ async def _migrate(
                 migrated_sessions += 1
                 threads = session_threads(session, ws_id)
                 for thread in threads:
-                    replay = session.rpc(
-                        "event/replay", {"streamId": thread["id"], "afterSeq": 0}
-                    )
                     migrated_messages += sum(
                         1
-                        for e in replay.get("events") or []
+                        for e in session.iter_replay_events(thread["id"])
                         if e.get("kind") == "message"
                     )
 

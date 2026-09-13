@@ -2,9 +2,10 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useRouter } from "next/navigation";
-import { ArrowLeft, ArrowUpRight, Check, ChevronRight, File, FileCode2, Folder, FolderGit2, FolderOpen, GitBranch, GitCompareArrows, Link2, Loader2, Plus, RefreshCw, Search, Sparkles, X } from "lucide-react";
-import { appendFileReferences, fileSize, parseUnifiedDiff, type DirectoryPage, type GitDiff, type GitFile, type GitStatus, type ProjectFile, type ProjectScope } from "@/lib/native-project-context";
+import { ArrowLeft, ArrowUpRight, Check, ChevronRight, File, FileCode2, FileSearch, Folder, FolderGit2, FolderOpen, GitBranch, GitCompareArrows, Link2, Loader2, Plus, RefreshCw, Search, Sparkles, X } from "lucide-react";
+import { addProjectContextFile, fileSize, mergeDirectoryPage, parseUnifiedDiff, scanDirectoryPages, type DirectoryPage, type GitDiff, type GitFile, type GitStatus, type ProjectFile, type ProjectScope } from "@/lib/native-project-context";
 import { errorText, useWorkbench } from "./NativeWorkbenchProvider";
+import { ProjectSearch } from "./ProjectSearch";
 import { WorktreeManager } from "./WorktreeManager";
 
 type Mode = "files" | "changes";
@@ -45,6 +46,7 @@ export function ProjectExplorer({ scope, mode, onModeChange, onClose, onUseFile,
   const [readError, setReadError] = useState("");
   const [revision, setRevision] = useState(0);
   const [reviewing, setReviewing] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
   const [capabilities, setCapabilities] = useState({ openPath: false, revealPath: false });
   const readGeneration = useRef(0);
   const workspaceId = scope.workspaceId, threadId = scope.threadId;
@@ -88,8 +90,45 @@ export function ProjectExplorer({ scope, mode, onModeChange, onClose, onUseFile,
     setMore(true);
     try {
       const next = await request<DirectoryPage>("workspace/files/list", { ...params, path: folder, cursor: directory.nextCursor, limit: 200 });
-      setDirectory(current => current?.path === next.path ? { ...next, entries: [...new Map([...current.entries, ...next.entries].map(entry => [entry.path, entry])).values()] } : current);
+      // Scope-safe merge: a stale page from another workspace or folder with
+      // the same relative path can never mix into the current listing.
+      const merged = mergeDirectoryPage(directory, next);
+      if (merged) setDirectory(merged);
     } catch (error) { setLocalError(errorText(error)); } finally { setMore(false); }
+  };
+  // B08: a bounded "keep scanning" run for the current directory. Loading is
+  // page-wise with a hard bound, can be cancelled, stops at the first new
+  // match, and a scope change mid-scan discards the outcome instead of
+  // merging another project's or folder's page.
+  const [scan, setScan] = useState({ running: false, cancelled: false, staleScope: false, matched: false });
+  const scanCancel = useRef(false);
+  const scopeToken = `${workspaceId ?? threadId ?? ""}:${folder}`;
+  const scopeTokenRef = useRef(scopeToken);
+  scopeTokenRef.current = scopeToken;
+  useEffect(() => { setScan({ running: false, cancelled: false, staleScope: false, matched: false }); }, [scopeToken]);
+  const cancelScan = () => { scanCancel.current = true; };
+  const continueScan = async () => {
+    if (!directory?.nextCursor || scan.running) return;
+    const token = scopeTokenRef.current;
+    scanCancel.current = false;
+    setScan({ running: true, cancelled: false, staleScope: false, matched: false });
+    try {
+      const outcome = await scanDirectoryPages(
+        async cursor => await request<DirectoryPage>("workspace/files/list", { ...params, path: folder, cursor, limit: 200 }),
+        directory,
+        {
+          maxPages: 10,
+          isCancelled: () => scanCancel.current || scopeTokenRef.current !== token,
+          matches: query.trim() ? (entry => entry.name.toLowerCase().includes(query.trim().toLowerCase())) : undefined,
+        },
+      );
+      const cancelledByScope = scopeTokenRef.current !== token;
+      if (!cancelledByScope && outcome.directory) setDirectory(outcome.directory);
+      if (!cancelledByScope) setScan({ running: false, cancelled: outcome.cancelled, staleScope: outcome.staleScope, matched: outcome.matched });
+    } catch (error) {
+      setLocalError(errorText(error));
+      if (scopeTokenRef.current === token) setScan(current => ({ ...current, running: false }));
+    }
   };
   const reveal = async (path: string, open: boolean) => {
     try { await request(open ? "desktop/open-path" : "desktop/reveal-path", { ...params, path }); }
@@ -111,12 +150,18 @@ export function ProjectExplorer({ scope, mode, onModeChange, onClose, onUseFile,
   const currentPath = mode === "files" ? selectedFile : selection?.path;
   const crumbs = folder.split("/").filter(Boolean);
   const entries = directory?.entries.filter(entry => entry.name.toLowerCase().includes(query.toLowerCase())) ?? [];
+  const locateFromSearch = (path: string) => {
+    const parts = path.split("/");
+    parts.pop();
+    chooseFolder(parts.join("/"));
+    setSelectedFile(path);
+  };
 
   return <section className={`nw-explorer ${compact ? "is-compact" : ""} ${onPreviewFile && mode === "files" ? "is-picker" : ""}`} aria-label={t("项目文件与改动", "Project files and changes")}>
     <div className="nw-explorer-heading"><div className="nw-tabs"><button className={mode === "files" ? "is-active" : ""} onClick={() => onModeChange("files")}><FolderOpen size={14} />{t("文件", "Files")}</button><button className={mode === "changes" ? "is-active" : ""} onClick={() => onModeChange("changes")}><GitCompareArrows size={14} />{t("改动", "Changes")}</button></div><div><button className="nw-icon" onClick={() => setRevision(value => value + 1)} aria-label={t("刷新项目内容", "Refresh project contents")}><RefreshCw size={15} /></button>{onClose && <button className="nw-icon" onClick={onClose} aria-label={t("关闭项目面板", "Close project panel")}><X size={16} /></button>}</div></div>
     {error ? <InlineFailure error={error} retry={() => setRevision(value => value + 1)} /> : loading ? <div className="nw-file-empty"><Loader2 size={20} className="nw-spin" /><span>{t("正在读取项目…", "Reading project…")}</span></div> : mode === "changes" && !git?.available ? <div className="nw-file-empty"><FolderOpen size={26} /><strong>{t("这个文件夹未使用 Git", "This folder does not use Git")}</strong><p>{t("你仍然可以查看文件并在项目中开展任务。", "You can still explore its files and work on tasks.")}</p><button className="nw-button" onClick={() => onModeChange("files")}>{t("查看文件", "Browse files")}</button></div> : <div className={`nw-explorer-body ${currentPath ? "has-file" : ""}`}>
       <div className="nw-file-list">
-        {mode === "files" ? <><div className="nw-file-breadcrumb"><button onClick={() => { chooseFolder(""); setQuery(""); }} aria-label={t("项目根目录", "Project root")}><Folder size={13} /></button>{crumbs.map((part, index) => <span key={index}><ChevronRight size={10} /><button onClick={() => { chooseFolder(crumbs.slice(0, index + 1).join("/")); setQuery(""); }}>{part}</button></span>)}</div><label className="nw-file-search"><Search size={13} /><input aria-label={t("筛选当前文件夹", "Filter this folder")} value={query} onChange={event => setQuery(event.target.value)} placeholder={t("查找文件…", "Find a file…")} /></label>{folder && <button className="nw-file-row nw-file-up" onClick={() => { chooseFolder(crumbs.slice(0, -1).join("/")); setQuery(""); }}><ArrowLeft size={13} /><span>{t("上一级", "Parent folder")}</span></button>}{entries.map(entry => <button key={entry.path} className={`nw-file-row ${selectedFile === entry.path ? "is-active" : ""}`} title={entry.path} onClick={() => { if (entry.kind === "directory") { chooseFolder(entry.path); setQuery(""); } else if (onPreviewFile) onPreviewFile(entry.path); else setSelectedFile(entry.path); }}>{entry.kind === "directory" ? <Folder size={14} /> : entry.kind === "symlink" ? <Link2 size={14} /> : <FileCode2 size={14} />}<span>{entry.name}</span>{entry.kind === "directory" && <ChevronRight size={12} />}</button>)}{!entries.length && <p className="nw-empty-copy">{query ? t("没有匹配的文件", "No matching files") : t("文件夹为空", "This folder is empty")}</p>}{directory?.nextCursor && <button className="nw-load-more" disabled={more} onClick={() => void loadMore()}>{more ? <Loader2 size={13} className="nw-spin" /> : null}{t("加载更多文件", "Load more files")}</button>}</> : <><div className="nw-git-branch"><GitBranch size={14} /><span>{git?.branch || t("分离的 HEAD", "Detached HEAD")}</span></div>{changeGroups.map(group => group.entries.length > 0 && <div className="nw-change-group" key={group.label}><h3>{group.label}<span>{group.entries.length}</span></h3>{group.entries.map(entry => <button key={entry.path} title={entry.oldPath ? `${entry.oldPath} → ${entry.path}` : entry.path} className={`nw-file-row ${selection?.path === entry.path && selection?.staged === group.staged ? "is-active" : ""}`} onClick={() => setSelection({ path: entry.path, staged: group.staged })}><FileCode2 size={14} /><span>{entry.path}</span><code className={`nw-git-status ${entry.status.includes("?") || entry.status.includes("A") ? "is-new" : ""}`}>{entry.status.trim()}</code></button>)}</div>)}{git?.clean && <div className="nw-file-empty nw-clean-state"><Check size={20} /><p>{t("工作目录干净", "Working tree clean")}</p></div>}{git && !git.clean && <button className="nw-review-button" onClick={() => void review()} disabled={reviewing}>{reviewing ? <Loader2 className="nw-spin" size={14} /> : <Sparkles size={14} />}{t("让助手审阅", "Ask for a review")}</button>}</>}
+        {mode === "files" ? <>{searchOpen && <ProjectSearch scope={scope} onUseFile={onUseFile} onLocate={locateFromSearch} onClose={() => setSearchOpen(false)} />}<div className="nw-file-breadcrumb"><button onClick={() => { chooseFolder(""); setQuery(""); }} aria-label={t("项目根目录", "Project root")}><Folder size={13} /></button>{crumbs.map((part, index) => <span key={index}><ChevronRight size={10} /><button onClick={() => { chooseFolder(crumbs.slice(0, index + 1).join("/")); setQuery(""); }}>{part}</button></span>)}</div><button className={`nw-icon ${searchOpen ? "is-active" : ""}`} aria-pressed={searchOpen} onClick={() => setSearchOpen(value => !value)} aria-label={t("全项目搜索", "Search the project")} title={t("全项目搜索", "Search the project")}><FileSearch size={13} /></button><label className="nw-file-search"><Search size={13} /><input aria-label={t("筛选当前文件夹", "Filter this folder")} value={query} onChange={event => setQuery(event.target.value)} placeholder={t("查找文件…", "Find a file…")} /></label>{folder && <button className="nw-file-row nw-file-up" onClick={() => { chooseFolder(crumbs.slice(0, -1).join("/")); setQuery(""); }}><ArrowLeft size={13} /><span>{t("上一级", "Parent folder")}</span></button>}{entries.map(entry => <button key={entry.path} className={`nw-file-row ${selectedFile === entry.path ? "is-active" : ""}`} title={entry.path} onClick={() => { if (entry.kind === "directory") { chooseFolder(entry.path); setQuery(""); } else if (onPreviewFile) onPreviewFile(entry.path); else setSelectedFile(entry.path); }}>{entry.kind === "directory" ? <Folder size={14} /> : entry.kind === "symlink" ? <Link2 size={14} /> : <FileCode2 size={14} />}<span>{entry.name}</span>{entry.kind === "directory" && <ChevronRight size={12} />}</button>)}{directory?.nextCursor && query ? <div className="nw-dir-scan" role="status"><p>{t(`已扫描前 ${directory.entries.length} 项，还没有匹配；这个目录还有更多未读取。`, `Scanned the first ${directory.entries.length} entries with no match yet; this folder has more.`)}</p><div>{scan.running ? <button className="nw-button" onClick={cancelScan}>{t("停止", "Stop")}</button> : <button className="nw-button" onClick={() => void continueScan()}>{scan.matched ? t("继续查找其他匹配", "Keep scanning for more") : t("继续在当前目录查找", "Keep scanning this folder")}</button>}<button className="nw-button" onClick={() => setSearchOpen(true)}>{t("用全项目搜索", "Search the whole project")}</button></div>{scan.cancelled && <p className="nw-dir-scan-note">{t("已停止；已扫描的内容保留，不能据此判断目录里没有匹配。", "Stopped; scanned entries remain, and this does not prove the folder has no match.")}</p>}{scan.staleScope && <p className="nw-dir-scan-note">{t("结果来自旧的范围，已丢弃；请重新打开目录再试。", "A page from a stale scope was dropped; reopen the folder and try again.")}</p>}</div> : !entries.length && <p className="nw-empty-copy">{query ? t("没有匹配的文件", "No matching files") : t("文件夹为空", "This folder is empty")}</p>}{directory?.nextCursor && <button className="nw-load-more" disabled={more} onClick={() => void loadMore()}>{more ? <Loader2 size={13} className="nw-spin" /> : null}{t("加载更多文件", "Load more files")}</button>}{query && directory?.nextCursor && <p className="nw-dir-scan-note" role="note">{t(`当前匹配基于已扫描的 ${directory.entries.length} 项；这个目录还有未读取的文件。`, `Matches cover the first ${directory.entries.length} scanned entries; more files remain unread.`)}</p>}</> : <><div className="nw-git-branch"><GitBranch size={14} /><span>{git?.branch || t("分离的 HEAD", "Detached HEAD")}</span></div>{changeGroups.map(group => group.entries.length > 0 && <div className="nw-change-group" key={group.label}><h3>{group.label}<span>{group.entries.length}</span></h3>{group.entries.map(entry => <button key={entry.path} title={entry.oldPath ? `${entry.oldPath} → ${entry.path}` : entry.path} className={`nw-file-row ${selection?.path === entry.path && selection?.staged === group.staged ? "is-active" : ""}`} onClick={() => setSelection({ path: entry.path, staged: group.staged })}><FileCode2 size={14} /><span>{entry.path}</span><code className={`nw-git-status ${entry.status.includes("?") || entry.status.includes("A") ? "is-new" : ""}`}>{entry.status.trim()}</code></button>)}</div>)}{git?.clean && <div className="nw-file-empty nw-clean-state"><Check size={20} /><p>{t("工作目录干净", "Working tree clean")}</p></div>}{git && !git.clean && <button className="nw-review-button" onClick={() => void review()} disabled={reviewing}>{reviewing ? <Loader2 className="nw-spin" size={14} /> : <Sparkles size={14} />}{t("让助手审阅", "Ask for a review")}</button>}</>}
       </div>
       <div className="nw-file-preview">{currentPath ? <><div className="nw-file-toolbar"><button className="nw-icon nw-file-back" onClick={() => mode === "files" ? setSelectedFile("") : setSelection(undefined)} aria-label={t("返回文件列表", "Back to file list")}><ArrowLeft size={14} /></button><span title={currentPath}>{currentPath}</span><div>{mode === "files" && <button className="nw-icon" onClick={() => onUseFile(currentPath)} aria-label={t("加入任务", "Add to task")} title={t("加入任务", "Add to task")}><Plus size={15} /></button>}{capabilities.revealPath && <button className="nw-icon" onClick={() => void reveal(currentPath, false)} aria-label={t("在文件夹中显示", "Show in folder")} title={t("在文件夹中显示", "Show in folder")}><FolderOpen size={15} /></button>}{capabilities.openPath && <button className="nw-icon" onClick={() => void reveal(currentPath, true)} aria-label={t("在本地打开文件", "Open local file")} title={t("在本地打开文件", "Open local file")}><ArrowUpRight size={15} /></button>}</div></div>{readError ? <InlineFailure error={readError} /> : reading ? <div className="nw-file-empty"><Loader2 className="nw-spin" size={20} /></div> : mode === "changes" && diff ? <div className="nw-file-scroll"><DiffPreview value={diff} /></div> : file?.kind === "binary" ? <div className="nw-file-empty"><File size={28} /><strong>{t("此文件需要专用查看器", "This file needs its own viewer")}</strong><p>{fileSize(file.size)} · {t("可把文件路径加入任务，让助手处理。", "Add its path to the task for the agent to work with it.")}</p><button className="nw-button" onClick={() => onUseFile(file.path)}><Plus size={14} />{t("加入任务", "Add to task")}</button></div> : file ? <><div className="nw-file-scroll"><div className="nw-source-code" aria-label={t("文件内容", "File contents")}>{(file.content ?? "").split("\n").map((line, index) => <div key={index}><span className="nw-line-number">{index + 1}</span><code>{line || " "}</code></div>)}</div></div><div className="nw-file-footer"><span>{fileSize(file.size)}</span><span>{file.truncated ? t("显示前一部分内容", "Showing the beginning of the file") : "UTF-8"}</span></div></> : null}</> : <div className="nw-file-empty"><span className="nw-file-empty-icon">{mode === "files" ? <FileCode2 size={25} /> : <GitCompareArrows size={25} />}</span><strong>{mode === "files" ? t("项目就在手边", "Your project, close at hand") : t("清楚看见每一处改动", "See what changed")}</strong><p>{mode === "files" ? t("选择文件查看内容，或把它加入任务上下文。", "Choose a file to read it or add it to the task.") : t("选择文件，查看新增、删除和修改的内容。", "Choose a file to inspect its additions, deletions, and edits.")}</p></div>}</div>
     </div>}
@@ -130,11 +175,14 @@ export function ProjectView({ id }: { id: string }) {
   const [mode, setMode] = useState<Mode>("files");
   const [worktree, setWorktree] = useState(false);
   useEffect(() => { if (workspace) setWorkspaceId(workspace.id); }, [workspace, setWorkspaceId]);
+  // B04: adding a file records it in the project's structured task context
+  // and stays in the explorer, so several files can be picked in a row. The
+  // chips appear on the new-task view and task pages, never inside the draft
+  // text, and are cleaned up per file after a successful send.
   const useFile = useCallback((path: string) => {
-    try { const key = "knorvia-native-draft:new"; localStorage.setItem(key, appendFileReferences(localStorage.getItem(key) ?? "", [path])); }
-    catch { setNotice(t("无法保存文件引用，请手动添加文件路径。", "Could not save the file reference. Add the path manually.")); return; }
-    router.push("/workbench");
-  }, [router, setNotice, t]);
+    const list = addProjectContextFile(id, path);
+    setNotice(t(`已加入任务上下文（${list.length} 个文件）。在“新任务”中可查看并发送。`, `Added to the task context (${list.length} files). Review and send from "New task".`));
+  }, [id, setNotice, t]);
   if (!workspace) return <div className="nw-state-screen"><Loader2 size={20} className="nw-spin" /><p>{t("正在读取项目…", "Loading project…")}</p></div>;
   return <div className="nw-project-view"><div className="nw-project-page-heading"><div><h1><FolderGit2 size={23} />{workspace.title}</h1><p>{workspace.cwd || t("尚未选择本地文件夹", "No local folder selected")}</p></div><div><button className="nw-button" aria-pressed={worktree} onClick={() => setWorktree(value => !value)}><GitBranch size={15} />{t("独立工作目录", "Worktree")}</button><button className="nw-button nw-button-primary" onClick={() => router.push("/workbench")}><Plus size={15} />{t("新任务", "New task")}</button></div></div>{worktree ? <WorktreeManager key={id} workspaceId={id} /> : <ProjectExplorer key={id} scope={{ workspaceId: id }} mode={mode} onModeChange={setMode} onUseFile={useFile} />}</div>;
 }

@@ -349,6 +349,48 @@ export type NativeWorkspaceFileList = {
   truncated: boolean
 }
 
+export type NativeWorkspaceSearchMatch = {
+  path: string
+  name: string
+  kind: "file" | "symlink"
+  line?: number
+  column?: number
+  snippet?: string
+  matchCount?: number
+}
+
+export type NativeWorkspaceSearchCoverage = {
+  scannedFiles: number
+  scannedDirectories: number
+  matchedFiles: number
+  skippedBinary: number
+  skippedLarge: number
+  skippedSymlink: number
+  ignoredEntries: number
+  unreadable: number
+  bytesScanned: number
+  otherEntries: number
+}
+
+export type NativeWorkspaceSearchPage = {
+  workspace: { id: string; cwd: string }
+  searchId: string
+  query: { text: string; mode: "paths" | "content" | "both"; caseSensitive: boolean }
+  matches: NativeWorkspaceSearchMatch[]
+  page: { index: number; nextCursor?: string | null; done: boolean }
+  coverage: NativeWorkspaceSearchCoverage
+  matchedTotal: number
+  matchedLimitReached: boolean
+  scope: {
+    root?: string | null
+    followsSymlinks: boolean
+    skipsHiddenDirectories: boolean
+    alwaysSkippedDirectories: string[]
+    honoursRootGitignore: boolean
+    maxContentFileBytes: number
+  }
+}
+
 export type NativeWorkspaceFileRead = {
   workspace: { id: string; cwd: string }
   path: string
@@ -625,6 +667,8 @@ export type NativeMethodMap = {
   "workspace/path/resolve": { params: NativeParams & { workspaceId?: string; threadId?: string; path?: string }; result: NativeWorkspacePath }
   "workspace/files/list": { params: NativeParams & { workspaceId?: string; threadId?: string; path?: string; cursor?: string; limit?: number }; result: NativeWorkspaceFileList }
   "workspace/files/read": { params: NativeParams & { workspaceId?: string; threadId?: string; path: string; offset?: number; maxBytes?: number }; result: NativeWorkspaceFileRead }
+  "workspace/files/search": { params: NativeParams & { workspaceId?: string; threadId?: string; query: string; mode?: "paths" | "content" | "both"; maxResults?: number; caseSensitive?: boolean; searchId?: string; cursor?: string }; result: NativeWorkspaceSearchPage }
+  "workspace/files/search/cancel": { params: NativeParams & { searchId: string }; result: { cancelled: boolean; searchId: string } }
   "workspace/git/status": { params: NativeParams & { workspaceId?: string; threadId?: string }; result: NativeWorkspaceGitStatus }
   "workspace/git/diff": { params: NativeParams & { workspaceId?: string; threadId?: string; path: string; staged?: boolean; maxBytes?: number }; result: NativeWorkspaceGitDiff }
   "workspace/worktree/create": { params: NativeParams & { workspaceId?: string; threadId?: string; branch: string; baseRef?: string; title?: string }; result: NativeWorkspaceWorktree }
@@ -637,6 +681,11 @@ export type NativeMethodMap = {
   "thread/archive": { params: NativeParams & { id: string }; result: NativeThread }
   "thread/unarchive": { params: NativeParams & { id: string }; result: NativeThread }
   "turn/start": { params: NativeTurnStartParams; result: NativeTurn | { turn: NativeTurn; items?: NativeItem[]; pendingApprovalId?: string | null; [field: string]: unknown } }
+  "turnQueue/read": { params: NativeParams & { threadId: string }; result: import("./native-message-queue").MessageQueue }
+  "turnQueue/enqueue": { params: NativeParams & { threadId: string; requestId: string; idempotencyKey: string; input: string; options: NativeParams }; result: import("./native-message-queue").MessageQueue }
+  "turnQueue/cancel": { params: NativeParams & { threadId: string; revision: number; messageId: string }; result: import("./native-message-queue").MessageQueue }
+  "turnQueue/pause": { params: NativeParams & { threadId: string; revision: number }; result: import("./native-message-queue").MessageQueue }
+  "turnQueue/resume": { params: NativeParams & { threadId: string; revision: number }; result: import("./native-message-queue").MessageQueue }
   "turn/read": { params: NativeParams & { id: string }; result: NativeTurn }
   "turn/steer": { params: NativeParams & { threadId: string; turnId: string; input: string; clientMessageId?: string }; result: { turnId: string; item: NativeItem } }
   "turn/interrupt": { params: NativeParams & { turnId: string }; result: NativeTurn }
@@ -705,6 +754,12 @@ export type NativeMethodMap = {
   "cliBackend/cancel": { params: NativeParams & { runId?: string }; result: { canceled: boolean; reason?: string; runId?: string; pid?: number } }
   "studio/content": { params: NativeParams & { id: string; index?: number; offset?: number }; result: { name: string; mime: string; size: number; sha256: string; base64: string; nextOffset: number | null } }
   "studio/library": { params: NativeParams & { id: string; index?: number; path?: string }; result: Record<string, unknown> }
+  // C19: scoped revocable media-preview capabilities. preview/read returns
+  // a loopback stream URL (instead of base64) for video/audio/PDF and large
+  // images when the media preview service is active; the renderer revokes
+  // on panel close or scope switch.
+  "preview/revoke": { params: NativeParams & { token: string }; result: { revoked: boolean } }
+  "preview/revokeScope": { params: NativeParams & { workspaceId?: string; threadId?: string }; result: { revoked: number } }
 }
 
 export type NativeMethod = keyof NativeMethodMap
@@ -756,4 +811,11 @@ export interface NativeClient {
   request<T = unknown>(method: string, params?: NativeParams): Promise<T>
   subscribe(listener: NativeNotificationListener): () => void
   onStateChange(listener: NativeConnectionListener): () => void
+}
+
+export type DesktopOpenThreadListener = (threadId: string) => void
+
+export interface DesktopNotificationsBridge {
+  setPreferences?(prefs: { enabled: boolean; completed: boolean; failed: boolean; cancelled: boolean; interrupted: boolean }): void
+  onOpenThread(callback: DesktopOpenThreadListener): () => void
 }

@@ -20,7 +20,7 @@ export function UnifiedLibraryView({ view = 'files' }: { view?: 'files' | 'outpu
   const header = useSyncExternalStore(subscribeHeader, getHeader, noHeader);
   const collections = <nav className="nl-collections" aria-label={t('资料库内容', 'Library collections')}>
       <Link href="/workbench/library" aria-current={view === 'files' ? 'page' : undefined}><FolderOpen size={16} />{t('我的资料', 'My files')}</Link>
-      <Link href="/workbench/library?view=outputs" aria-current={view === 'outputs' ? 'page' : undefined}><Layers size={16} />{t('本地产物', 'Local outputs')}</Link>
+      <Link href="/workbench/library?view=outputs" aria-current={view === 'outputs' ? 'page' : undefined}><Layers size={16} />{t('任务生成', 'From tasks')}</Link>
     </nav>;
   return <div className="nl-unified">
     {header && createPortal(collections, header)}

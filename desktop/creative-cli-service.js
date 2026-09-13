@@ -252,14 +252,20 @@ function createCreativeCliService({
     fs.unlinkSync(discoveryFile);
   }
 
+  const activeRequests = new Set();
+  let closing = false;
   async function dispatch(command, params) {
+    if (closing) throw commandError('temporary', 'Creative CLI is shutting down');
     if (typeof command !== 'string' || !command || (params !== undefined && (!params || typeof params !== 'object' || Array.isArray(params)))) throw commandError('usage', '命令需要名称和 JSON 对象参数');
     // Learning/catalog modules use the codebase's slash convention
     // (learning/sources); the CLI contract is dot-form, so normalize.
     const key = Object.hasOwn(COMMANDS, command) ? command : command.replaceAll('.', '/');
     const handler = Object.hasOwn(COMMANDS, key) ? COMMANDS[key] : null;
     if (!handler) throw commandError('usage', `未知命令 ${command}；用 schema 查看可用命令`);
-    return handler(params ?? {});
+    const operation = Promise.resolve().then(() => handler(params ?? {}));
+    activeRequests.add(operation);
+    try { return await operation; }
+    finally { activeRequests.delete(operation); }
   }
 
   const server = http.createServer(async (req, res) => {
@@ -293,10 +299,17 @@ function createCreativeCliService({
     return record;
   }
 
-  async function close() {
+  async function close(context = {}) {
+    closing = true;
     try { removeDiscovery(); } catch {}
     server.closeAllConnections?.();
-    await new Promise(resolve => server.close(() => resolve()));
+    const serverClosed = new Promise(resolve => server.close(() => resolve()));
+    const drained = Promise.allSettled([serverClosed, ...activeRequests]).then(() => true);
+    if (!context.signal) { await drained; return { confirmed: true, ownedPids: [], detail: 'Creative CLI admissions frozen and requests drained' }; }
+    if (context.signal.aborted) return { confirmed: false, ownedPids: [], detail: `${activeRequests.size} Creative CLI request(s) remained in flight` };
+    const aborted = new Promise(resolve => context.signal.addEventListener('abort', () => resolve(false), { once: true }));
+    if (!await Promise.race([drained, aborted])) return { confirmed: false, ownedPids: [], detail: `${activeRequests.size} Creative CLI request(s) remained in flight` };
+    return { confirmed: true, ownedPids: [], detail: 'Creative CLI admissions frozen and requests drained' };
   }
 
   return { COMMANDS, dispatch, listen, close, get address() { return `http://127.0.0.1:${server.address()?.port}/creative-cli`; }, token, discoveryFile };

@@ -83,6 +83,12 @@
 .nw-decision-prompt > div { display: flex; align-items: center; gap: 10px; }
 .nw-decision-prompt > div:first-child { color: var(--nw-green); }
 .nw-compose-collapse { font-size: 12px; color: var(--nw-muted); margin-bottom: 10px; }
+.nw-steer-recovery { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; border: 1px solid var(--nw-line); background: var(--nw-soft); padding: 10px 14px; border-radius: 12px; font-size: 13px; color: var(--nw-muted); margin-bottom: 10px; }
+.nw-steer-recovery[data-phase="unknown"] { color: var(--nw-amber); }
+.nw-steer-recovery span { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.nw-recovery-banner > div { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.nw-recovery-banner strong { font-size: 13px; color: var(--nw-amber); }
+.nw-recovery-banner small { color: var(--nw-muted); overflow-wrap: anywhere; }
 .nw-agent-message .nw-markdown, .nw-user-message { font-size: 15px; line-height: 1.85; }
 .nw-user-message { max-width: 90%; overflow-wrap: anywhere; }
 .nw-tool summary { min-height: 40px; font-size: 12px; }
@@ -353,3 +359,38 @@
 }
 
 .nw-tool summary>.nw-tool-symbol{width:26px;height:26px;flex:0 0 26px;display:grid;place-items:center;overflow:visible;color:var(--nw-muted);border-radius:7px;background:var(--nw-bg)}.nw-thought summary>.nw-tool-symbol{background:transparent}.nw-tool summary>.nw-tool-state{display:flex;align-items:center;gap:5px;flex:0 0 auto;overflow:visible;font-size:10px}.nw-tool-state[data-tool-state=running]{color:var(--nw-ink)}.nw-tool-state[data-tool-state=failed]{color:var(--nw-error)}.nw-tool-state[data-tool-state=done]>span{display:none}.nw-tool-method{display:block;opacity:.65;font-size:10px;line-height:1.6}.nw-tool summary>svg:last-child{flex-shrink:0}.nw-tool summary:focus-visible{outline:2px solid var(--nw-ink);outline-offset:-2px;border-radius:7px}.nw-root[data-reduce-motion=true] .nw-tool-state .nw-spin{animation:none!important}@media(max-width:650px){.nw-tool summary{gap:7px;padding:9px 10px}.nw-tool summary>.nw-tool-symbol{width:22px;height:22px;flex-basis:22px}.nw-tool-state>span{display:none}}
+.nw-attention { position: relative; display: inline-flex; }
+.nw-attention-trigger { position: relative; }
+.nw-attention-trigger[data-has-attention] { color: var(--nw-amber); }
+.nw-attention-badge { position: absolute; top: -3px; right: -4px; min-width: 15px; height: 15px; padding: 0 3px; border-radius: 8px; background: var(--nw-amber); color: #fff; font-size: 9px; line-height: 15px; text-align: center; font-weight: 600; }
+.nw-attention-panel { position: absolute; right: 0; top: calc(100% + 8px); width: min(360px, calc(100vw - 24px)); max-height: min(480px, calc(100vh - 90px)); overflow-y: auto; background: var(--nw-surface); border: 1px solid var(--nw-line); border-radius: 14px; padding: 12px; box-shadow: 0 12px 32px color-mix(in srgb, #000 18%, transparent); display: grid; gap: 8px; z-index: 40; }
+.nw-attention-head { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }
+.nw-attention-head span { color: var(--nw-muted); font-size: 11px; }
+.nw-attention-note { color: var(--nw-muted); font-size: 11px; margin: 0; }
+.nw-attention-item { display: flex; align-items: center; gap: 10px; width: 100%; border: 1px solid var(--nw-line); border-radius: 10px; padding: 8px 10px; background: transparent; text-align: left; font-size: 12px; }
+.nw-attention-item:hover { background: var(--nw-hover); }
+.nw-attention-item-main { flex: 1; min-width: 0; display: grid; }
+.nw-attention-item-main strong { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nw-attention-item-main small { color: var(--nw-muted); font-size: 10px; }
+.nw-attention-empty { color: var(--nw-muted); font-size: 12px; margin: 0; }
+.nw-composer-foot-tools { display: inline-flex; align-items: center; gap: 4px; }
+.nw-suggestion-choice { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; border: 1px solid var(--nw-line); background: var(--nw-soft); border-radius: 12px; padding: 8px 12px; margin-bottom: 10px; font-size: 12px; color: var(--nw-muted); }
+.nw-draft-recovery { border: 1px solid var(--nw-line); background: var(--nw-soft); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; font-size: 12px; display: grid; gap: 8px; }
+.nw-draft-recovery-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.nw-draft-recovery-head strong { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; }
+.nw-draft-recovery-note { margin: 0; color: var(--nw-muted); }
+.nw-draft-recovery-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; max-height: 170px; overflow-y: auto; }
+.nw-draft-recovery-list li { display: flex; align-items: center; gap: 8px; }
+.nw-draft-recovery-preview { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--nw-muted); }
+.nw-draft-recovery-list time { color: var(--nw-muted); font-size: 10px; flex-shrink: 0; }
+.nw-recipe-toolbar { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-bottom: 8px; }
+.nw-recipe-search { flex: 1; min-width: 140px; font-size: 12px; }
+.nw-recipe-list { list-style: none; margin: 0; padding: 0; display: grid; gap: 6px; max-height: 320px; overflow-y: auto; }
+.nw-recipe-row { display: flex; align-items: center; gap: 8px; border: 1px solid var(--nw-line); border-radius: 10px; padding: 7px 9px; }
+.nw-recipe-main { flex: 1; min-width: 0; display: grid; }
+.nw-recipe-main small { color: var(--nw-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.nw-recipe-vars { border: 1px solid var(--nw-line); border-radius: 10px; padding: 8px 10px; display: grid; gap: 8px; }
+.nw-recipe-vars legend { font-size: 11px; color: var(--nw-muted); padding: 0 4px; }
+.nw-recipe-preview pre { max-height: 200px; overflow: auto; font-size: 12px; white-space: pre-wrap; background: var(--nw-soft); border-radius: 8px; padding: 8px 10px; }
+.nw-modal:has(.nw-recipe-preview, .nw-recipe-toolbar) { width: 640px; }
+.nw-modal:has(.nw-recipe-preview) .nw-dialog-actions { position: sticky; bottom: -28px; padding: 12px 0; background: var(--nw-popover); z-index: 1; flex-wrap: wrap; }

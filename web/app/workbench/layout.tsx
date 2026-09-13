@@ -1,5 +1,6 @@
 import { NativeWorkbenchProvider } from "@/components/native/NativeWorkbenchProvider";
 import { WorkbenchShell } from "@/components/native/WorkbenchShell";
+import { WorkbenchStyleSync } from "@/components/native/WorkbenchStyle";
 import "@/components/native/workbench.css";
 import "@/components/native/workspace-tools.css";
 import "@/components/native/brand-theme.css";
@@ -14,7 +15,9 @@ import "@/components/native/select-controls.css";
 import "@/components/native/component-finish.css";
 import "@/components/native/motion.css";
 import "@/components/native/background.css";
+import "@/components/native/workbench-style-choice.css";
+import "@/components/native/luminous.css";
 
 export default function WorkbenchLayout({ children }: { children: React.ReactNode }) {
-  return <NativeWorkbenchProvider><WorkbenchShell>{children}</WorkbenchShell></NativeWorkbenchProvider>;
+  return <NativeWorkbenchProvider><WorkbenchStyleSync /><WorkbenchShell>{children}</WorkbenchShell></NativeWorkbenchProvider>;
 }

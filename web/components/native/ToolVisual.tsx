@@ -1,11 +1,11 @@
 "use client";
 
-import { BookOpen, Brain, CalendarClock, ChartNoAxesColumn, Check, CircleAlert, CirclePause, FilePenLine, FileSpreadsheet, FileText, Film, FolderOpen, Globe, Hourglass, Image, Loader2, Network, Presentation, Search, Target, Terminal, Wrench, type LucideIcon } from 'lucide-react';
+import { BookOpen, Brain, CalendarClock, ChartNoAxesColumn, Check, CircleAlert, CirclePause, FilePenLine, FileSpreadsheet, FileText, Film, FolderOpen, Globe, Hourglass, Image, LayoutGrid, Loader2, Network, Presentation, Search, Target, Terminal, Wrench, type LucideIcon } from 'lucide-react';
 import { toolPresentation, type ToolCategory, type ToolState } from '@/lib/native-tool-presentation';
 import type { Item } from '@/lib/native-workbench-state';
 import { useWorkbench } from './NativeWorkbenchProvider';
 
-const icons: Record<ToolCategory, LucideIcon> = { terminal: Terminal, read: FileText, edit: FilePenLine, search: Search, browser: Globe, image: Image, video: Film, agent: Network, library: BookOpen, automation: CalendarClock, goal: Target, document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, usage: ChartNoAxesColumn, reasoning: Brain, folder: FolderOpen, tool: Wrench };
+const icons: Record<ToolCategory, LucideIcon> = { canvas: LayoutGrid, terminal: Terminal, read: FileText, edit: FilePenLine, search: Search, browser: Globe, image: Image, video: Film, agent: Network, library: BookOpen, automation: CalendarClock, goal: Target, document: FileText, spreadsheet: FileSpreadsheet, presentation: Presentation, usage: ChartNoAxesColumn, reasoning: Brain, folder: FolderOpen, tool: Wrench };
 export function ToolIcon({ item }: { item: Item }) {
   const { t } = useWorkbench(), presentation = toolPresentation(item), Icon = icons[presentation.category];
   return <span className="nw-tool-symbol" data-tool-category={presentation.category} data-tool-state={presentation.state} role="img" aria-label={t(presentation.zh, presentation.en)} title={t(presentation.zh, presentation.en)}><Icon size={16} strokeWidth={1.65} aria-hidden="true" /></span>;

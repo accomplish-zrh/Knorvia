@@ -6,12 +6,14 @@
 //! JSON files and JSONL streams are atomically rebuilt projections.
 
 mod media_jobs;
+mod message_queue;
+pub use message_queue::{MessageQueue, QueuedMessage};
 
 use std::collections::HashMap;
 #[cfg(unix)]
 use std::fs::File;
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak};
@@ -27,23 +29,43 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+mod artifact_catalog;
+mod automation_calendar;
+mod automation_index;
 mod automations;
 mod bots;
+pub mod checkpoint;
 mod durable;
+mod kernel_bindings;
+pub use artifact_catalog::{ArtifactCatalogPage, ArtifactCatalogQuery};
+#[cfg(test)]
+mod automation_index_tests;
+#[cfg(test)]
+mod checkpoint_bench;
+#[cfg(test)]
+mod checkpoint_tests;
 mod goal_execution;
+mod goal_runs;
+#[cfg(test)]
+mod goal_runs_tests;
 #[cfg(test)]
 mod goal_tests;
 mod goals;
 mod pagination;
-mod room_chat;
+mod replay_index;
 mod recovery;
+mod room_chat;
+mod room_send;
+mod usage_index;
+pub use usage_index::UsageSnapshot;
+pub use room_send::{RoomSendReceipt,RoomSendWork};
 mod thread_index;
 mod timeline_index;
 pub mod usage;
 // C-001/C-002 wiring (A-integrated): durable memory records and auth-link
 // registry. The modules own their semantics; this is the crate entry only.
-pub mod memory;
 pub mod auth_links;
+pub mod memory;
 #[cfg(test)]
 mod timeline_index_tests;
 pub use timeline_index::{ThreadActivity, ThreadHistory, TurnHistory};
@@ -53,19 +75,22 @@ mod turn_lifecycle;
 
 pub use automations::{
     Automation, AutomationRun, AutomationRunState, AutomationSchedule, AutomationStatus,
-    AutomationTrigger, AutomationUpdate, MAX_AUTOMATIONS_PER_HOME, epoch_millis,
+    AutomationTrigger, AutomationUpdate, MAX_AUTOMATIONS_PER_HOME, MisfirePolicy, epoch_millis,
 };
 pub use bots::{
-    BindingAction, BindingIdentity, BotProfile, ResolvedBinding, Room, RoomMember, SessionBinding,
-    SoulRevisionEntry, DEFAULT_BOT_ID, DEFAULT_KNORVIA_SOUL, MAX_GROUP_BOTS,
-};
-pub use room_chat::{
-    RoomMessage, RoomMessageInput, MAX_MESSAGES_RETURNED, MAX_TRANSFER_HOPS,
-    MAX_TRANSFERS_PER_CORRELATION,
+    BindingAction, BindingIdentity, BotProfile, DEFAULT_BOT_ID, DEFAULT_KNORVIA_SOUL,
+    MAX_GROUP_BOTS, ResolvedBinding, Room, RoomMember, SessionBinding, SoulRevisionEntry,
 };
 pub use durable::WorkspaceCwdUpdate;
 use durable::{EventDraft, ProjectionKind};
-pub use pagination::{EventPage, ItemPage};
+pub use pagination::{
+    DEFAULT_REPLAY_PAGE_BYTES, EventPage, EventReplayPage, ItemPage, MAX_REPLAY_PAGE_BYTES,
+};
+pub use room_chat::{
+    MAX_MESSAGES_RETURNED, MAX_TRANSFER_HOPS, MAX_TRANSFERS_PER_CORRELATION, RoomMessage,
+    RoomMessageInput,
+};
+use turn_lifecycle::system_resolution_item;
 pub use usage::UsageRecord;
 
 #[derive(Debug, thiserror::Error)]
@@ -177,9 +202,17 @@ static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 struct StoreLocks {
     mutation: Mutex<()>,
     journal: Mutex<()>,
+    /// Lines deserialized by bounded replay page reads (A08). Test and
+    /// operations code reads it to prove a late page stops parsing the
+    /// prefix instead of trusting elapsed time.
+    page_lines_parsed: AtomicU64,
+    page_bytes_read: AtomicU64,
+    replay_indexes: Mutex<replay_index::ReplayIndexes>,
+    usage_index: Mutex<usage_index::UsageIndex>,
     durable: Mutex<durable::DurableState>,
     thread_index: Mutex<thread_index::ThreadDirectoryIndex>,
     timeline_index: Mutex<timeline_index::TimelineDirectoryIndex>,
+    automation_index: Mutex<automation_index::AutomationRunIndex>,
 }
 
 static STORE_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Weak<StoreLocks>>>> = OnceLock::new();
@@ -267,6 +300,73 @@ struct IdempotencyRecord {
     /// attempt instead of discovering it by replaying.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     error: Option<String>,
+    /// Hash of the request payload (method params minus the key itself).
+    /// Recycling a key for a different payload is a typed conflict, never a
+    /// silent replay of the old result. Absent on pre-fingerprint records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    fingerprint: Option<String>,
+}
+
+/// Bounded keys: empty or oversized keys are a client bug, rejected before
+/// they reach the filesystem at all (the record path is hashed either way).
+const IDEMPOTENCY_KEY_MAX_CHARS: usize = 256;
+
+fn validate_idempotency_key(key: &str) -> Result<(), StoreError> {
+    if key.is_empty() {
+        return Err(invalid("idempotency key must not be empty"));
+    }
+    if key.chars().count() > IDEMPOTENCY_KEY_MAX_CHARS {
+        return Err(invalid(
+            "idempotency key exceeds 256 characters; use a shorter key",
+        ));
+    }
+    Ok(())
+}
+
+/// Empty string means "caller does not fingerprint" (legacy tests); records
+/// then carry None and any replay of the same key/method stays compatible.
+fn fingerprint_field(fingerprint: &str) -> Option<String> {
+    (!fingerprint.is_empty()).then(|| fingerprint.to_string())
+}
+
+/// Which keys can have LEGACY records in the pre-hash layout? The old build
+/// wrote `{key}.json` verbatim, so any key that formed a legal, safely
+/// locatable single filename there keeps its compat read — including dotted
+/// names like `client.request.1`. Everything that could escape the directory
+/// or hit a Windows special name is excluded (those keys cannot have a
+/// readable legacy record anyway; their data was never durably addressable).
+fn is_safe_legacy_idempotency_name(key: &str) -> bool {
+    if key.is_empty() || key.len() > 200 {
+        return false;
+    }
+    if key.starts_with('.') || key.ends_with('.') || key.ends_with(' ') {
+        return false;
+    }
+    if key.contains("..") {
+        return false;
+    }
+    if !key
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))
+    {
+        return false;
+    }
+    !is_windows_device_name(key)
+}
+
+fn is_windows_device_name(key: &str) -> bool {
+    let up = key.to_ascii_uppercase();
+    if matches!(up.as_str(), "CON" | "PRN" | "AUX" | "NUL") {
+        return true;
+    }
+    for prefix in ["COM", "LPT"] {
+        if let Some(rest) = up.strip_prefix(prefix) {
+            if rest.len() == 1 && matches!(rest.as_bytes()[0], b'1'..=b'9') {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
@@ -301,6 +401,7 @@ impl ProductStore {
         fs::create_dir_all(paths.state.join("events"))?;
         fs::create_dir_all(paths.state.join("blobs"))?;
         fs::create_dir_all(paths.state.join("idempotency"))?;
+        fs::create_dir_all(paths.state.join("idempotency").join("records"))?;
         fs::create_dir_all(paths.state.join("product").join("automations"))?;
         fs::create_dir_all(paths.state.join("product").join("automation-runs"))?;
         fs::create_dir_all(paths.state.join("product").join("bots"))?;
@@ -344,6 +445,11 @@ impl ProductStore {
     }
     fn goal_path(&self, id: &str) -> PathBuf {
         self.product_dir().join("goals").join(format!("{id}.json"))
+    }
+    fn goal_execution_path(&self, id: &str) -> PathBuf {
+        self.product_dir()
+            .join("goal-executions")
+            .join(format!("{id}.json"))
     }
     fn task_path(&self, id: &str) -> PathBuf {
         self.product_dir().join("tasks").join(format!("{id}.json"))
@@ -445,21 +551,225 @@ impl ProductStore {
             .map_err(|e| StoreError::Io(io::Error::other(format!("journal lock poisoned: {e}"))))
     }
 
-    /// Recall the cached result of a write request. The idempotency key is
-    /// scoped to one method: replaying the same key for a different method is
-    /// a client bug that must be attributed, not silently served a foreign
-    /// result (or worse, a repeated execution of the new method). A `pending`
-    /// record means an earlier attempt never reached a durable outcome — the
-    /// client must query state instead of replaying a possibly-executed write.
+    /// Recall the cached result of a write request. The idempotency identity
+    /// is (key, method, request fingerprint): replaying the same key for a
+    /// different method or a different payload is a client bug that must be
+    /// attributed, not silently served a foreign result (or worse, a repeated
+    /// execution of the new request). A `pending` record means an earlier
+    /// attempt never reached a durable outcome — the client must query state
+    /// instead of replaying a possibly-executed write.
     pub fn recall_idempotent(
         &self,
         key: &str,
         expected_method: &str,
+        fingerprint: &str,
     ) -> Result<Option<Value>, StoreError> {
-        let rec = match self.read_idempotent(key, expected_method)? {
-            Some(rec) => rec,
-            None => return Ok(None),
+        validate_idempotency_key(key)?;
+        let _mutations = self.lock_mutations()?;
+        Ok(self
+            .checked_idempotent_record(key, expected_method, fingerprint)?
+            .map(|rec| rec.result))
+    }
+
+    /// Mark a keyed request as running before execution. Returns the cached
+    /// result when a completed record exists; a live pending record from the
+    /// same owner cannot happen (single control-plane reader), so one found
+    /// here survived a crash and must stay attributable.
+    pub fn begin_idempotent(
+        &self,
+        key: &str,
+        expected_method: &str,
+        fingerprint: &str,
+    ) -> Result<Option<Value>, StoreError> {
+        validate_idempotency_key(key)?;
+        let _mutations = self.lock_mutations()?;
+        if let Some(cached) = self.checked_idempotent_record(key, expected_method, fingerprint)? {
+            return Ok(Some(cached.result));
+        }
+        let rec = IdempotencyRecord {
+            key: key.to_string(),
+            method: expected_method.to_string(),
+            state: IdempotencyState::Pending,
+            result: Value::Null,
+            error: None,
+            fingerprint: fingerprint_field(fingerprint),
         };
+        atomic_write(
+            &self.idempotency_path(key),
+            &serde_json::to_vec_pretty(&rec)?,
+        )?;
+        Ok(None)
+    }
+
+    /// Persist the durable outcome of a keyed request.
+    pub fn remember_idempotent(
+        &self,
+        key: &str,
+        method: &str,
+        fingerprint: &str,
+        result: &Value,
+    ) -> Result<(), StoreError> {
+        validate_idempotency_key(key)?;
+        let _mutations = self.lock_mutations()?;
+        let rec = IdempotencyRecord {
+            key: key.to_string(),
+            method: method.to_string(),
+            state: IdempotencyState::Completed,
+            result: result.clone(),
+            error: None,
+            fingerprint: fingerprint_field(fingerprint),
+        };
+        atomic_write(
+            &self.idempotency_path(key),
+            &serde_json::to_vec_pretty(&rec)?,
+        )?;
+        Ok(())
+    }
+
+    /// Record that a keyed attempt ended in an error that may have produced
+    /// effects. Side-effect-free validation failures should instead call
+    /// [`Self::clear_idempotent`] so the client can simply retry.
+    pub fn fail_idempotent(
+        &self,
+        key: &str,
+        method: &str,
+        fingerprint: &str,
+        error: &str,
+    ) -> Result<(), StoreError> {
+        validate_idempotency_key(key)?;
+        let _mutations = self.lock_mutations()?;
+        let rec = IdempotencyRecord {
+            key: key.to_string(),
+            method: method.to_string(),
+            state: IdempotencyState::Failed,
+            result: Value::Null,
+            error: Some(error.to_string()),
+            fingerprint: fingerprint_field(fingerprint),
+        };
+        atomic_write(
+            &self.idempotency_path(key),
+            &serde_json::to_vec_pretty(&rec)?,
+        )?;
+        Ok(())
+    }
+
+    /// Remove a pending marker after a side-effect-free failure, so honest
+    /// retries with the same key stay possible. Clears both the hashed record
+    /// and a not-yet-migrated legacy record.
+    pub fn clear_idempotent(&self, key: &str) -> Result<(), StoreError> {
+        validate_idempotency_key(key)?;
+        let _mutations = self.lock_mutations()?;
+        let path = self.idempotency_path(key);
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        if let Some(legacy) = self.idempotency_legacy_path(key) {
+            if legacy.exists() {
+                fs::remove_file(&legacy)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Current records live in their OWN namespace subdirectory, disjoint
+    /// from the legacy `{key}.json` files the pre-hash build wrote into the
+    /// same parent: a key that happens to be a 64-hex string can otherwise
+    /// make its legacy lookup land on another key's hashed record (and vice
+    /// versa). The file name is a SHA-256 of the key, never the key itself:
+    /// keys are client-supplied, so key-derived paths could traverse the
+    /// Home (`../`), collide with Windows device names, or explode in length.
+    fn idempotency_path(&self, key: &str) -> PathBuf {
+        self.paths
+            .state
+            .join("idempotency")
+            .join("records")
+            .join(format!(
+                "{}.json",
+                hex::encode(Sha256::digest(key.as_bytes()))
+            ))
+    }
+
+    /// Pre-hash layout wrote `{key}.json` straight into the idempotency
+    /// directory, so only keys that were a legal single filename there can
+    /// have legacy records — dotted names like `client.request.1` were legal
+    /// and stay readable. Old Homes migrate lazily: the legacy file is read
+    /// when the namespaced record is missing, and the next write records the
+    /// outcome under the namespaced path.
+    fn idempotency_legacy_path(&self, key: &str) -> Option<PathBuf> {
+        if !is_safe_legacy_idempotency_name(key) {
+            return None;
+        }
+        Some(
+            self.paths
+                .state
+                .join("idempotency")
+                .join(format!("{key}.json")),
+        )
+    }
+
+    /// Locking caller: reads namespaced-then-legacy and enforces the full
+    /// identity contract — record key, method scope, request fingerprint,
+    /// and record state. Returns the record only when a completed cached
+    /// result exists; pending/failed states and identity mismatches are
+    /// typed conflicts.
+    fn checked_idempotent_record(
+        &self,
+        key: &str,
+        expected_method: &str,
+        fingerprint: &str,
+    ) -> Result<Option<IdempotencyRecord>, StoreError> {
+        let read_owned = |path: &Path| -> Result<Option<IdempotencyRecord>, StoreError> {
+            if !path.exists() {
+                return Ok(None);
+            }
+            let rec: IdempotencyRecord = read_json(path)?;
+            // A record file belongs to this key only if it says so. A crafted
+            // or collided file carrying a different key is treated as absent
+            // — another key's result is never leaked or replayed.
+            if rec.key == key {
+                Ok(Some(rec))
+            } else {
+                Ok(None)
+            }
+        };
+        let record: Option<IdempotencyRecord> = match read_owned(&self.idempotency_path(key))? {
+            Some(rec) => Some(rec),
+            None => match self.idempotency_legacy_path(key) {
+                Some(legacy) => read_owned(&legacy)?,
+                None => None,
+            },
+        };
+        let Some(rec) = record else {
+            return Ok(None);
+        };
+        if rec.method != expected_method {
+            return Err(StoreError::Protocol(StoreProtocolError(
+                ProtocolError::new(
+                    knorvia_protocol::ErrorCategory::Conflict,
+                    format!(
+                        "idempotency key {key} was recorded for method {}, not {expected_method}",
+                        rec.method
+                    ),
+                ),
+            )));
+        }
+        // Same key + same method but a different request payload is a
+        // recycled key: the old result must never be served to it. Records
+        // written before fingerprints existed carry None and stay replayable.
+        if let (Some(recorded), Some(expected)) = (&rec.fingerprint, fingerprint_field(fingerprint))
+        {
+            if recorded != &expected {
+                return Err(StoreError::Protocol(StoreProtocolError(
+                    ProtocolError::new(
+                        knorvia_protocol::ErrorCategory::Conflict,
+                        format!(
+                            "idempotency key {key} was recorded for a different request payload; \
+                             use a fresh key instead of recycling this one"
+                        ),
+                    ),
+                )));
+            }
+        }
         if rec.state == IdempotencyState::Pending {
             return Err(StoreError::Protocol(StoreProtocolError(
                 ProtocolError::new(
@@ -478,112 +788,6 @@ impl ProductStore {
                     format!(
                         "idempotency key {key} already ended in an error: {}; use a fresh key to retry",
                         rec.error.unwrap_or_else(|| "unknown failure".into())
-                    ),
-                ),
-            )));
-        }
-        Ok(Some(rec.result))
-    }
-
-    /// Mark a keyed request as running before execution. Returns the cached
-    /// result when a completed record exists; a live pending record from the
-    /// same owner cannot happen (single control-plane reader), so one found
-    /// here survived a crash and must stay attributable.
-    pub fn begin_idempotent(
-        &self,
-        key: &str,
-        expected_method: &str,
-    ) -> Result<Option<Value>, StoreError> {
-        if let Some(cached) = self.recall_idempotent(key, expected_method)? {
-            return Ok(Some(cached));
-        }
-        let rec = IdempotencyRecord {
-            key: key.to_string(),
-            method: expected_method.to_string(),
-            state: IdempotencyState::Pending,
-            result: Value::Null,
-            error: None,
-        };
-        atomic_write(
-            &self.idempotency_path(key),
-            &serde_json::to_vec_pretty(&rec)?,
-        )?;
-        Ok(None)
-    }
-
-    /// Persist the durable outcome of a keyed request.
-    pub fn remember_idempotent(
-        &self,
-        key: &str,
-        method: &str,
-        result: &Value,
-    ) -> Result<(), StoreError> {
-        let rec = IdempotencyRecord {
-            key: key.to_string(),
-            method: method.to_string(),
-            state: IdempotencyState::Completed,
-            result: result.clone(),
-            error: None,
-        };
-        atomic_write(
-            &self.idempotency_path(key),
-            &serde_json::to_vec_pretty(&rec)?,
-        )?;
-        Ok(())
-    }
-
-    /// Record that a keyed attempt ended in an error that may have produced
-    /// effects. Side-effect-free validation failures should instead call
-    /// [`Self::clear_idempotent`] so the client can simply retry.
-    pub fn fail_idempotent(&self, key: &str, method: &str, error: &str) -> Result<(), StoreError> {
-        let rec = IdempotencyRecord {
-            key: key.to_string(),
-            method: method.to_string(),
-            state: IdempotencyState::Failed,
-            result: Value::Null,
-            error: Some(error.to_string()),
-        };
-        atomic_write(
-            &self.idempotency_path(key),
-            &serde_json::to_vec_pretty(&rec)?,
-        )?;
-        Ok(())
-    }
-
-    /// Remove a pending marker after a side-effect-free failure, so honest
-    /// retries with the same key stay possible.
-    pub fn clear_idempotent(&self, key: &str) -> Result<(), StoreError> {
-        let path = self.idempotency_path(key);
-        if path.exists() {
-            fs::remove_file(&path)?;
-        }
-        Ok(())
-    }
-
-    fn idempotency_path(&self, key: &str) -> PathBuf {
-        self.paths
-            .state
-            .join("idempotency")
-            .join(format!("{key}.json"))
-    }
-
-    fn read_idempotent(
-        &self,
-        key: &str,
-        expected_method: &str,
-    ) -> Result<Option<IdempotencyRecord>, StoreError> {
-        let path = self.idempotency_path(key);
-        if !path.exists() {
-            return Ok(None);
-        }
-        let rec: IdempotencyRecord = read_json(&path)?;
-        if rec.method != expected_method {
-            return Err(StoreError::Protocol(StoreProtocolError(
-                ProtocolError::new(
-                    knorvia_protocol::ErrorCategory::Conflict,
-                    format!(
-                        "idempotency key {key} was recorded for method {}, not {expected_method}",
-                        rec.method
                     ),
                 ),
             )));
@@ -1301,13 +1505,93 @@ impl ProductStore {
         Ok(ItemPage { data, next_cursor })
     }
 
+    /// A legal content digest: exactly 64 lowercase hex digits. Anything
+    /// else (wrong length, uppercase, separators, `..`) can never name a
+    /// blob file, which is what keeps path traversal out of the blob store.
+    fn valid_blob_digest(digest: &str) -> bool {
+        digest.len() == 64
+            && digest
+                .chars()
+                .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+    }
+
+    /// Verify one blob file's real SHA-256 against its digest with bounded
+    /// memory (fixed-size streaming buffer). A symlinked blob path is
+    /// refused: the blob store is content-addressed, never name-addressed.
+    fn verify_blob_file(&self, digest: &str, path: &std::path::Path) -> Result<(), StoreError> {
+        let meta = fs::symlink_metadata(path)
+            .map_err(|e| StoreError::Io(io::Error::other(e.to_string())))?;
+        if meta.file_type().is_symlink() {
+            return Err(StoreError::Corrupt(format!(
+                "blob {digest} is a symlink; the blob store refuses name-addressed escapes"
+            )));
+        }
+        let file =
+            fs::File::open(path).map_err(|e| StoreError::Io(io::Error::other(e.to_string())))?;
+        let mut reader = io::BufReader::new(file);
+        let mut hasher = Sha256::new();
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+        }
+        let actual = hex::encode(hasher.finalize());
+        if actual != digest {
+            return Err(StoreError::Corrupt(format!(
+                "blob {digest} content hash mismatch (file hashes to {actual}); the stored file was modified or corrupted and is preserved as evidence at {}",
+                path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// The blob directory and every state ancestor on its path must be
+    /// real directories inside this state root, never reparse points: a
+    /// Windows junction at `state/blobs` — or anywhere between the state
+    /// root and it — would redirect every blob read, reuse, write, verify
+    /// and publish outside the isolated Home even while each leaf file is
+    /// an ordinary, correctly hashed file that the leaf-level symlink
+    /// check accepts. Every blob boundary goes through this guard, not
+    /// just open time, because the directory can be re-pointed while the
+    /// store is running.
+    fn blobs_dir(&self) -> Result<std::path::PathBuf, StoreError> {
+        let dir = self.paths.state.join("blobs");
+        for candidate in [self.paths.state.clone(), dir.clone()] {
+            let meta = fs::symlink_metadata(&candidate)
+                .map_err(|e| StoreError::Io(io::Error::other(e.to_string())))?;
+            let name = candidate
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| candidate.display().to_string());
+            if meta.file_type().is_symlink() {
+                return Err(StoreError::Corrupt(format!(
+                    "the {name} path is a symlink or junction; the blob store refuses to follow it outside the state root"
+                )));
+            }
+            if !meta.is_dir() {
+                return Err(StoreError::Corrupt(format!(
+                    "the {name} path is not a real directory inside the state root"
+                )));
+            }
+        }
+        Ok(dir)
+    }
+
     pub fn put_blob(&self, bytes: &[u8]) -> Result<String, StoreError> {
         let mut hasher = Sha256::new();
         hasher.update(bytes);
         let digest = hex::encode(hasher.finalize());
         let rel = format!("sha256:{digest}");
-        let path = self.paths.state.join("blobs").join(&digest);
-        if !path.exists() {
+        let path = self.blobs_dir()?.join(&digest);
+        if path.exists() {
+            // Content-addressed reuse is only honest when the existing file
+            // really hashes to its name; a corrupted file is never silently
+            // presented as the caller's content.
+            self.verify_blob_file(&digest, &path)?;
+        } else {
             atomic_write(&path, bytes)?;
         }
         Ok(rel)
@@ -1316,11 +1600,15 @@ impl ProductStore {
     pub fn get_blob(&self, content_ref: &str) -> Result<Vec<u8>, StoreError> {
         let digest = content_ref
             .strip_prefix("sha256:")
-            .ok_or_else(|| invalid("content_ref must be sha256:<hex>"))?;
-        let path = self.paths.state.join("blobs").join(digest);
+            .filter(|digest| Self::valid_blob_digest(digest))
+            .ok_or_else(|| invalid("content_ref must be sha256:<64 lowercase hex>"))?;
+        let path = self.blobs_dir()?.join(digest);
         if !path.exists() {
             return Err(not_found("blob", content_ref));
         }
+        // The read boundary verifies the real content hash: a modified
+        // same-name blob is a typed corruption, never the returned bytes.
+        self.verify_blob_file(digest, &path)?;
         Ok(fs::read(path)?)
     }
 
@@ -1407,9 +1695,33 @@ impl ProductStore {
         bytes: &[u8],
         author: &str,
     ) -> Result<ArtifactRevision, StoreError> {
+        self.stage_artifact_at_revision(artifact_id, bytes, author, None)
+    }
+
+    /// Stage a new revision only if the artifact still sits at the base the
+    /// caller read. `expected_current_revision` mirrors what the client saw:
+    /// `Some(None)` expects no current revision, `Some(Some(id))` expects that
+    /// exact revision, and `None` keeps the legacy unchecked behavior. A stale
+    /// base is a typed conflict, so two editors can never interleave stages
+    /// unnoticed.
+    pub fn stage_artifact_at_revision(
+        &self,
+        artifact_id: &str,
+        bytes: &[u8],
+        author: &str,
+        expected_current_revision: Option<Option<&str>>,
+    ) -> Result<ArtifactRevision, StoreError> {
         let _mutations = self.lock_mutations()?;
         let _journal = self.lock_journal()?;
         let mut art = self.read_artifact(artifact_id)?;
+        if let Some(expected) = expected_current_revision {
+            if art.current_revision.as_deref() != expected {
+                return Err(conflict(format!(
+                    "artifact {artifact_id} changed since it was read: expected current revision {:?}, found {:?}; reload before staging",
+                    expected, art.current_revision
+                )));
+            }
+        }
         let content_ref = self.put_blob(bytes)?;
         let parent = art.current_revision.clone().into_iter().collect();
         let rev = ArtifactRevision {
@@ -1438,6 +1750,51 @@ impl ProductStore {
         Ok(rev)
     }
 
+    /// Commit exactly the staged revision the caller produced. Unlike the
+    /// legacy verify→publish pair, the conflict check, content verification
+    /// and publish happen under one lock in a single durable transaction, so
+    /// there is no window where another editor's stage can slip between them.
+    /// A stale `staged_revision_id` is a typed conflict: the caller's draft
+    /// (its staged revision) stays readable and the newer content is never
+    /// overwritten or misattributed. Committing the already-current staged
+    /// revision again is idempotent — no extra revision is minted.
+    pub fn commit_staged_artifact(
+        &self,
+        artifact_id: &str,
+        staged_revision_id: &str,
+    ) -> Result<Artifact, StoreError> {
+        let _mutations = self.lock_mutations()?;
+        let _journal = self.lock_journal()?;
+        let mut art = self.read_artifact(artifact_id)?;
+        if art.current_revision.as_deref() != Some(staged_revision_id) {
+            return Err(conflict(format!(
+                "artifact {artifact_id} staged revision {staged_revision_id} is no longer current (current: {:?}); reload and re-apply the draft",
+                art.current_revision
+            )));
+        }
+        let rev = self.read_artifact_revision(staged_revision_id)?;
+        if rev.artifact_id != artifact_id {
+            return Err(invalid(format!(
+                "revision {staged_revision_id} does not belong to artifact {artifact_id}"
+            )));
+        }
+        let bytes = self.get_blob(&rev.content_ref)?;
+        if bytes.is_empty() {
+            return Err(invalid("staged revision is empty"));
+        }
+        art.lifecycle = "published".into();
+        art.updated_at = now_rfc3339();
+        let write = self.projection_write(ProjectionKind::Artifact, &art.id, &art)?;
+        self.commit_transaction_locked(
+            &art.workspace_id,
+            "artifact.published",
+            serde_json::to_value(&art)?,
+            None,
+            vec![write],
+        )?;
+        Ok(art)
+    }
+
     pub fn verify_artifact(&self, artifact_id: &str) -> Result<Artifact, StoreError> {
         let _mutations = self.lock_mutations()?;
         let _journal = self.lock_journal()?;
@@ -1450,6 +1807,14 @@ impl ProductStore {
         if bytes.is_empty() {
             return Err(invalid("staged revision is empty"));
         }
+        // The verify boundary checks the content against its content_ref:
+        // a tampered or corrupted blob can never be marked verified.
+        let digest = rev
+            .content_ref
+            .strip_prefix("sha256:")
+            .filter(|digest| Self::valid_blob_digest(digest))
+            .ok_or_else(|| invalid("staged revision content_ref is not a legal sha256 digest"))?;
+        self.verify_blob_file(digest, &self.blobs_dir()?.join(digest))?;
         art.lifecycle = "verified".into();
         art.updated_at = now_rfc3339();
         let write = self.projection_write(ProjectionKind::Artifact, &art.id, &art)?;
@@ -1472,6 +1837,17 @@ impl ProductStore {
                 "artifact {} must be verified before publish (was {})",
                 artifact_id, art.lifecycle
             )));
+        }
+        // The publish boundary re-verifies the content hash: what goes out
+        // published is what its revision references, byte for byte.
+        if let Some(rev_id) = art.current_revision.clone() {
+            let rev: ArtifactRevision = read_json(&self.revision_path(&rev_id))?;
+            let digest = rev
+                .content_ref
+                .strip_prefix("sha256:")
+                .filter(|digest| Self::valid_blob_digest(digest))
+                .ok_or_else(|| invalid("revision content_ref is not a legal sha256 digest"))?;
+            self.verify_blob_file(digest, &self.blobs_dir()?.join(digest))?;
         }
         art.lifecycle = "published".into();
         art.updated_at = now_rfc3339();
@@ -1557,9 +1933,11 @@ impl ProductStore {
             return Ok(job);
         }
         if job.status != "queued" {
-            return Err(
-                ProtocolError::new(ErrorCategory::PreconditionFailed, "job must be queued before running").into(),
-            );
+            return Err(ProtocolError::new(
+                ErrorCategory::PreconditionFailed,
+                "job must be queued before running",
+            )
+            .into());
         }
         job.status = "running".into();
         job.attempt += 1;
@@ -1640,6 +2018,51 @@ impl ProductStore {
 
     pub fn cancel_job(&self, id: &str) -> Result<Job, StoreError> {
         self.finish_job(id, "cancelled")
+    }
+
+    /// Convert durable `running` jobs left by a previous process into the
+    /// explicit `failed` terminal state, preserving each job's checkpoint and
+    /// identity. Like [`Self::recover_incomplete_turns`], this never infers
+    /// success and never re-runs work: unknown external side effects are not
+    /// redone automatically — an explicit retry/resume continues the recorded
+    /// identity. Call once at startup after establishing that no runner from
+    /// the old process can own the store. Unparsable job files are left
+    /// untouched: recovery only asserts about records it can actually read.
+    pub fn recover_incomplete_jobs(&self) -> Result<Vec<Job>, StoreError> {
+        let _mutations = self.lock_mutations()?;
+        let _journal = self.lock_journal()?;
+        self.recover_durable_state_locked()?;
+        let mut recovered = Vec::new();
+        let dir = self.product_dir().join("jobs");
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(recovered),
+            Err(e) => return Err(e.into()),
+        };
+        for entry in entries {
+            let path = entry?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Ok(mut job) = serde_json::from_slice::<Job>(&fs::read(&path)?) else {
+                continue;
+            };
+            if job.status != "running" {
+                continue;
+            }
+            job.status = "failed".into();
+            job.updated_at = now_rfc3339();
+            let write = self.projection_write(ProjectionKind::Job, &job.id, &job)?;
+            self.commit_transaction_locked(
+                &job.workspace_id,
+                "job.recovered",
+                serde_json::to_value(&job)?,
+                None,
+                vec![write],
+            )?;
+            recovered.push(job);
+        }
+        Ok(recovered)
     }
 
     pub fn retry_job(&self, id: &str) -> Result<Job, StoreError> {
@@ -1723,12 +2146,14 @@ impl ProductStore {
             return Err(invalid("decision must be allow or deny"));
         }
         let _mutations = self.lock_mutations()?;
+        let _journal = self.lock_journal()?;
+        // A previous call may have synced its WAL intent before returning an
+        // I/O error. Recover that decision before inspecting the projection.
+        self.recover_durable_state_locked()?;
         let mut a = self.read_approval(id)?;
         if a.status != "pending" {
             return Err(conflict("approval already resolved"));
         }
-        let _journal = self.lock_journal()?;
-        self.recover_durable_state_locked()?;
         let _ = self.require_running_turn_locked(&a.thread_id, &a.turn_id)?;
         a.status = if decision == "allow" {
             "allowed"
@@ -1743,6 +2168,58 @@ impl ProductStore {
             serde_json::to_value(&a)?,
             None,
             vec![write],
+        )?;
+        Ok(a)
+    }
+
+    /// Record a SYSTEM resolution for one pending approval: the approval
+    /// deadline expired ("timed_out"), the turn was cancelled
+    /// ("cancelled"), or the runner owner disappeared ("owner_lost"). This
+    /// is deliberately distinct from a user's "denied" so the timeline can
+    /// tell a user decision from a system close-out. The transition is an
+    /// atomic pending→terminal CAS and idempotent per status; a decision
+    /// already recorded for the user is never overwritten. The Kernel side
+    /// of these paths still receives a Decline.
+    ///
+    /// The same transaction also appends one durable `approvalResolution`
+    /// timeline Item (A03) so a timeline stays explainable after the
+    /// pending card disappears; the recovery path in
+    /// `recover_incomplete_turns` writes the same shape.
+    pub fn resolve_approval_system(&self, id: &str, reason: &str) -> Result<Approval, StoreError> {
+        if !matches!(reason, "timed_out" | "cancelled" | "owner_lost") {
+            return Err(invalid(
+                "system resolution must be timed_out, cancelled or owner_lost",
+            ));
+        }
+        let _mutations = self.lock_mutations()?;
+        let _journal = self.lock_journal()?;
+        // Recovery precedes both the pending CAS and the idempotent return:
+        // an earlier intent may already own this approval and its Item.
+        self.recover_durable_state_locked()?;
+        let mut a = self.read_approval(id)?;
+        if a.status == reason {
+            return Ok(a);
+        }
+        if a.status != "pending" {
+            return Err(conflict("approval already resolved"));
+        }
+        a.status = reason.into();
+        let first_seq = self.next_event_sequence_locked(&a.thread_id)?;
+        let item = system_resolution_item(&a, reason, first_seq + 1);
+        let writes = vec![
+            self.projection_write(ProjectionKind::Approval, &a.id, &a)?,
+            self.projection_write(ProjectionKind::Item, &item.id, &item)?,
+        ];
+        self.commit_transaction_batch_locked(
+            &a.thread_id,
+            vec![
+                EventDraft::new(
+                    "approval.systemResolved",
+                    serde_json::json!({"approval": a, "reason": reason}),
+                ),
+                EventDraft::new("item.appended", serde_json::to_value(&item)?),
+            ],
+            writes,
         )?;
         Ok(a)
     }
@@ -1793,6 +2270,10 @@ mod turn_tests;
 #[cfg(test)]
 #[path = "durable_tests.rs"]
 mod durable_tests;
+
+#[cfg(test)]
+#[path = "artifact_txn_tests.rs"]
+mod artifact_txn_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1930,5 +2411,172 @@ mod tests {
             other => panic!("{other:?}"),
         }
         let _ = fs::remove_dir_all(&store.paths.home);
+    }
+
+    /// The guard seals the boundary without degrading the honest path: an
+    /// ordinary blob round-trips, and a same-content put reuses the existing
+    /// file through the verified content-addressed reuse branch.
+    #[test]
+    fn ordinary_blob_read_and_reuse_still_work_inside_the_state_root() {
+        let store = tmp_store();
+        let first = store.put_blob(b"ordinary local content").unwrap();
+        let second = store.put_blob(b"ordinary local content").unwrap();
+        assert_eq!(first, second, "same bytes must reuse the same digest");
+        assert_eq!(
+            store.get_blob(&first).unwrap(),
+            b"ordinary local content",
+            "the honest read path still returns the local blob"
+        );
+        let _ = fs::remove_dir_all(&store.paths.home);
+    }
+
+    /// A junction at `state/blobs` must never redirect the blob store
+    /// outside the state root. Every boundary — read, reuse, write, verify
+    /// and publish — refuses the reparse point itself instead of following
+    /// it, even when the outside directory holds an ordinary file whose
+    /// bytes hash exactly to its name, because leaf-level checks cannot see
+    /// the parent escape. Real Windows junction (`mklink /J`, no admin
+    /// rights needed); all fixtures live in this test's own temp
+    /// directories and the outside sentinel is self-built.
+    #[cfg(windows)]
+    #[test]
+    fn blob_boundaries_refuse_a_junctioned_blobs_directory() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let pid = std::process::id();
+        let home = std::env::temp_dir().join(format!("knorvia-junction-home-{pid}-{unique}"));
+        let outside = std::env::temp_dir().join(format!("knorvia-junction-out-{pid}-{unique}"));
+        let store = ProductStore::open(layout(home.clone())).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+
+        // The sentinel outside the isolated Home is a correctly hashed
+        // ordinary file, so only the parent boundary can reject it.
+        let sentinel = b"outside the isolated home";
+        let mut hasher = Sha256::new();
+        hasher.update(sentinel);
+        let digest = hex::encode(hasher.finalize());
+        fs::write(outside.join(&digest), sentinel).unwrap();
+
+        let blobs = home.join("state").join("blobs");
+        fs::remove_dir(&blobs).unwrap();
+        let status = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&blobs)
+            .arg(&outside)
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "mklink /J must be able to create a real junction in the test environment"
+        );
+        assert!(
+            fs::symlink_metadata(&blobs)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "a junction must report as a reparse point via symlink_metadata"
+        );
+        // The junction is live, not dangling: the sentinel genuinely
+        // resolves through it, so a refusal can only come from the parent
+        // boundary — never from a broken link.
+        let through = fs::read(blobs.join(&digest)).unwrap();
+        assert_eq!(
+            through, sentinel,
+            "the junction must really resolve to the sentinel before the boundary is exercised"
+        );
+
+        // Read boundary: refused as corruption, never resolved through the
+        // junction to the sentinel bytes.
+        let read_err = store.get_blob(&format!("sha256:{digest}")).unwrap_err();
+        assert!(
+            read_err.to_string().contains("junction"),
+            "get must refuse the junction itself, got: {read_err}"
+        );
+
+        // Write boundary: refused; nothing may appear in the outside
+        // directory (the lone sentinel file stays the only entry).
+        let write_err = store.put_blob(b"captured content").unwrap_err();
+        assert!(
+            write_err.to_string().contains("junction"),
+            "put must refuse the junction itself, got: {write_err}"
+        );
+
+        // Reuse boundary: the caller's bytes hash exactly to the existing
+        // outside file, so without the guard put would verify-and-reuse it
+        // through the junction.
+        let reuse_err = store.put_blob(sentinel).unwrap_err();
+        assert!(
+            reuse_err.to_string().contains("junction"),
+            "put must refuse reusing outside content, got: {reuse_err}"
+        );
+
+        // Verify and publish boundaries: reach them with a durable revision
+        // whose content_ref names the sentinel, then require the same
+        // parent refusal from both. Publish is exercised with a verified
+        // lifecycle, modeling a junction re-pointed after verification.
+        let ws = store.create_workspace("j").unwrap();
+        let art = store
+            .create_artifact(&ws.id, "text/plain", "junction fixture")
+            .unwrap();
+        let rev_id = format!("rev_junction_{unique}");
+        let rev = ArtifactRevision {
+            id: rev_id.clone(),
+            artifact_id: art.id.clone(),
+            parent_ids: vec![],
+            content_ref: format!("sha256:{digest}"),
+            created_at: now_rfc3339(),
+            author: "junction-fixture".into(),
+        };
+        let revisions = store.product_dir().join("revisions");
+        fs::create_dir_all(&revisions).unwrap();
+        fs::write(
+            revisions.join(format!("{rev_id}.json")),
+            serde_json::to_vec_pretty(&rev).unwrap(),
+        )
+        .unwrap();
+        let mut art_doc: Artifact = read_json(&store.artifact_path(&art.id)).unwrap();
+        art_doc.current_revision = Some(rev_id);
+        art_doc.lifecycle = "staged".into();
+        fs::write(
+            store.artifact_path(&art.id),
+            serde_json::to_vec_pretty(&art_doc).unwrap(),
+        )
+        .unwrap();
+
+        let verify_err = store.verify_artifact(&art.id).unwrap_err();
+        assert!(
+            verify_err.to_string().contains("junction"),
+            "verify must refuse the junction itself, got: {verify_err}"
+        );
+        art_doc.lifecycle = "verified".into();
+        fs::write(
+            store.artifact_path(&art.id),
+            serde_json::to_vec_pretty(&art_doc).unwrap(),
+        )
+        .unwrap();
+        let publish_err = store.publish_artifact(&art.id).unwrap_err();
+        assert!(
+            publish_err.to_string().contains("junction"),
+            "publish must refuse the junction itself, got: {publish_err}"
+        );
+
+        // The outside directory and its sentinel stayed byte-identical:
+        // every refusal happened before any I/O through the junction.
+        assert_eq!(
+            fs::read_dir(&outside).unwrap().count(),
+            1,
+            "the outside sentinel directory must stay untouched by every boundary"
+        );
+        assert_eq!(
+            fs::read(outside.join(&digest)).unwrap(),
+            sentinel,
+            "the sentinel file must stay byte-identical"
+        );
+
+        fs::remove_dir(&blobs).unwrap();
+        let _ = fs::remove_dir_all(&store.paths.home);
+        let _ = fs::remove_dir_all(&outside);
     }
 }

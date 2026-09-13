@@ -14,6 +14,9 @@ pub fn encode_frame(body: &str) -> Vec<u8> {
 }
 
 pub fn write_frame<W: Write>(mut w: W, body: &str) -> Result<(), WireError> {
+    if body.len() > MAX_FRAME_BYTES {
+        return Err(WireError::FrameTooLarge(body.len()));
+    }
     w.write_all(&encode_frame(body))?;
     w.flush()?;
     Ok(())
@@ -119,5 +122,14 @@ mod tests {
             read_frame(Cursor::new(duplicate)),
             Err(WireError::InvalidHeader(_))
         ));
+    }
+    #[test]
+    fn rejects_oversized_output_before_writing_any_bytes() {
+        let mut written = Vec::new();
+        assert!(matches!(
+            write_frame(&mut written, &"x".repeat(MAX_FRAME_BYTES + 1)),
+            Err(WireError::FrameTooLarge(_))
+        ));
+        assert!(written.is_empty());
     }
 }

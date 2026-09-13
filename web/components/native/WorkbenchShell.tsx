@@ -14,11 +14,13 @@ import "./pet.css";
 import "./integration.css";
 import { SidebarContent } from "./SidebarContent";
 import { BotSidebar } from "./BotSidebar";
+import { TaskAttentionMenu } from "./TaskAttentionMenu";
 import { useDrawerFocus } from "./useDrawerFocus";
 import { useLocalPreference } from "./useLocalPreference";
 import { parseSidebarPreferences } from "@/lib/native-sidebar";
 import { SidebarResize, sidebarWidth } from "./SidebarResize";
 import { READING_KEY, readingPreference } from '@/lib/native-reading';
+import { WorkbenchStyleToggle } from './WorkbenchStyle';
 
 export function Modal({ title, children, close, busy = false }: { title: string; children: React.ReactNode; close: () => void | false | Promise<void | false>; busy?: boolean }) {
   const { t } = useWorkbench();
@@ -130,7 +132,7 @@ export function ProjectDialog({ close, project }: { close: () => void; project?:
 }
 
 export function WorkbenchShell({ children }: { children: React.ReactNode }) {
-  const { t, locale, toggleLocale, connection, error, setError, notice, setNotice, reconnect, threads, workspaceId } = useWorkbench();
+  const { t, locale, toggleLocale, connection, error, errorKind, setError, notice, setNotice, reconnect, recovery, clearRecovery, threads, workspaceId, setWorkspaceId, readThread } = useWorkbench();
   const pathname = usePathname();
   const router = useRouter();
   const [preferences, updatePreferences] = useLocalPreference("knorvia-native-sidebar-v1", parseSidebarPreferences);
@@ -143,13 +145,41 @@ export function WorkbenchShell({ children }: { children: React.ReactNode }) {
   useDrawerFocus(mobileOpen && narrow, sidebarRef, () => setMobileOpen(false));
   // OS notification click-through: the main process owns banners and asks the
   // renderer to reveal the task. Only available inside the desktop shell.
+  const notificationContext = useRef({ router, pathname, workspaceId, setWorkspaceId, readThread, setError, t });
+  notificationContext.current = { router, pathname, workspaceId, setWorkspaceId, readThread, setError, t };
   useEffect(() => {
+    let mounted = true;
+    let generation = 0;
     const desktop = typeof window !== "undefined" ? window.knorviaDesktop : undefined;
     const unsubscribe = desktop?.notifications?.onOpenThread?.((threadId) => {
-      if (typeof threadId === "string" && threadId) router.push(`/workbench/task/${encodeURIComponent(threadId)}`);
+      const currentGeneration = ++generation;
+      const context = notificationContext.current;
+      const stillCurrent = () => mounted && generation === currentGeneration && notificationContext.current.pathname === context.pathname;
+      const missing = () => {
+        if (!stillCurrent()) return;
+        const current = notificationContext.current;
+        current.setError(current.t("未找到对应的任务或任务已失效。", "Task not found or has expired."));
+      };
+      if (typeof threadId !== "string" || !threadId.trim() || threadId.length > 200 || /[\u0000-\u001f\u007f<>"'\\]/.test(threadId)) {
+        missing();
+        return;
+      }
+      // Re-read even a cached task: a notification may outlive its deletion
+      // or project move. readThread returns the flat authoritative snapshot.
+      void context.readThread(threadId).then((snapshot) => {
+        if (!stillCurrent()) return;
+        if (snapshot?.id !== threadId || !snapshot.workspaceId) { missing(); return; }
+        const current = notificationContext.current;
+        if (snapshot.workspaceId !== current.workspaceId) current.setWorkspaceId(snapshot.workspaceId);
+        current.router.push(`/workbench/task/${encodeURIComponent(threadId)}`);
+      }).catch(missing);
     });
-    return () => { try { unsubscribe?.(); } catch { /* optional bridge */ } };
-  }, [router]);
+    return () => {
+      mounted = false;
+      generation += 1;
+      try { unsubscribe?.(); } catch { /* optional bridge */ }
+    };
+  }, []);
   const [settingsBack, setSettingsBack] = useState("/workbench");
   const isSettings = pathname === "/workbench/settings" || pathname.startsWith("/workbench/settings/");
   const collapsed = narrow ? !mobileOpen : preferences.collapsed;
@@ -205,8 +235,8 @@ export function WorkbenchShell({ children }: { children: React.ReactNode }) {
     <a className="nw-skip-link" href="#nw-content">{t("跳到主要内容", "Skip to content")}</a>
     {!collapsed && <button className="nw-sidebar-scrim" onClick={() => setCollapsed(true)} aria-label={t("关闭侧栏", "Close sidebar")} />}
     <aside ref={sidebarRef} className="nw-sidebar" inert={collapsed} aria-hidden={collapsed} onClick={event => { if (window.matchMedia("(max-width: 650px)").matches && (event.target as Element).closest("a, .nw-project")) setCollapsed(true); }}>
+      <nav className="nw-sidebar-tabs" aria-label={t("侧栏模式", "Sidebar mode")}><Link href="/workbench" aria-current={!botsMode ? "page" : undefined}>{t("会话", "SESSIONS")}</Link><Link href="/workbench/bots" aria-current={botsMode ? "page" : undefined}>{t("BOTS", "BOTS")}</Link></nav>
       <div className="nw-brand" data-desktop-drag=""><Link href="/workbench" className="nw-wordmark"><WorkbenchMark />{"Knorvia"}</Link><div className="nw-brand-actions"><button className="nw-icon" onClick={() => { if (window.matchMedia("(max-width: 650px)").matches) setCollapsed(true); setSearch(true); }} aria-label={t("搜索任务", "Search tasks")} title={t("搜索任务 · Ctrl K", "Search tasks · Ctrl K")}><Search size={17} /></button><button className="nw-icon" onClick={() => setCollapsed(true)} aria-label={t("收起侧栏", "Collapse sidebar")}><PanelLeftClose size={17} /></button></div></div>
-      <nav className="nw-sidebar-tabs" aria-label={t("侧栏模式", "Sidebar mode")}><Link href="/workbench" aria-current={!botsMode ? "page" : undefined}>{t("会话", "Sessions")}</Link><Link href="/workbench/bots" aria-current={botsMode ? "page" : undefined}>Bots</Link></nav>
       {botsMode ? <Suspense fallback={null}><BotSidebar navigate={() => setMobileOpen(false)} /></Suspense> : <>
         <nav className="nw-nav" aria-label={t("工作台导航", "Workbench navigation")}>{nav.map(item => <Link key={item.href} href={item.href} aria-current={pathname === item.href ? "page" : undefined} className={pathname === item.href ? "nw-nav-item is-active" : "nw-nav-item"}><item.icon size={17} /><span>{item.label}</span></Link>)}</nav>
         <SidebarContent selectedId={selectedId} activeProjectId={activeProjectId} preferences={preferences} update={updatePreferences} newProject={() => { setMobileOpen(false); setProjectDialog(true); }} navigate={() => setMobileOpen(false)} />
@@ -214,8 +244,9 @@ export function WorkbenchShell({ children }: { children: React.ReactNode }) {
       <div className="nw-sidebar-bottom nw-settings-footer"><Link className={`nw-nav-item${pathname === "/workbench/memory" ? " is-active" : ""}`} aria-current={pathname === "/workbench/memory" ? "page" : undefined} href="/workbench/memory"><BrainIcon size={18} /><span>{t("记忆", "Memory")}</span></Link><Link className="nw-nav-item" href="/workbench/settings"><Settings size={18} /><span>{t("设置", "Settings")}</span></Link></div>
       {!narrow && <SidebarResize width={leftWidth} change={width => setLeftWidth(() => width)} />}
     </aside>
-    <div className="nw-main" inert={mobileOpen && narrow}><header className="nw-topbar" data-desktop-drag=""><div className="nw-breadcrumb">{collapsed && <button className="nw-icon" onClick={() => setCollapsed(false)} aria-expanded={!collapsed} aria-label={t("展开侧栏", "Expand sidebar")}><Menu size={18} /></button>}{!selectedId && <span>{title}</span>}</div><div id="nw-task-header-tools" /><div className="nw-top-actions">{collapsed && <button className="nw-icon" onClick={() => setSearch(true)} aria-label={t("搜索任务", "Search tasks")}><Search size={17} /></button>}<button className="nw-locale" onClick={toggleLocale} aria-label={locale === "zh" ? "Switch to English" : "切换为中文"}>{locale === "zh" ? "EN" : "中文"}</button><span role="status" aria-label={connectionLabel} className={`nw-connection ${connection === "connected" ? "is-connected" : ""}`}><i />{connectionLabel}</span></div></header>
-      {error && <div className="nw-banner" role="alert"><span>{error}</span><button onClick={() => { void reconnect().catch(error => setError(errorText(error))); }}>{t("重新连接", "Reconnect")}</button><button className="nw-icon" onClick={() => setError("")} aria-label={t("关闭提示", "Dismiss")}><X size={15} /></button></div>}
+    <div className="nw-main" inert={mobileOpen && narrow}><header className="nw-topbar" data-desktop-drag=""><div className="nw-breadcrumb">{collapsed && <button className="nw-icon" onClick={() => setCollapsed(false)} aria-expanded={!collapsed} aria-label={t("展开侧栏", "Expand sidebar")}><Menu size={18} /></button>}{!selectedId && <span>{title}</span>}</div><div id="nw-task-header-tools" /><div className="nw-top-actions">{collapsed && <button className="nw-icon" onClick={() => setSearch(true)} aria-label={t("搜索任务", "Search tasks")}><Search size={17} /></button>}<WorkbenchStyleToggle /><TaskAttentionMenu /><button className="nw-locale" onClick={toggleLocale} aria-label={locale === "zh" ? "Switch to English" : "切换为中文"}>{locale === "zh" ? "EN" : "中文"}</button><span role="status" aria-label={connectionLabel} className={`nw-connection ${connection === "connected" ? "is-connected" : ""}`}><i />{connectionLabel}</span></div></header>
+      {error && <div className="nw-banner" role="alert" data-error-kind={errorKind}><span>{errorKind === "conflict" ? `${t("操作未生效：", "The action did not take effect: ")}${error}` : error}</span>{errorKind === "connection" && <button onClick={() => { void reconnect().catch(error => setError(error)); }}>{t("重新连接", "Reconnect")}</button>}{errorKind === "generic" && connection !== "connected" && <button onClick={() => { void reconnect().catch(error => setError(error)); }}>{t("重新连接", "Reconnect")}</button>}<button className="nw-icon" onClick={() => setError("")} aria-label={t("关闭提示", "Dismiss")}><X size={15} /></button></div>}
+      {recovery && <div className="nw-banner nw-recovery-banner" role="status"><div><strong>{t("任务状态待恢复", "Task state needs recovery")}</strong><span>{t("最近一次写入未能确认，正文与草稿已保留；恢复权威快照后此提示会自动消失。", "The last write could not be confirmed. Your text and drafts are kept; this notice clears once the authoritative snapshot returns.")}</span>{recovery.message && <small>{recovery.message}</small>}</div><button className="nw-icon" onClick={clearRecovery} aria-label={t("关闭提示", "Dismiss")}><X size={15} /></button></div>}
       <main className="nw-view" id="nw-content" tabIndex={-1}>{children}</main>
       {notice && <div className="nw-toast" role="status"><Check size={16} />{notice}</div>}
     </div>

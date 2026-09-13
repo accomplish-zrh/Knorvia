@@ -250,6 +250,101 @@ class DaemonSession:
             self._notification_bytes = remaining_bytes
             return drained
 
+    def iter_replay_events(
+        self,
+        stream_id: str,
+        *,
+        activity: bool = False,
+        page_limit: int = 500,
+        max_bytes: int = 1024 * 1024,
+        timeout: float = 30.0,
+    ) -> Iterator[dict[str, Any]]:
+        """Yield a validated frozen replay without building one giant response.
+
+        A cold or repaired sidecar is rebuilt by the daemon in bounded slices.
+        That read-only response is safe to retry at the same cursor; every other
+        protocol error is surfaced unchanged.
+        """
+
+        if not isinstance(stream_id, str) or not stream_id:
+            raise KernelClientError("replay stream_id must be a non-empty string")
+        if not isinstance(page_limit, int) or not 1 <= page_limit <= 500:
+            raise KernelClientError("replay page_limit must be between 1 and 500")
+        if not isinstance(max_bytes, int) or not 512 <= max_bytes <= 6 * 1024 * 1024:
+            raise KernelClientError("replay max_bytes must be between 512 and 6291456")
+        deadline = time.monotonic() + _positive_timeout(timeout, 30.0)
+        method = "activity/list" if activity else "event/replay"
+        after_seq = 0
+        upper_seq: int | None = None
+        cursor: str | None = None
+        while True:
+            params: dict[str, Any] = {
+                "streamId": stream_id,
+                "afterSeq": after_seq,
+                "limit": page_limit,
+                "maxBytes": max_bytes,
+            }
+            if upper_seq is not None:
+                params["upperSeq"] = upper_seq
+                params["cursor"] = cursor
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise KernelClientTimeout(
+                    f"{method} did not finish its frozen replay within {timeout:g}s"
+                )
+            try:
+                page = self.rpc(method, params, timeout=remaining)
+            except KernelClientError as exc:
+                if "replay_index_building:" not in str(exc):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise KernelClientTimeout(
+                        f"{method} index rebuild did not finish within {timeout:g}s"
+                    ) from exc
+                time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                continue
+            if not isinstance(page, dict) or not isinstance(page.get("events"), list):
+                raise KernelClientError(f"invalid {method} page: missing events")
+            page_upper = page.get("upperSeq")
+            next_seq = page.get("nextSeq")
+            has_more = page.get("hasMore")
+            next_cursor = page.get("nextCursor")
+            if (
+                not isinstance(page_upper, int)
+                or isinstance(page_upper, bool)
+                or not isinstance(next_seq, int)
+                or isinstance(next_seq, bool)
+                or not isinstance(has_more, bool)
+                or not isinstance(next_cursor, str)
+                or not next_cursor
+            ):
+                raise KernelClientError(f"invalid {method} paging metadata")
+            if upper_seq is None:
+                upper_seq = page_upper
+            elif page_upper != upper_seq:
+                raise KernelClientError(f"{method} changed its frozen upperSeq")
+            expected = after_seq + 1
+            for event in page["events"]:
+                if (
+                    not isinstance(event, dict)
+                    or event.get("streamId") != stream_id
+                    or event.get("seq") != expected
+                ):
+                    raise KernelClientError(
+                        f"{method} returned a foreign or non-contiguous event"
+                    )
+                expected += 1
+                yield event
+            delivered_seq = expected - 1
+            if next_seq != delivered_seq or has_more != (next_seq < upper_seq):
+                raise KernelClientError(f"invalid {method} cursor progression")
+            if has_more and next_seq == after_seq:
+                raise KernelClientError(f"{method} did not advance an unfinished page")
+            after_seq = next_seq
+            if not has_more:
+                return
+            cursor = next_cursor
+
     def wait_for_notification(
         self,
         *,

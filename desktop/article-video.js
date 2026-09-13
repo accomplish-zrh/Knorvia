@@ -20,6 +20,16 @@ function createArticleEngine({ studio, rpc, library, playback }) {
   const read = async id => { const j = await rpc('job/read', { id: P.id(id) }); if (j.type !== 'studio.article' || j.workspaceId !== studio.workspaceId()) P.fail('找不到文章视频工程'); return j; };
   const visible = j => ({ id: j.id, ...j.checkpoint, guide });
   const save = (id, c) => rpc('job/checkpoint', { jobId: id, checkpoint: c });
+  // P09: a save whose response was lost must be safely retryable. Remembering
+  // the last result per (project, idempotency key) turns a duplicate submit
+  // into a replay of the stored result instead of a revision conflict or a
+  // second mutation. In-memory is enough: after a daemon restart the client
+  // recovers through read-back.
+  const saveMemo = new Map();
+  const memoKey = (p) => {
+    const key = typeof p.idempotencyKey === 'string' ? p.idempotencyKey.slice(0, 128) : '';
+    return key && P.id(p.id) ? `${P.id(p.id)}:${key}` : '';
+  };
   const checked = (j, p) => { if (j.checkpoint.revision !== p.revision) P.fail('工程已被其他窗口修改，请刷新后重试'); if (j.checkpoint.busy) P.fail('当前步骤尚未结束，请等待或取消'); return j.checkpoint; };
   const directory = (id, revision) => path.join(root, P.id(id), `v${revision}`);
   const audioFile = (id, audio) => { if (!Number.isSafeInteger(audio?.revision)) P.fail('配音记录无效'); return path.join(directory(id, audio.revision), 'voice', 'final.wav'); };
@@ -89,7 +99,11 @@ function createArticleEngine({ studio, rpc, library, playback }) {
     },
     'studio/article/read': async p => { await studio.initialize(); return visible(await read(p.id)); },
     'studio/article/save': async p => {
-      await studio.initialize(); return lock(p.id, async () => {
+      await studio.initialize();
+      const memo = memoKey(p);
+      if (memo && saveMemo.has(memo)) return saveMemo.get(memo);
+      return lock(p.id, async () => {
+        if (memo && saveMemo.has(memo)) return saveMemo.get(memo);
         const j = await read(p.id), c = checked(j, p), patch = {};
         if (p.narration !== undefined) { patch.narration = P.text(p.narration, 30000); if (patch.narration) W.segments(patch.narration); }
         if (p.aspect !== undefined) { if (!['16:9', '9:16', '1:1'].includes(p.aspect)) P.fail('画幅不支持'); patch.aspect = p.aspect; }
@@ -102,7 +116,9 @@ function createArticleEngine({ studio, rpc, library, playback }) {
           });
         }
         const changed = patch.narration !== undefined && patch.narration !== c.narration;
-        return visible(await save(j.id, { ...c, ...patch, revision: c.revision + 1, built: null, preview: null, output: null, ...(changed ? { audio: null, sample: null, scenes: [], phase: 'script' } : {}), error: null }));
+        const result = visible(await save(j.id, { ...c, ...patch, revision: c.revision + 1, built: null, preview: null, output: null, ...(changed ? { audio: null, sample: null, scenes: [], phase: 'script' } : {}), error: null }));
+        if (memo) { saveMemo.set(memo, result); if (saveMemo.size > 200) saveMemo.delete(saveMemo.keys().next().value); }
+        return result;
       });
     },
     'studio/article/voice': async p => {
@@ -202,7 +218,8 @@ function createArticleEngine({ studio, rpc, library, playback }) {
       P.atomic(configFile, { node, runtime, version: manifest.version }); return config();
     },
   };
-  return { handlers, async recover() {
+  // C20 activity contract: outstanding article render tasks.
+  return { handlers, get pendingCount() { return active.size; }, async recover() {
     let offset = 0;
     for (;;) {
       const page = await rpc('job/list', { workspaceId: studio.workspaceId(), typePrefix: 'studio.article', offset, limit: 1 });

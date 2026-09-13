@@ -65,6 +65,13 @@ impl GatewayModel {
     }
 }
 
+fn map_execute_error(error: knorvia_provider_gateway::ExecuteError) -> PackExecError {
+    PackExecError::Msg(format!(
+        "provider call failed: {}",
+        error.sanitized_message()
+    ))
+}
+
 impl PackModel for GatewayModel {
     fn complete(&mut self, prompt: &str) -> Result<String, PackExecError> {
         let req = CanonicalRequest {
@@ -83,12 +90,32 @@ impl PackModel for GatewayModel {
             base_url: self.base_url.clone(),
             api_key: self.api_key.clone(),
         };
-        let result = execute(&tx, &cfg)
-            .map_err(|e| PackExecError::Msg(format!("provider call failed: {e}")))?;
+        let result = execute(&tx, &cfg).map_err(map_execute_error)?;
         if let Some(err) = result.error {
-            return Err(PackExecError::Msg(format!("provider error: {err}")));
+            return Err(PackExecError::Msg(format!(
+                "provider error: {}",
+                knorvia_protocol::sanitize_diagnostic(&err)
+            )));
         }
         Ok(result.text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pack_boundary_resanitizes_direct_execute_errors() {
+        let secret = "Bearer xy";
+        let error = knorvia_provider_gateway::ExecuteError::Transport(format!(
+            "host api.example.com Authorization: {secret} model=gpt-5.4 status=502"
+        ));
+        let rendered = map_execute_error(error).to_string();
+        assert!(!rendered.contains("xy"), "{rendered}");
+        assert!(rendered.contains("api.example.com"), "{rendered}");
+        assert!(rendered.contains("gpt-5.4"), "{rendered}");
+        assert!(rendered.contains("502"), "{rendered}");
     }
 }
 

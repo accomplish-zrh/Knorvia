@@ -31,16 +31,25 @@ export async function readLibraryFile(request: LibraryRequest, entry: LibraryEnt
     if (part.nextOffset <= offset) throw new Error('资料读取未继续'); offset = part.nextOffset;
   } while (true);
 }
-export async function saveLibraryFile(request: LibraryRequest, path: string, file: Blob | Uint8Array, expectedSha256?: string, progress?: (percent: number) => void) {
+export async function saveLibraryFile(request: LibraryRequest, path: string, file: Blob | Uint8Array, expectedSha256?: string, progress?: (percent: number) => void, options?: { signal?: AbortSignal; onUploadId?: (uploadId: string) => void }) {
+  const signal = options?.signal;
   const size = file instanceof Blob ? file.size : file.byteLength;
-  const upload = await request<{ id: string; chunkBytes: number }>('library/upload/start', { path, size, expectedSha256 });
+  const upload = await request<{ id: string; chunkBytes: number }>('library/upload/start', { path, size, ...(expectedSha256 === undefined ? {} : { expectedSha256 }) });
+  options?.onUploadId?.(upload.id);
   try {
     for (let offset = 0; offset < size; offset += upload.chunkBytes) {
+      signal?.throwIfAborted();
       const bytes = file instanceof Blob ? new Uint8Array(await file.slice(offset, offset + upload.chunkBytes).arrayBuffer()) : file.subarray(offset, offset + upload.chunkBytes);
       await request('library/upload/chunk', { id: upload.id, offset, base64: base64(bytes) }); progress?.(Math.round(Math.min(size, offset + bytes.length) / size * 95));
     }
+    signal?.throwIfAborted();
     const result = await request<LibraryEntry>('library/upload/finish', { id: upload.id }); progress?.(100); return result;
-  } catch (error) { await request('library/upload/cancel', { id: upload.id }).catch(() => {}); throw error; }
+  } catch (error) {
+    // A finished upload must not be undone: the daemon refuses to cancel an
+    // uploaded record, and canceling only removes this upload's part file.
+    await request('library/upload/cancel', { id: upload.id }).catch(() => {});
+    throw error;
+  }
 }
 export function downloadLibraryBytes(name: string, bytes: Uint8Array<ArrayBuffer>) {
   const url = URL.createObjectURL(new Blob([bytes], { type: libraryMime(name) }));

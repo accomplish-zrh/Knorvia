@@ -1,0 +1,14 @@
+/* Task export dialog (B-owned). */
+.ht-export-formats { display: flex; gap: 8px; margin: 14px 0 10px; }
+.ht-export-formats button { flex: 1; flex-direction: column; gap: 6px; padding: 14px 10px; border: 1px solid var(--nw-line); border-radius: 11px; background: transparent; color: inherit; font-size: 12px; }
+.ht-export-formats button.is-active { border-color: var(--nw-green); background: var(--nw-soft, rgba(21, 115, 71, .08)); }
+.ht-export-raw { display: flex; align-items: flex-start; gap: 8px; font-size: 12px; margin: 6px 0 2px; }
+.ht-export-raw input { width: 14px; height: 14px; margin-top: 2px; accent-color: var(--nw-green); }
+.ht-export-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
+.ht-export-progress { display: flex; flex-direction: column; gap: 8px; align-items: flex-start; }
+.ht-export-banner { display: flex; align-items: center; gap: 7px; font-size: 13px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--nw-line); }
+.ht-export-ok { color: #157347; border-color: #15734740; background: #15734712; }
+.ht-export-warn { color: #b45309; border-color: #b4530940; background: #b4530912; }
+/* Row-level export entry in the history list. */
+.nw-task-row .ht-export-open { flex-shrink: 0; align-self: center; color: var(--nw-muted); }
+.nw-task-row .ht-export-open:hover { color: var(--nw-green); }

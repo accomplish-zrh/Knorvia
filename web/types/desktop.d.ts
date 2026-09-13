@@ -59,6 +59,21 @@ type DesktopChrome = {
   onWindowState(callback: (state: DesktopWindowState) => void): () => void;
 };
 
+type DesktopUpdateDownloadTask = {
+  id: string;
+  url: string;
+  name: string;
+  version?: string;
+  sha256: string;
+  verified: boolean;
+  state: "downloading" | "cancelled" | "failed" | "published" | "cancelling";
+  receivedBytes: number;
+  totalBytes: number;
+  destinationDir: string;
+  publishedPath: string;
+  error: string;
+};
+
 interface Window {
   knorviaDesktop?: {
     fetch(request: DesktopHttpRequest): Promise<DesktopHttpResponse>;
@@ -67,6 +82,14 @@ interface Window {
     wsClose(id: string): void;
     onWsEvent(id: string, callback: (event: { type: string; data?: string; error?: string }) => void): () => void;
     chrome?: DesktopChrome;
+    update?: {
+      check(): Promise<unknown>;
+      startDownload(params: { url: string; name: string; version?: string; sha256?: string; digest?: string; size?: number }): Promise<{ ok: boolean; task?: DesktopUpdateDownloadTask; error?: string }>;
+      downloadStatus(): Promise<{ managerAvailable: boolean; unavailableError: string | null; task: DesktopUpdateDownloadTask | null }>;
+      cancelDownload(): Promise<{ cancelled: boolean }>;
+      openDownload(): Promise<{ opened: boolean }>;
+      chooseDownloadDir(): Promise<{ ok: boolean; dir?: string; error?: string }>;
+    };
     notifications?: {
       setPreferences(prefs: { enabled: boolean; completed: boolean; failed: boolean; cancelled: boolean; interrupted: boolean }): void;
       onOpenThread(callback: (threadId: string) => void): () => void;
@@ -76,6 +99,11 @@ interface Window {
       setBuiltin(id: string): Promise<{ id: string; src: string | null }>;
       importCustom(): Promise<{ id: string; src: string | null }>;
       clear(): Promise<{ id: string; src: string | null }>;
+    };
+    migration?: {
+      retry(): Promise<{ status: "ready" | "blocked" | "idle"; code?: string }>;
+      openLegacy(): void;
+      exit(): void;
     };
   };
 }

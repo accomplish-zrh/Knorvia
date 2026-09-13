@@ -40,6 +40,79 @@ const captionSchema = { type: 'object', properties: { startFrame: { type: 'integ
 TOOLS.find(t => t.name === 'media_edit').inputSchema.properties.edit.properties.captions = { type: 'array', maxItems: 3000, items: captionSchema };
 TOOLS.push({ name: 'media_subtitles', description: 'Transcribe edit audio locally with the user-configured whisper.cpp program/model. No remote model charges. start takes project id, revision and idempotencyKey; status/cancel take subtitle job id. apply takes subtitle job id and unchanged project revision; never overwrite a changed edit. import/export take project id and revision, import also needs SRT content. Recognition is provisional until reviewed; results are saved in the personal library. Edit caption text/timing with media_edit update. Configuration must be set by the user in the UI.', inputSchema: { type: 'object', properties: { action: { type: 'string', enum: ['start', 'status', 'cancel', 'apply', 'import', 'export'] }, id: { type: 'string' }, revision: { type: 'integer' }, idempotencyKey: { type: 'string' }, content: { type: 'string' } }, required: ['action', 'id'], additionalProperties: false } });
 TOOLS.push({ name: 'media_retake', description: 'Regenerate a selected segment using a video model that supports both firstFrame and lastFrame. This is boundary-frame-conditioned generation, not video-conditioned editing. start takes project id/revision, clipId, source-relative startFrame/endFrame (30 fps), profileId, prompt and idempotencyKey. Uses provider credits and Agent-enabled connections only. Original media is preserved. Read status, preview in UI, then apply with the unchanged project revision. Candidate is retimed to exactly replace the range; undo takes project id/revision and works only before further edits. Cancellation cannot guarantee remote billing stops. Never resubmit uncertain child jobs.', inputSchema: { type: 'object', properties: { action: { type: 'string', enum: ['start', 'status', 'cancel', 'apply', 'undo'] }, id: { type: 'string' }, revision: { type: 'integer' }, clipId: { type: 'string' }, startFrame: { type: 'integer' }, endFrame: { type: 'integer' }, profileId: { type: 'string' }, prompt: { type: 'string' }, idempotencyKey: { type: 'string' } }, required: ['action', 'id'], additionalProperties: false } });
+const canvasNodeSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: 'Unique node identifier' },
+    kind: { type: 'string', enum: ['text', 'asset', 'image', 'video'], description: 'Node kind' },
+    title: { type: 'string', description: 'Node title (max 120 chars)' },
+    x: { type: 'number', description: 'Finite X coordinate' },
+    y: { type: 'number', description: 'Finite Y coordinate' },
+    prompt: { type: 'string', description: 'Node prompt text (max 8000 chars)' },
+    profileId: { type: 'string', description: 'Model connection profile ID' },
+    reference: {
+      type: 'object',
+      properties: {
+        id: { type: 'string', description: 'Personal library entry ID' },
+        version: { type: 'string', description: 'Exact 64-char SHA-256 version hash' },
+        name: { type: 'string', description: 'Optional reference display name' },
+      },
+      required: ['id', 'version'],
+      additionalProperties: false,
+    },
+    settings: {
+      type: 'object',
+      properties: {
+        size: { type: 'string' },
+        aspect: { type: 'string' },
+        count: { type: 'integer', minimum: 1, maximum: 4 },
+        seconds: { type: 'integer', minimum: 1, maximum: 60 },
+        quality: { type: 'string' },
+      },
+      additionalProperties: false,
+    },
+    jobId: { type: 'string', description: 'Server-owned generation job ID (read-only)' },
+  },
+  required: ['id', 'kind', 'x', 'y'],
+  additionalProperties: false,
+};
+
+const canvasEdgeSchema = {
+  type: 'object',
+  properties: {
+    id: { type: 'string', description: 'Unique edge identifier' },
+    from: { type: 'string', description: 'Source node ID' },
+    to: { type: 'string', description: 'Target node ID' },
+    role: { type: 'string', enum: ['context', 'reference', 'firstFrame', 'lastFrame'], description: 'Connection role' },
+  },
+  required: ['id', 'from', 'to', 'role'],
+  additionalProperties: false,
+};
+
+TOOLS.push({
+  name: 'media_canvas',
+  description: 'Manage and generate on personal infinite canvases. Actions: list (optional threadId, query), create (title, threadId, globalPrompt, nodes, edges, idempotencyKey), read (id), save (id, revision, title, globalPrompt, nodes, edges), generate (id, revision, nodeId, idempotencyKey - revision and idempotencyKey are required for generation). Always read before save/generate and provide expected revision for CAS protection. Do not resubmit running or uncertain jobs. Generate only upon user request; uses user-configured and Agent-enabled media models.',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      action: { type: 'string', enum: ['list', 'create', 'read', 'save', 'generate'] },
+      id: { type: 'string' },
+      revision: { type: 'integer' },
+      expectedRevision: { type: 'integer' },
+      nodeId: { type: 'string' },
+      idempotencyKey: { type: 'string' },
+      threadId: { type: 'string' },
+      query: { type: 'string' },
+      title: { type: 'string' },
+      name: { type: 'string' },
+      globalPrompt: { type: 'string' },
+      nodes: { type: 'array', items: canvasNodeSchema },
+      edges: { type: 'array', items: canvasEdgeSchema },
+    },
+    required: ['action'],
+    additionalProperties: false,
+  },
+});
 // Single dispatch shared by the Kernel MCP endpoint and the external creative
 // CLI, so both entrances apply identical revision/idempotency semantics.
 async function callMediaTool({ studio, library, name, params = {} }) {
@@ -109,6 +182,12 @@ async function callMediaTool({ studio, library, name, params = {} }) {
       else if (action === 'remove') value = await studio.handlers['studio/template/remove']({ id: params.id, expectedRevision: params.expectedRevision });
       else throw expose('Invalid template action');
     }
+    else if (name === 'media_canvas') {
+      const { action = 'list', ...args } = params;
+      if (!['list', 'create', 'read', 'save', 'generate'].includes(action)) throw expose('Invalid canvas action');
+      if (action === 'generate') value = await studio.handlers['studio/canvas/generate']({ ...args, agentRequested: true });
+      else value = await studio.handlers[`studio/canvas/${action}`](args);
+    }
     else throw expose('Unknown media tool');
     return value;
   } catch (error) {
@@ -121,6 +200,8 @@ async function callMediaTool({ studio, library, name, params = {} }) {
 
 async function createStudioMcp({ getStudio, getLibrary, getLearning, getCatalog }) {
   const token = crypto.randomBytes(32).toString('hex');
+  const activeCalls = new Set();
+  let closing = false;
   // Learning/catalog packs extend the Kernel's tool surface with the same
   // descriptors the creative CLI serves; hosts opt in by passing the getters.
   const packTools = () => [...(getLearning?.()?.toolDescriptors?.() ?? []), ...(getCatalog?.()?.toolDescriptors?.() ?? [])];
@@ -131,6 +212,7 @@ async function createStudioMcp({ getStudio, getLibrary, getLearning, getCatalog 
   };
   const server = http.createServer(async (req, res) => {
     const send = (status, result) => { res.writeHead(status, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(result ? JSON.stringify(result) : undefined); };
+    if (closing) { send(503); return; }
     if (req.url !== '/mcp' || req.headers.authorization !== `Bearer ${token}` || req.headers.origin) { send(403); return; }
     if (req.method !== 'POST') { send(405); return; }
     let length = 0; const chunks = []; let message;
@@ -148,8 +230,13 @@ async function createStudioMcp({ getStudio, getLibrary, getLearning, getCatalog 
       const { name, arguments: params = {} } = message.params || {};
       let value;
       try {
-        const packValue = await callPackTool(name, params);
-        value = packValue !== undefined ? packValue : await callMediaTool({ studio, library, name, params });
+        const operation = (async () => {
+          const packValue = await callPackTool(name, params);
+          return packValue !== undefined ? packValue : callMediaTool({ studio, library, name, params });
+        })();
+        activeCalls.add(operation);
+        try { value = await operation; }
+        finally { activeCalls.delete(operation); }
       } catch (error) {
         const replyText = error.rpc?.message || (error.expose === true ? error.message : 'The media request failed unexpectedly; details were written to the application log');
         reply({ content: [{ type: 'text', text: replyText }], isError: true });
@@ -163,6 +250,16 @@ async function createStudioMcp({ getStudio, getLibrary, getLearning, getCatalog 
   });
   server.headersTimeout = 10000; server.requestTimeout = 30000;
   await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
-  return { env: { KNORVIA_STUDIO_MCP_URL: `http://127.0.0.1:${server.address().port}/mcp`, KNORVIA_STUDIO_MCP_TOKEN: token }, async close() { server.closeAllConnections(); await new Promise(resolve => server.close(resolve)); } };
+  return { env: { KNORVIA_STUDIO_MCP_URL: `http://127.0.0.1:${server.address().port}/mcp`, KNORVIA_STUDIO_MCP_TOKEN: token }, async close(context = {}) {
+    closing = true;
+    server.closeAllConnections();
+    const serverClosed = new Promise(resolve => server.close(resolve));
+    const drained = Promise.allSettled([serverClosed, ...activeCalls]).then(() => true);
+    if (!context.signal) { await drained; return { confirmed: true, ownedPids: [], detail: 'Studio MCP admissions frozen and calls drained' }; }
+    if (context.signal.aborted) return { confirmed: false, ownedPids: [], detail: `${activeCalls.size} Studio MCP call(s) remained in flight` };
+    const aborted = new Promise(resolve => context.signal.addEventListener('abort', () => resolve(false), { once: true }));
+    if (!await Promise.race([drained, aborted])) return { confirmed: false, ownedPids: [], detail: `${activeCalls.size} Studio MCP call(s) remained in flight` };
+    return { confirmed: true, ownedPids: [], detail: 'Studio MCP admissions frozen and calls drained' };
+  } };
 }
 module.exports = { createStudioMcp, callMediaTool, TOOLS };

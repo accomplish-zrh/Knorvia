@@ -220,6 +220,8 @@ async function main() {
           'learning.sources', 'learning.lecture.create', 'learning.lecture.read',
           'learning.quiz.create', 'learning.quiz.read', 'learning.attempt.record',
           'learning.mastery.read', 'learning.review.due',
+          'learning.practice.start', 'learning.practice.read', 'learning.practice.answer', 'learning.practice.assess', 'learning.practice.due',
+          'creative.brief.create', 'creative.brief.read', 'creative.brief.review',
           'catalog.list', 'catalog.preflight',
         ],
       },

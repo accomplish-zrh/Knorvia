@@ -1,25 +1,36 @@
 "use client";
 
 import Link from "next/link";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { ArrowRight, BarChart3, Code2, FileText, FolderOpen, Pencil, Plus } from "lucide-react";
 import { displayTime, taskStatus, type Workspace } from "@/lib/native-workbench-state";
 import { useWorkbench } from "./NativeWorkbenchProvider";
 import { TaskComposer } from "./TaskComposer";
 import { TaskView } from "./TaskView";
 import { ProjectDialog, StatusLabel } from "./WorkbenchShell";
-import { OutputsView } from "./OutputsView";
+import { UnifiedLibraryView } from "./UnifiedLibraryView";
 import { ExtensionsView } from "./WorkspaceSettings";
 import { ProjectView } from "./ProjectExplorer";
 import { AutomationsView } from "./AutomationsView";
 import { GoalsView } from "./GoalsView";
 import { HistoryView } from "./HistoryView";
 import { BotsView } from "./BotsView";
+import { readCanvasHandoff, keepCanvasHandoff, type CanvasHandoff } from '@/lib/native-canvas-recovery';
+import { saveTaskView } from '@/lib/native-task-view';
+import { openPanelTab } from '@/lib/native-panel';
+import { readProjectContextFiles, removeProjectContextFiles } from '@/lib/native-project-context';
 import { MemoryView } from "./MemoryView";
 
 function HomeView() {
-  const { t, threads, workspaces, workspaceId, locale } = useWorkbench();
+  const { t, threads, workspaces, workspaceId, locale, newTask } = useWorkbench();
   const [suggestion, setSuggestion] = useState("");
+  const [canvas, setCanvas] = useState<CanvasHandoff>();
+  // B04: the new-task view shows the structured per-project file context the
+  // project explorer collects. Same chips and cleanup rules as a task page.
+  const [contextFiles, setContextFiles] = useState<string[]>([]);
+  useEffect(() => { setContextFiles(readProjectContextFiles(workspaceId)); }, [workspaceId]);
+  useEffect(() => { let disposed = false; void Promise.resolve().then(() => { if (!disposed) setCanvas(readCanvasHandoff()); }); return () => { disposed = true; }; }, []);
+  const clearCanvas = (text: string) => { setCanvas(current => current?.text === text ? undefined : current); if (readCanvasHandoff()?.text === text) keepCanvasHandoff(); };
   const recent = threads.filter(thread => thread.workspaceId === workspaceId && thread.status !== "archived").slice(0, 4);
   const prompts = [
     { label: t("整理资料", "Explore files"), icon: FolderOpen, text: t("阅读这个项目的资料，整理关键结论、待解决的问题和下一步建议。", "Read the files in this project and organize the key findings, open questions, and next steps.") },
@@ -28,8 +39,12 @@ function HomeView() {
     { label: t("分析数据", "Analyze data"), icon: BarChart3, text: t("分析项目里的数据，检查质量，找出重要趋势，并把结果整理成易读的结论。", "Analyze the data in this project, check its quality, identify important trends, and explain the findings clearly.") },
   ];
   return <div className="nw-home"><div className="nw-home-hero">
-    <header className="nw-welcome-heading"><h1>{t("今天，想做些什么？", "What would you like to do?")}</h1></header>
-    <TaskComposer suggestion={suggestion} onSuggestionUsed={() => setSuggestion("")} />
+    <header className="nw-welcome-heading">
+      <div className="nw-luminous-emblem" aria-hidden="true" />
+      <h1><span className="nw-minimal-title">{t("今天，想做些什么？", "What would you like to do?")}</span><span className="nw-luminous-title">{t("把想象，变成你的作品。", "Make something of your ideas.")}</span></h1>
+      <p className="nw-luminous-intro">{t("从一个想法开始，让 Knorvia 帮你推进。", "Start with an idea. Let Knorvia help you take it further.")}</p>
+    </header>
+    <TaskComposer canvasContext={canvas?.text} onCanvasContextUsed={clearCanvas} suggestion={suggestion} onSuggestionUsed={() => setSuggestion("")} contextFiles={contextFiles} onRemoveContextFile={path => { removeProjectContextFiles(workspaceId, [path]); setContextFiles(current => current.filter(value => value !== path)); }} onContextFilesUsed={paths => { removeProjectContextFiles(workspaceId, paths); setContextFiles(readProjectContextFiles(workspaceId)); }} onCreate={async (text, options) => { const id = await newTask(text, options); if (canvas) saveTaskView(id, { panel: { open: true, content: openPanelTab({ tabs: [], active: null }, { kind: 'canvas', id: canvas.id }) } }); return id; }} onThreadOpened={id => { if (canvas) saveTaskView(id, { panel: { open: true, content: openPanelTab({ tabs: [], active: null }, { kind: 'canvas', id: canvas.id }) } }); }} />
     <div className="nw-starters" role="group" aria-label={t("快速开始", "Quick start")}>{prompts.map(prompt => <button key={prompt.label} onClick={() => setSuggestion(prompt.text)}><prompt.icon size={16} strokeWidth={1.6} /><span>{prompt.label}</span></button>)}</div></div>
     {recent.length > 0 && <section className="nw-home-recents"><div className="nw-list-heading"><h2>{t("继续推进", "Pick up where you left off")}</h2><Link href="/workbench/history">{t("全部任务", "All tasks")}<ArrowRight size={13} /></Link></div><div className="nw-task-rows">{recent.map(thread => <Link className="nw-task-row" key={thread.id} href={`/workbench/task/${encodeURIComponent(thread.id)}`}><div><strong>{thread.title}</strong><span>{workspaces.find(project => project.id === thread.workspaceId)?.title}</span></div><StatusLabel status={taskStatus(thread)} /><time>{displayTime(thread.updatedAt, locale)}</time><ArrowRight size={15} /></Link>)}</div></section>}
   </div>;
@@ -55,7 +70,7 @@ export function WorkbenchView({ view = [] }: { view?: string[] }) {
   if (pathname === "/workbench/goals") return <GoalsView />;
   if (["/workbench/history", "/workbench/activity"].includes(pathname)) return <HistoryView />;
   if (["/workbench/projects", "/workbench/workspaces"].includes(pathname)) return <ProjectsView />;
-  if (pathname === "/workbench/artifacts") return <OutputsView />;
+  if (pathname === "/workbench/artifacts") return <UnifiedLibraryView view="outputs" />;
   if (pathname === "/workbench/packs") return <ExtensionsView />;
   // The persistent layout owns settings so category navigation keeps unsaved fields.
   if (view[0] === "settings") return null;

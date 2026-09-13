@@ -10,10 +10,8 @@
  */
 
 const { spawn } = require("child_process");
-
-let helper;
-let helperReady = false;
-const pending = [];
+const fs = require("node:fs");
+const path = require("node:path");
 
 const BOOTSTRAP = `
 Add-Type @"
@@ -30,35 +28,112 @@ public static class KnorviaRgn {
   }
 }
 "@
+
 Write-Output READY
 `;
 
-function send(line) {
-  if (process.platform !== "win32") return;
-  if (!helper || helper.killed || helper.exitCode != null) {
-    helperReady = false;
-    helper = spawn("powershell.exe", ["-NoProfile", "-STA", "-Command", "-"], {
-      windowsHide: true,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-    helper.stdin.setDefaultEncoding("utf8");
-    helper.stdout.on("data", (chunk) => {
-      if (String(chunk).includes("READY")) {
-        helperReady = true;
-        const queue = pending.splice(0, pending.length);
-        for (const item of queue) helper.stdin.write(item);
-      }
-    });
-    helper.on("exit", () => {
-      helperReady = false;
-      helper = null;
-    });
-    helper.stdin.write(BOOTSTRAP);
+function resolvePowerShell({ env = process.env, arch = process.arch, exists = fs.existsSync } = {}) {
+  const envValue = (name) => env[Object.keys(env).find((key) => key.toLowerCase() === name)];
+  const roots = [envValue("systemroot"), envValue("windir"), "C:\\Windows"];
+  for (const root of new Set(roots)) {
+    if (typeof root !== "string" || !path.win32.isAbsolute(root)) continue;
+    // A 32-bit helper on 64-bit Windows needs the unredirected system directory.
+    for (const system of arch === "ia32" ? ["Sysnative", "System32"] : ["System32"]) {
+      const command = path.win32.join(root, system, "WindowsPowerShell", "v1.0", "powershell.exe");
+      if (exists(command)) return command;
+    }
   }
-  const payload = `${line}\n`;
-  if (helperReady) helper.stdin.write(payload);
-  else pending.push(payload);
+  return null;
 }
+
+function createCornerCommandSender({
+  spawnProcess = spawn,
+  platform = process.platform,
+  resolveCommand = resolvePowerShell,
+  warn = (message) => console.warn(message),
+  startupTimeoutMs = 15000,
+} = {}) {
+  let helper = null;
+  let ready = false;
+  let disabled = false;
+  let timer;
+  let output = "";
+  const pending = new Map();
+
+  function stop(error) {
+    if (disabled) return;
+    disabled = true;
+    ready = false;
+    clearTimeout(timer);
+    pending.clear();
+    const child = helper;
+    helper = null;
+    // This is optional window decoration. A missing shell or broken pipe must
+    // never become an unhandled main-process error or a spawn loop on resize.
+    try { child?.stdin?.end(); } catch { /* already closed */ }
+    try { child?.kill(); } catch { /* already exited */ }
+    if (error) warn(`[Knorvia] Custom window corners unavailable (${error.code || error.message}); using system corners.`);
+  }
+
+  function write(payload) {
+    if (disabled || !helper) return false;
+    try {
+      helper.stdin.write(payload, (error) => { if (error) stop(error); });
+      return !disabled;
+    } catch (error) {
+      stop(error);
+      return false;
+    }
+  }
+
+  function flush() {
+    const queue = [...pending.values()];
+    pending.clear();
+    for (const payload of queue) if (!write(payload)) break;
+  }
+
+  function send(line, windowKey = "main") {
+    if (platform !== "win32" || disabled) return false;
+    pending.set(windowKey, `${line}\n`);
+    if (!helper) {
+      try {
+        const command = resolveCommand();
+        if (!command) throw Object.assign(new Error("Windows PowerShell is unavailable"), { code: "ENOENT" });
+        helper = spawnProcess(command, ["-NoProfile", "-NonInteractive", "-STA", "-Command", "-"], {
+          windowsHide: true,
+          stdio: ["pipe", "pipe", "pipe"],
+        });
+        helper.on("error", stop);
+        helper.on("exit", (code) => stop(new Error(`helper exited: ${code}`)));
+        helper.stdin.on("error", stop);
+        helper.stdout.on("error", stop);
+        helper.stderr.on("error", stop);
+        helper.stderr.on("data", () => {});
+        helper.stdout.on("data", (chunk) => {
+          if (disabled || ready) return;
+          output = (output + String(chunk)).slice(-4096);
+          if (/(?:^|\r?\n)READY\r?\n/.test(output)) {
+            ready = true;
+            clearTimeout(timer);
+            flush();
+          }
+        });
+        helper.stdin.setDefaultEncoding("utf8");
+        timer = setTimeout(() => stop(new Error("helper startup timed out")), startupTimeoutMs);
+        timer.unref?.();
+        write(BOOTSTRAP);
+      } catch (error) {
+        stop(error);
+      }
+    }
+    if (ready) flush();
+    return !disabled;
+  }
+
+  return { send, dispose: () => stop() };
+}
+
+const cornerCommands = createCornerCommandSender();
 
 function hwndOf(win) {
   try {
@@ -78,8 +153,7 @@ function applyWindowCornerRegion(win, radiusDip, { square = false } = {}) {
     square || win.isMaximized?.() || win.isFullScreen?.(),
   );
   if (forceSquare) {
-    send(`[KnorviaRgn]::Clear(${hwnd}L)`);
-    return true;
+    return cornerCommands.send(`[KnorviaRgn]::Clear(${hwnd}L)`, String(hwnd));
   }
   const [dipW, dipH] = win.getSize();
   let factor = 1;
@@ -92,8 +166,7 @@ function applyWindowCornerRegion(win, radiusDip, { square = false } = {}) {
   const width = Math.max(1, Math.round(dipW * factor));
   const height = Math.max(1, Math.round(dipH * factor));
   const diameter = Math.max(2, Math.round(radiusDip * 2 * factor));
-  send(`[KnorviaRgn]::Round(${hwnd}L, ${width}, ${height}, ${diameter})`);
-  return true;
+  return cornerCommands.send(`[KnorviaRgn]::Round(${hwnd}L, ${width}, ${height}, ${diameter})`, String(hwnd));
 }
 
-module.exports = { applyWindowCornerRegion };
+module.exports = { applyWindowCornerRegion, resolvePowerShell, createCornerCommandSender };

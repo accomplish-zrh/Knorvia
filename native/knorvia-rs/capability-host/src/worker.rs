@@ -52,6 +52,8 @@ pub fn worker_env() -> Vec<(String, String)> {
         "KNORVIA_PROVIDER_MODEL",
         "KNORVIA_PROVIDER_BASE_URL",
         "KNORVIA_PROVIDER_API_KEY",
+        "KNORVIA_WORKER_FIXTURE_DELAY_MS",
+        "KNORVIA_WORKER_FIXTURE_PID_DIR",
     ];
     for key in ALLOWLIST {
         if let Ok(value) = std::env::var(key) {
@@ -95,8 +97,269 @@ pub fn resolve_worker_bin() -> Result<PathBuf, WorkerError> {
     ))
 }
 
-pub struct PackWorkerClient {
+/// Owns every process spawned for one worker: on Windows the worker is
+/// assigned to a dedicated Job Object with KILL_ON_JOB_CLOSE, so a cancel
+/// reclaims the worker AND any descendant it spawned (a grandchild holding
+/// the inherited stdout pipe cannot survive its parent's cancellation).
+/// Closing the job handle on drop is itself a kill switch.
+struct ProcessGroup {
     child: Arc<Mutex<Child>>,
+    termination: Mutex<()>,
+    reclaimed: AtomicBool,
+    #[cfg(windows)]
+    job: std::sync::atomic::AtomicIsize,
+}
+
+#[cfg(windows)]
+impl ProcessGroup {
+    /// Spawn the worker into its own killable job and take the stdio pipes.
+    fn spawn(
+        cmd: &mut Command,
+    ) -> Result<(Arc<Self>, ChildStdin, BufReader<ChildStdout>), WorkerError> {
+        use std::os::windows::process::CommandExt;
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject, TerminateJobObject,
+        };
+        cmd.creation_flags(0x00000004 | 0x08000000); // suspended + no visible window
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| WorkerError::Transport(e.to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| WorkerError::Transport("worker stdin missing".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| WorkerError::Transport("worker stdout missing".into()))?;
+        let group = Arc::new(Self {
+            child: Arc::new(Mutex::new(child)),
+            termination: Mutex::new(()),
+            reclaimed: AtomicBool::new(false),
+            job: std::sync::atomic::AtomicIsize::new(0),
+        });
+        unsafe {
+            let job = CreateJobObjectW(std::ptr::null(), std::ptr::null());
+            if job.is_null() {
+                return Err(WorkerError::Transport(
+                    "worker job object could not be created".into(),
+                ));
+            }
+            let mut limit = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+            limit.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            let configured = SetInformationJobObject(
+                job,
+                JobObjectExtendedLimitInformation,
+                &limit as *const _ as *const core::ffi::c_void,
+                std::mem::size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+            );
+            let assigned = if configured != 0 {
+                use std::os::windows::io::AsRawHandle;
+                let handle = group
+                    .child
+                    .lock()
+                    .ok()
+                    .map(|mut child| child.as_raw_handle());
+                match handle {
+                    Some(handle) => AssignProcessToJobObject(job, handle),
+                    None => 0,
+                }
+            } else {
+                0
+            };
+            if configured == 0 || assigned == 0 {
+                // Fail closed: the worker must never outlive its job.
+                TerminateJobObject(job, 1);
+                let _ = CloseHandle(job);
+                group.kill();
+                return Err(WorkerError::Transport(
+                    "worker could not be placed under its killable job".into(),
+                ));
+            }
+            group
+                .job
+                .store(job as isize, std::sync::atomic::Ordering::SeqCst);
+        }
+        // No worker instruction can run before Job Object assignment, closing
+        // the escape window for children created immediately at process start.
+        if let Err(error) = resume_worker(&group) {
+            group.kill();
+            return Err(error);
+        }
+        Ok((group, stdin, BufReader::new(stdout)))
+    }
+
+    /// Kill the whole tree: terminate the job (worker + descendants), then
+    /// reap the direct child so no zombie or file lock outlives the cancel.
+    fn kill(&self) -> bool {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject, TerminateJobObject,
+        };
+        let _termination = self.termination.lock().unwrap_or_else(|e| e.into_inner());
+        if self.reclaimed.load(Ordering::Acquire) {
+            return true;
+        }
+        let job = self.job.swap(0, Ordering::SeqCst);
+        let mut tree_gone = job == 0;
+        if job != 0 {
+            unsafe {
+                TerminateJobObject(job as _, 1);
+                let deadline = std::time::Instant::now() + Duration::from_secs(2);
+                loop {
+                    let mut accounting = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+                    let read = QueryInformationJobObject(
+                        job as _,
+                        JobObjectBasicAccountingInformation,
+                        &mut accounting as *mut _ as _,
+                        std::mem::size_of_val(&accounting) as u32,
+                        std::ptr::null_mut(),
+                    );
+                    if read != 0 && accounting.ActiveProcesses == 0 {
+                        tree_gone = true;
+                        break;
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                CloseHandle(job as _);
+            }
+        }
+        let child_gone = if let Ok(mut child) = self.child.lock() {
+            let _ = child.kill();
+            child.wait().is_ok()
+        } else {
+            false
+        };
+        self.reclaimed
+            .store(tree_gone && child_gone, Ordering::Release);
+        tree_gone && child_gone
+    }
+}
+
+#[cfg(windows)]
+fn resume_worker(group: &ProcessGroup) -> Result<(), WorkerError> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    let pid = group.child.lock().unwrap_or_else(|e| e.into_inner()).id();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return Err(WorkerError::Transport(
+                "cannot enumerate suspended worker thread".into(),
+            ));
+        }
+        let mut entry = THREADENTRY32::default();
+        entry.dwSize = std::mem::size_of_val(&entry) as u32;
+        let mut found = Thread32First(snapshot, &mut entry);
+        let mut resumed = false;
+        while found != 0 {
+            if entry.th32OwnerProcessID == pid {
+                let thread = OpenThread(THREAD_SUSPEND_RESUME, 0, entry.th32ThreadID);
+                if !thread.is_null() {
+                    resumed = ResumeThread(thread) != u32::MAX;
+                    CloseHandle(thread);
+                }
+                break;
+            }
+            found = Thread32Next(snapshot, &mut entry);
+        }
+        CloseHandle(snapshot);
+        if resumed {
+            Ok(())
+        } else {
+            Err(WorkerError::Transport(
+                "cannot resume managed worker thread".into(),
+            ))
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+#[cfg(not(windows))]
+impl ProcessGroup {
+    fn spawn(
+        cmd: &mut Command,
+    ) -> Result<(Arc<Self>, ChildStdin, BufReader<ChildStdout>), WorkerError> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::CommandExt;
+            cmd.process_group(0);
+        }
+        let mut child = cmd
+            .spawn()
+            .map_err(|e| WorkerError::Transport(e.to_string()))?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| WorkerError::Transport("worker stdin missing".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| WorkerError::Transport("worker stdout missing".into()))?;
+        let group = Arc::new(Self {
+            child: Arc::new(Mutex::new(child)),
+            termination: Mutex::new(()),
+            reclaimed: AtomicBool::new(false),
+        });
+        Ok((group, stdin, BufReader::new(stdout)))
+    }
+
+    fn kill(&self) -> bool {
+        let _termination = self.termination.lock().unwrap_or_else(|e| e.into_inner());
+        if self.reclaimed.load(Ordering::Acquire) {
+            return true;
+        }
+        if let Ok(mut child) = self.child.lock() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(-(child.id() as i32), libc::SIGKILL);
+            }
+            let _ = child.kill();
+            let gone = child.wait().is_ok();
+            self.reclaimed.store(gone, Ordering::Release);
+            return gone;
+        }
+        false
+    }
+}
+
+#[cfg(not(windows))]
+impl Drop for ProcessGroup {
+    fn drop(&mut self) {
+        self.kill();
+    }
+}
+
+/// Cancellation-safe handle to one worker's process tree. Clone it into the
+/// cancel registry before handing the client to a render thread.
+pub struct ProcessGroupKill {
+    group: Arc<ProcessGroup>,
+}
+
+impl ProcessGroupKill {
+    pub fn kill(&self) -> bool {
+        self.group.kill()
+    }
+}
+
+pub struct PackWorkerClient {
+    group: Arc<ProcessGroup>,
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: i64,
@@ -136,21 +399,11 @@ impl PackWorkerClient {
         for (key, value) in worker_env() {
             cmd.env(key, value);
         }
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| WorkerError::Transport(e.to_string()))?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| WorkerError::Transport("worker stdin missing".into()))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| WorkerError::Transport("worker stdout missing".into()))?;
+        let (group, stdin, stdout) = ProcessGroup::spawn(&mut cmd)?;
         Ok(Self {
-            child: Arc::new(std::sync::Mutex::new(child)),
+            group,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout,
             next_id: 1,
             event_sink: None,
         })
@@ -176,17 +429,26 @@ impl PackWorkerClient {
 
     pub fn is_alive(&self) -> bool {
         matches!(
-            self.child.lock().ok().and_then(|mut c| c.try_wait().ok()),
+            self.group
+                .child
+                .lock()
+                .ok()
+                .and_then(|mut c| c.try_wait().ok()),
             Some(None)
         )
     }
 
-    /// Kill the worker (cancel/crash path). Reaps the process so file locks
-    /// are released.
+    /// Kill the worker's whole process tree (cancel/crash path) and reap the
+    /// direct child so no pipe holder or file lock outlives the cancel.
     pub fn kill(&mut self) {
-        if let Ok(mut child) = self.child.lock() {
-            let _ = child.kill();
-            let _ = child.wait();
+        self.group.kill();
+    }
+
+    /// Shared kill handle for cancellation paths that do not own the client
+    /// (a render is in flight on another thread). Killing is idempotent.
+    pub fn kill_handle(&self) -> ProcessGroupKill {
+        ProcessGroupKill {
+            group: Arc::clone(&self.group),
         }
     }
 
@@ -250,7 +512,7 @@ impl PackWorkerClient {
         self.write_msg(&msg)?;
 
         let watchdog_fired = Arc::new(AtomicBool::new(false));
-        let child = Arc::clone(&self.child);
+        let child = Arc::clone(&self.group.child);
         let secs = RENDER_TIMEOUT_SECS;
         let watchdog_flag = Arc::clone(&watchdog_fired);
         std::thread::spawn(move || {
@@ -266,6 +528,10 @@ impl PackWorkerClient {
             }
         });
         let result = self.read_response(request_id);
+        // Retire the watchdog: without this, a completed request still kept
+        // its watchdog thread sleeping until the full deadline. The flag is
+        // also what classifies a transport failure after a kill as deadline.
+        watchdog_fired.store(true, Ordering::Relaxed);
         // Detach the watchdog: it exits on its own flag once the response
         // arrives; joining here would block fast callers for the full
         // deadline. The deadline classification uses the watchdog flag, not

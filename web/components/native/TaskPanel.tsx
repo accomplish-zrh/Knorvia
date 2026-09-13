@@ -1,9 +1,10 @@
 "use client";
 
+import dynamic from "next/dynamic";
 import { useEffect, useRef, useState, type CSSProperties, type Dispatch, type SetStateAction } from "react";
-import { Activity, FileText, FolderOpen, GitCompareArrows, Globe, Maximize2, MessageCirclePlus, Minimize2, PanelRightClose, Plus, TerminalSquare, X } from "lucide-react";
+import { Activity, FileText, FolderOpen, GitCompareArrows, LayoutGrid, Globe, Maximize2, MessageCirclePlus, Minimize2, PanelRightClose, Plus, TerminalSquare, X } from "lucide-react";
 import { itemText, type Artifact, type ThreadSnapshot } from "@/lib/native-workbench-state";
-import { closePanelTab, previewUrl, type PanelTab, type PanelTabView, type PanelState, type PanelTarget } from "@/lib/native-panel";
+import { closePanelTab, panelKey, previewUrl, type PanelTab, type PanelTabView, type PanelState, type PanelTarget } from "@/lib/native-panel";
 import { errorText, useWorkbench } from "./NativeWorkbenchProvider";
 import { ItemDetail } from "./TaskTimeline";
 import { ProjectExplorer } from "./ProjectExplorer";
@@ -13,19 +14,24 @@ import { TerminalPanel } from "./TerminalPanel";
 import { useLocalPreference } from "./useLocalPreference";
 import { RemoteWorkspace } from "./RemoteWorkspace";
 
+const CanvasWorkspace = dynamic(() => import("./CanvasWorkspace").then(m => m.CanvasWorkspace), { ssr: false });
+
 export type PanelMode = "files" | "changes" | "activity";
 function parseWidth(raw: string) {
   const value = Number(raw);
   return Number.isFinite(value) && value >= 360 ? Math.min(880, value) : 480;
 }
-const iconFor = (target: PanelTarget) => target.kind === "ssh" ? TerminalSquare : target.kind === "terminal" ? TerminalSquare : target.kind === "files" ? FolderOpen : target.kind === "browser" ? Globe : target.kind === "chat" ? MessageCirclePlus : target.kind === "changes" ? GitCompareArrows : target.kind === "activity" ? Activity : FileText;
+const iconFor = (target: PanelTarget) => target.kind === "canvas" ? LayoutGrid : target.kind === "ssh" ? TerminalSquare : target.kind === "terminal" ? TerminalSquare : target.kind === "files" ? FolderOpen : target.kind === "browser" ? Globe : target.kind === "chat" ? MessageCirclePlus : target.kind === "changes" ? GitCompareArrows : target.kind === "activity" ? Activity : FileText;
 
-export function TaskPanel({ thread, open, state, setState, close, onUseFile, openContent }: {
-  thread: ThreadSnapshot; open: boolean; state: PanelState; setState: Dispatch<SetStateAction<PanelState>>; close: () => void; onUseFile: (path: string) => void; openContent: (target: PanelTarget) => void;
+export function TaskPanel({ thread, open, state, setState, close, onUseFile, openContent, onUseCanvas }: {
+  thread: ThreadSnapshot; open: boolean; state: PanelState; setState: Dispatch<SetStateAction<PanelState>>; close: () => void; onUseFile: (path: string) => void; openContent: (target: PanelTarget) => void; onUseCanvas?: (text: string) => void;
 }) {
   const { t, request, setError } = useWorkbench();
   const updateView = (id: string, view: Partial<PanelTabView>) => setState(current => ({ ...current, tabs: current.tabs.map(tab => tab.id === id ? { ...tab, view: { ...tab.view, ...view } } : tab) }));
-  const updateTarget = (id: string, target: PanelTarget) => setState(current => ({ ...current, tabs: current.tabs.map(tab => tab.id === id ? { ...tab, target } : tab) }));
+  const updateTarget = (id: string, target: PanelTarget) => setState(current => {
+    const key = target.kind === 'canvas' ? panelKey(target) : id;
+    return { ...current, active: current.active === id ? key : current.active, tabs: current.tabs.filter(tab => tab.id === id || tab.id !== key).map(tab => tab.id === id ? { ...tab, id: key, target } : tab) };
+  });
   const closing = useRef(new Set<string>());
   const closeTab = async (tab: PanelTab) => {
     if (closing.current.has(tab.id)) return;
@@ -91,7 +97,7 @@ export function TaskPanel({ thread, open, state, setState, close, onUseFile, ope
     sync(); narrow.addEventListener("change", sync);
     return () => { narrow.removeEventListener("change", sync); if (center) center.inert = false; };
   }, [open, expanded]);
-  const label = (target: PanelTarget) => target.kind === "ssh" ? t("远程连接", "Remote connection") : target.kind === "terminal" ? `${t("终端", "Terminal")} ${state.tabs.filter(tab => tab.target.kind === "terminal").findIndex(tab => tab.target.kind === "terminal" && tab.target.id === target.id) + 1}` : target.kind === "file" ? target.path.split(/[\\/]/).at(-1)! : target.kind === "artifact" ? target.artifact.title : target.kind === "browser" ? (target.url ? new URL(target.url).host : t("浏览器", "Browser")) : target.kind === "chat" ? t("侧边聊天", "Side chat") : target.kind === "files" ? t("文件", "Files") : target.kind === "changes" ? t("改动", "Changes") : t("任务活动", "Activity");
+  const label = (target: PanelTarget) => target.kind === "canvas" ? t("创作画布", "Creative canvas") : target.kind === "ssh" ? t("远程连接", "Remote connection") : target.kind === "terminal" ? `${t("终端", "Terminal")} ${state.tabs.filter(tab => tab.target.kind === "terminal").findIndex(tab => tab.target.kind === "terminal" && tab.target.id === target.id) + 1}` : target.kind === "file" ? target.path.split(/[\\/]/).at(-1)! : target.kind === "artifact" ? target.artifact.title : target.kind === "browser" ? (target.url ? new URL(target.url).host : t("浏览器", "Browser")) : target.kind === "chat" ? t("侧边聊天", "Side chat") : target.kind === "files" ? t("文件", "Files") : target.kind === "changes" ? t("改动", "Changes") : t("任务活动", "Activity");
   const links = [...new Set(thread.items.filter(item => item.kind === "agentMessage").flatMap(item => itemText(item).match(/https?:\/\/[^\s<>"\])]+/g) ?? []).map(url => previewUrl(url.replace(/[.,，。；;]+$/, ""))).filter((url): url is string => Boolean(url)))].slice(-5);
   const clamp = (value: number) => Math.max(360, Math.min(880, value));
   return <>
@@ -111,6 +117,7 @@ export function TaskPanel({ thread, open, state, setState, close, onUseFile, ope
         <div className="nw-panel-actions"><button className="nw-icon" aria-label={expanded ? t("还原面板宽度", "Restore panel width") : t("扩大面板", "Expand panel")} aria-pressed={expanded} onClick={() => setExpanded(value => !value)}>{expanded ? <Minimize2 size={15} /> : <Maximize2 size={15} />}</button><button className="nw-icon" onClick={close} aria-label={t("关闭工作面板", "Close work panel")}><PanelRightClose size={17} /></button></div>
       </header>
       <div className="nw-panel-launcher" hidden={state.active !== null}><div className="nw-panel-launcher-inner"><div className="nw-panel-launch-actions">
+        <button onClick={() => openContent({ kind: "canvas" })}><LayoutGrid size={17} /><span>{t("创作画布", "Creative canvas")}</span></button>
         <button onClick={() => openContent({ kind: "files" })}><FolderOpen size={17} /><span>{t("文件", "Files")}</span><kbd>{t("Ctrl+P", "Ctrl+P")}</kbd></button>
         <button onClick={() => openContent({ kind: "chat", id: crypto.randomUUID() })}><MessageCirclePlus size={17} /><span>{t("侧边聊天", "Side chat")}</span><kbd>{t("Ctrl+Alt+S", "Ctrl+Alt+S")}</kbd></button>
         <button onClick={() => openContent({ kind: "browser" })}><Globe size={17} /><span>{t("浏览器", "Browser")}</span><kbd>{t("Ctrl+T", "Ctrl+T")}</kbd></button>
@@ -118,7 +125,7 @@ export function TaskPanel({ thread, open, state, setState, close, onUseFile, ope
         <button onClick={() => openContent({ kind: "ssh" })}><TerminalSquare size={17} /><span>{t("远程连接", "Remote connection")}</span></button>
       </div>{(links.length > 0 || outputs.length > 0) && <section className="nw-panel-recommendations"><h2>{t("推荐", "Suggested")}</h2>{links.map(url => <button key={url} title={url} onClick={() => openContent({ kind: "browser", url })}><Globe size={16} /><span>{url.replace(/^https?:\/\//, '')}</span></button>)}{outputs.map(artifact => <button key={artifact.id} title={artifact.title} onClick={() => openContent({ kind: "artifact", artifact })}><FileText size={16} /><span>{artifact.title}</span></button>)}</section>}<div className="nw-panel-secondary"><button onClick={() => openContent({ kind: "changes" })}><GitCompareArrows size={14} />{t("项目改动", "Project changes")}</button><button onClick={() => openContent({ kind: "activity" })}><Activity size={14} />{t("任务活动", "Task activity")}</button></div></div></div>
       {state.tabs.map((tab, index) => <div role="tabpanel" key={tab.id} id={`nw-content-pane-${index}`} aria-labelledby={`nw-content-tab-${index}`} hidden={state.active !== tab.id} className={`nw-panel-content nw-panel-${tab.target.kind}`}>
-        {tab.target.kind === "ssh" ? <RemoteWorkspace active={open && state.active === tab.id} threadId={thread.id} initialSessionId={tab.target.id} /> : tab.target.kind === "terminal" ? <TerminalPanel threadId={thread.id} sessionId={tab.target.id} restore={tab.target.restore} active={open && state.active === tab.id} onClose={() => void closeTab(tab)} onNew={() => openContent({ kind: "terminal", id: crypto.randomUUID() })} /> : tab.target.kind === "files" || tab.target.kind === "changes" ? <ProjectExplorer scope={{ threadId: thread.id }} mode={tab.target.kind} onModeChange={kind => openContent({ kind })} onUseFile={onUseFile} compact onFolderChange={folder => updateTarget(tab.id, { kind: "files", folder })} initialFolder={tab.target.kind === "files" ? tab.target.folder : undefined} onPreviewFile={tab.target.kind === "files" ? path => openContent({ kind: "file", path }) : undefined} /> : tab.target.kind === "file" ? <FilePanelPreview threadId={thread.id} path={tab.target.path} onUseFile={onUseFile} view={tab.view} updateView={value => updateView(tab.id, value)} /> : tab.target.kind === "artifact" ? <FilePanelPreview threadId={thread.id} artifact={tab.target.artifact} onUseFile={onUseFile} view={tab.view} updateView={value => updateView(tab.id, value)} /> : tab.target.kind === "browser" ? <BrowserPanel initialUrl={tab.target.url} view={tab.view} updateView={value => updateView(tab.id, value)} /> : tab.target.kind === "chat" ? <SideChatPanel parent={thread} tabId={tab.target.id} existingThreadId={tab.target.threadId} onThreadCreated={threadId => updateTarget(tab.id, { kind: "chat", id: tab.target.kind === "chat" ? tab.target.id : "", threadId })} /> : <div className="nw-panel-activity-body"><h2>{t("任务活动", "Task activity")}</h2>{thread.items.filter(item => !["userMessage", "agentMessage", "reasoning"].includes(item.kind)).map(item => <ItemDetail key={item.id} item={item} />)}</div>}
+        {tab.target.kind === "canvas" ? <CanvasWorkspace threadId={thread.id} initialId={tab.target.id} active={open && state.active === tab.id} onSelect={id => updateTarget(tab.id, { kind: "canvas", id })} onAskAgent={onUseCanvas} /> : tab.target.kind === "ssh" ? <RemoteWorkspace active={open && state.active === tab.id} threadId={thread.id} initialSessionId={tab.target.id} /> : tab.target.kind === "terminal" ? <TerminalPanel threadId={thread.id} sessionId={tab.target.id} restore={tab.target.restore} active={open && state.active === tab.id} onClose={() => void closeTab(tab)} onNew={() => openContent({ kind: "terminal", id: crypto.randomUUID() })} /> : tab.target.kind === "files" || tab.target.kind === "changes" ? <ProjectExplorer scope={{ threadId: thread.id }} mode={tab.target.kind} onModeChange={kind => openContent({ kind })} onUseFile={onUseFile} compact onFolderChange={folder => updateTarget(tab.id, { kind: "files", folder })} initialFolder={tab.target.kind === "files" ? tab.target.folder : undefined} onPreviewFile={tab.target.kind === "files" ? path => openContent({ kind: "file", path }) : undefined} /> : tab.target.kind === "file" ? <FilePanelPreview threadId={thread.id} path={tab.target.path} onUseFile={onUseFile} view={tab.view} updateView={value => updateView(tab.id, value)} locateLine={tab.target.line} locateColumn={tab.target.column} /> : tab.target.kind === "artifact" ? <FilePanelPreview threadId={thread.id} artifact={tab.target.artifact} onUseFile={onUseFile} view={tab.view} updateView={value => updateView(tab.id, value)} /> : tab.target.kind === "browser" ? <BrowserPanel initialUrl={tab.target.url} view={tab.view} updateView={value => updateView(tab.id, value)} /> : tab.target.kind === "chat" ? <SideChatPanel parent={thread} tabId={tab.target.id} existingThreadId={tab.target.threadId} onThreadCreated={threadId => updateTarget(tab.id, { kind: "chat", id: tab.target.kind === "chat" ? tab.target.id : "", threadId })} /> : <div className="nw-panel-activity-body"><h2>{t("任务活动", "Task activity")}</h2>{thread.items.filter(item => !["userMessage", "agentMessage", "reasoning"].includes(item.kind)).map(item => <ItemDetail key={item.id} item={item} />)}</div>}
       </div>)}
     </aside>
   </>;

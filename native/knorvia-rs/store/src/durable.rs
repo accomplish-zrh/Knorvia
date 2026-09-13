@@ -25,12 +25,14 @@ pub(super) struct DurableState {
     pub(super) last_sequence_by_stream: HashMap<String, u64>,
     pub(super) projection_owners: HashMap<(ProjectionKind, String), String>,
     pub(super) journal_fingerprints: HashMap<String, Option<JournalFingerprint>>,
+    /// How the most recent recovery ran: "full", "checkpoint", or "none".
+    pub(super) recovery_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct JournalFingerprint {
-    len: u64,
-    modified: Option<SystemTime>,
+    pub(super) len: u64,
+    pub(super) modified: Option<SystemTime>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -39,6 +41,7 @@ pub(super) enum ProjectionKind {
     Workspace,
     WorkspaceCwd,
     Goal,
+    GoalExecution,
     Task,
     Thread,
     Artifact,
@@ -54,6 +57,9 @@ pub(super) enum ProjectionKind {
     SessionBinding,
     BindingKey,
     ChatMessage,
+    KernelBinding,
+    MessageQueue,
+    RoomSend,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,6 +207,7 @@ impl ProjectionKind {
             Self::Workspace => store.ws_path(id),
             Self::WorkspaceCwd => store.workspace_cwd_path(id),
             Self::Goal => store.goal_path(id),
+            Self::GoalExecution => store.goal_execution_path(id),
             Self::Task => store.task_path(id),
             Self::Thread => store.thread_path(id),
             Self::Artifact => store.artifact_path(id),
@@ -221,6 +228,9 @@ impl ProjectionKind {
             Self::Bot => store.bot_path(id),
             Self::Room => store.room_path(id),
             Self::SessionBinding => store.binding_path(id),
+            Self::KernelBinding => store.kernel_binding_path(id),
+            Self::MessageQueue => store.message_queue_path(id),
+            Self::RoomSend => store.room_send_path(id),
             Self::BindingKey => store.binding_key_path(id),
             Self::ChatMessage => {
                 let conversation_id = document
@@ -530,8 +540,14 @@ impl ProductStore {
         if self.durable_state_is_recovered()? {
             return Ok(());
         }
+        self.invalidate_usage_index()?;
+        self.locks.replay_indexes.lock().map_err(|_| StoreError::Corrupt("replay index lock poisoned".into()))?.0.clear();
         let started = std::time::Instant::now();
         let trace = std::env::var_os("KNORVIA_RECOVERY_TRACE").is_some();
+        if let Some(transactions) = self.recover_from_checkpoint_locked(&started, trace)? {
+            let _ = transactions;
+            return Ok(());
+        }
         let transactions = self.load_transactions()?;
         if trace {
             eprintln!(
@@ -542,6 +558,7 @@ impl ProductStore {
         }
         self.reset_thread_index()?;
         self.reset_timeline_index()?;
+        self.reset_automation_index()?;
         self.apply_projection_writes_locked(&transactions, true)?;
         self.include_legacy_thread_index()?;
         self.include_legacy_timeline_index()?;
@@ -582,13 +599,212 @@ impl ProductStore {
             projection_owners,
             journal_fingerprints,
         )?;
+        {
+            let mut state = self.locks.durable.lock().map_err(|e| {
+                StoreError::Io(io::Error::other(format!(
+                    "durable state lock poisoned: {e}"
+                )))
+            })?;
+            state.recovery_mode = "full".into();
+        }
         if trace {
             eprintln!(
                 "knorvia recovery stage=complete streams={stream_count} elapsed_ms={}",
                 started.elapsed().as_millis()
             );
         }
+        // A big replay earns an automatic checkpoint so the next open takes
+        // the fast path. The checkpoint is an accelerator: a failure here is
+        // logged and ignored, never surfaced as store corruption.
+        if transactions.len() >= crate::checkpoint::AUTO_CHECKPOINT_MIN_TRANSACTIONS
+            && let Err(error) = self.write_checkpoint_locked()
+        {
+            eprintln!("knorvia checkpoint write skipped: {error}");
+        }
         Ok(())
+    }
+
+    /// Checkpoint fast path: verify the live checkpoint, replay only the
+    /// WAL tail, and refuse (falling back to full replay) on any mismatch.
+    /// Missing projection files since the checkpoint also fall back, which
+    /// restores them from the WAL exactly like the legacy path.
+    fn recover_from_checkpoint_locked(
+        &self,
+        started: &std::time::Instant,
+        trace: bool,
+    ) -> Result<Option<Vec<DurableTransaction>>, StoreError> {
+        let Some(checkpoint) = self.load_live_checkpoint()? else {
+            return Ok(None);
+        };
+        // Every checkpointed WAL file must still exist; a missing one means
+        // the frozen prefix is no longer what the checkpoint described.
+        let mut tail_ids = std::collections::HashSet::new();
+        let wal_dir = self.wal_dir();
+        let mut present = std::collections::HashSet::new();
+        if wal_dir.exists() {
+            for entry in fs::read_dir(&wal_dir)? {
+                let path = entry?.path();
+                if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    if let Some(id) = path.file_stem().and_then(|stem| stem.to_str()) {
+                        present.insert(id.to_string());
+                    }
+                }
+            }
+        }
+        for id in &checkpoint.included_transactions {
+            if !present.contains(id) {
+                return Ok(None);
+            }
+        }
+        // A changed size means the frozen file was truncated or rewritten:
+        // reject the accelerator so full replay re-validates the bytes and
+        // fails closed on unreadable history.
+        for (id, expected_len) in &checkpoint.included_lengths {
+            match fs::metadata(wal_dir.join(format!("{id}.json"))) {
+                Ok(metadata) => {
+                    if metadata.len() != *expected_len {
+                        if trace {
+                            eprintln!(
+                                "knorvia recovery checkpoint rejected: wal file {id} changed size"
+                            );
+                        }
+                        return Ok(None);
+                    }
+                }
+                Err(_) => return Ok(None),
+            }
+        }
+        for id in &present {
+            if !checkpoint.included_transactions.contains(id) {
+                tail_ids.insert(id.clone());
+            }
+        }
+        // The prefix's projections must all still be on disk. A missing one
+        // is restored by the full replay fallback, preserving the guarantee
+        // that projections are rebuildable from the WAL.
+        let missing = self.missing_projection_files(&checkpoint.projection_files)?;
+        if !missing.is_empty() {
+            if trace {
+                eprintln!(
+                    "knorvia recovery checkpoint rejected: {} projection files missing",
+                    missing.len()
+                );
+            }
+            return Ok(None);
+        }
+        let transactions = self.load_transactions_from_ids(&tail_ids)?;
+        if trace {
+            eprintln!(
+                "knorvia recovery stage=checkpoint tail={} included={} elapsed_ms={}",
+                transactions.len(),
+                checkpoint.included_transactions.len(),
+                started.elapsed().as_millis()
+            );
+        }
+        self.reset_thread_index()?;
+        self.reset_timeline_index()?;
+        self.reset_automation_index()?;
+        // The frozen prefix's projections were verified present; rebuild the
+        // directory indexes from the checkpoint so history pages cover the
+        // prefix without replaying it.
+        self.restore_thread_directory(
+            checkpoint
+                .thread_directory
+                .iter()
+                .map(|dto| crate::thread_index::ThreadDirectoryDto {
+                    id: dto.id.clone(),
+                    workspace_id: dto.workspace_id.clone(),
+                })
+                .collect(),
+        )?;
+        self.restore_timeline_entries(
+            checkpoint
+                .timeline_entries
+                .iter()
+                .map(|dto| crate::timeline_index::EntryDto {
+                    thread_id: dto.thread_id.clone(),
+                    id: dto.id.clone(),
+                    turn_id: dto.turn_id.clone(),
+                    key0: dto.key0.clone(),
+                    key1: dto.key1.clone(),
+                    status: dto.status.clone(),
+                    kind: dto.kind.clone(),
+                    dir: dto.dir.clone(),
+                    pending: dto.pending,
+                    path: dto.path.clone(),
+                })
+                .collect(),
+        )?;
+        self.apply_projection_writes_locked(&transactions, true)?;
+        self.include_legacy_thread_index()?;
+        self.include_legacy_timeline_index()?;
+        if trace {
+            let restored = self.snapshot_timeline_entries()?.len();
+            eprintln!("knorvia recovery stage=index-restore entries={restored}");
+        }
+
+        let mut streams = self.event_stream_ids()?;
+        streams.extend(
+            transactions
+                .iter()
+                .map(|transaction| transaction.stream_id.clone()),
+        );
+        streams.extend(checkpoint.last_sequence_by_stream.keys().cloned());
+        streams.extend(checkpoint.journal_fingerprints.keys().cloned());
+        streams.sort();
+        streams.dedup();
+        let mut last_sequence_by_stream = HashMap::new();
+        let mut journal_fingerprints = HashMap::new();
+        for stream_id in streams {
+            let start =
+                transactions.partition_point(|transaction| transaction.stream_id < stream_id);
+            let length = transactions[start..]
+                .partition_point(|transaction| transaction.stream_id == stream_id);
+            let prefix_last = checkpoint.last_sequence_by_stream.get(&stream_id).copied();
+            let tail_last = self
+                .recover_stream_journal_locked(&stream_id, &transactions[start..start + length])?;
+            last_sequence_by_stream
+                .insert(stream_id.clone(), prefix_last.unwrap_or(0).max(tail_last));
+            journal_fingerprints.insert(stream_id.clone(), self.journal_fingerprint(&stream_id)?);
+        }
+        // Owners: start from the checkpoint watermark, then fold the tail in
+        // with the same cross-stream ownership corruption check.
+        let mut projection_owners = HashMap::new();
+        for owner in &checkpoint.owners {
+            let Some(kind) = crate::checkpoint::kind_from_name(&owner.kind) else {
+                return Ok(None);
+            };
+            projection_owners.insert((kind, owner.id.clone()), owner.stream.clone());
+        }
+        for transaction in &transactions {
+            for write in &transaction.writes {
+                let key = (write.kind, write.id.clone());
+                if let Some(owner) = projection_owners.get(&key) {
+                    if owner != &transaction.stream_id {
+                        return Err(StoreError::Corrupt(format!(
+                            "projection {:?}/{} is owned by stream {owner}, not {}",
+                            write.kind, write.id, transaction.stream_id
+                        )));
+                    }
+                } else {
+                    projection_owners.insert(key, transaction.stream_id.clone());
+                }
+            }
+        }
+        self.record_recovered_state(
+            last_sequence_by_stream,
+            projection_owners,
+            journal_fingerprints,
+        )?;
+        {
+            let mut state = self.locks.durable.lock().map_err(|e| {
+                StoreError::Io(io::Error::other(format!(
+                    "durable state lock poisoned: {e}"
+                )))
+            })?;
+            state.recovery_mode = "checkpoint".into();
+        }
+        Ok(Some(transactions))
     }
 
     fn event_stream_ids(&self) -> Result<Vec<String>, StoreError> {
@@ -667,6 +883,16 @@ impl ProductStore {
     }
 
     pub(super) fn load_transactions(&self) -> Result<Vec<DurableTransaction>, StoreError> {
+        self.load_transactions_filtered(None)
+    }
+
+    /// Parse only the WAL files whose ids pass the optional filter (the
+    /// checkpoint fast path replays just the tail). Validation semantics
+    /// are identical to the full scan.
+    pub(super) fn load_transactions_filtered(
+        &self,
+        ids: Option<&std::collections::HashSet<String>>,
+    ) -> Result<Vec<DurableTransaction>, StoreError> {
         let wal_dir = self.wal_dir();
         if !wal_dir.exists() {
             return Ok(Vec::new());
@@ -677,6 +903,15 @@ impl ProductStore {
             let path = entry.path();
             if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
                 continue;
+            }
+            if let Some(ids) = ids {
+                let stem_ok = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .is_some_and(|stem| ids.contains(stem));
+                if !stem_ok {
+                    continue;
+                }
             }
             let bytes = fs::read(&path)?;
             let transaction = match serde_json::from_slice::<DurableTransaction>(&bytes) {
@@ -736,6 +971,13 @@ impl ProductStore {
         }
         self.validate_projection_stream_ownership(&transactions, None)?;
         Ok(transactions)
+    }
+
+    fn load_transactions_from_ids(
+        &self,
+        ids: &std::collections::HashSet<String>,
+    ) -> Result<Vec<DurableTransaction>, StoreError> {
+        self.load_transactions_filtered(Some(ids))
     }
 
     fn validate_transaction(
@@ -905,6 +1147,7 @@ impl ProductStore {
                 )?;
             }
             atomic_write(&path, &expected)?;
+            if self.note_usage_projection(kind,&document,&path).is_err() { let _ = self.invalidate_usage_index(); }
             if let Some(thread) = &projected_thread {
                 self.record_projected_thread(thread)?;
             }

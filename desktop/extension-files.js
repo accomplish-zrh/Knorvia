@@ -79,4 +79,4 @@ async function extractZip(file, destination) {
   });
   return scan(destination);
 }
-module.exports = { relative, scan, copy, removeOwned, extractZip, MAX_BYTES, MAX_FILE };
+module.exports = { relative, scan, copy, removeOwned, extractZip, MAX_FILES, MAX_BYTES, MAX_FILE };

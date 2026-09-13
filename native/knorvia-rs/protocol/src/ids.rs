@@ -65,3 +65,6 @@ mod tests {
         }
     }
 }
+pub fn goal_execution_id() -> String {
+    new_id("gexec")
+}

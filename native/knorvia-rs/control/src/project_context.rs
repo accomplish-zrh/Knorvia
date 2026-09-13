@@ -39,7 +39,7 @@ pub(crate) struct WorkspaceScope {
 }
 
 impl WorkspaceScope {
-    fn workspace_value(&self) -> Value {
+    pub(crate) fn workspace_value(&self) -> Value {
         json!({
             "id": self.workspace_id,
             "cwd": display_path(&self.cwd),

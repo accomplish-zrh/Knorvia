@@ -7,6 +7,22 @@ and versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Learning and creation domains — 2026-09-13
+
+- Open a text source from the library into guided study. Practice fixed-version
+  quizzes one question at a time, revealing evidence only after an answer.
+- Grade selected options in the shared host tool; preserve written answers and
+  explicit learner self-assessments. Durable, idempotent records support resume,
+  wrong-question practice and simple interval review with visible source changes.
+- Add versioned creative briefs with audience, source-backed claims and criteria.
+  Reviews require real saved outputs, identify the reviewer and become stale when
+  sources or outputs change.
+- Add six bilingual learning/creation work plans with variables, draft preview
+  and editable personal copies, plus matching Kernel tools, CLI commands and skills.
+
+This is a source update. It does not publish an installer or claim live-provider
+quality evaluation; see the [goal and validation record](docs/architecture/KN-GOAL-LEARNING-CREATION-001.md).
+
 ### Native workbench update — 2026-09-09
 
 - Publish the current Knorvia Rust runtime under `native/knorvia-rs`, with the

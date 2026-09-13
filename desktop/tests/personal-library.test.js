@@ -95,7 +95,8 @@ test('content search returns files with line snippets and skips trashed entries'
   assert.deepEqual(result.hits.map(hit => hit.path), ['notes/plan.md']);
   assert.equal(result.hits[0].snippets[0].line, 3);
   assert.match(result.hits[0].snippets[0].text, /菠萝披萨/);
-  assert.deepEqual(await call('search', { query: '   ' }), { hits: [] });
+  // The response carries pagination/coverage metadata on top of hits.
+  assert.deepEqual((await call('search', { query: '   ' })).hits, []);
   assert.deepEqual((await call('search', { query: '不存在的词' })).hits, []);
 });
 

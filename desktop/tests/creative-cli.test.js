@@ -278,7 +278,7 @@ test('curated catalog separates builtin, needs-config and needs-install with pre
   const studio = fakeStudio();
   const catalog = createCuratedCatalog({ home, library: null, studio });
   const { entries } = await catalog.commands['catalog/list']();
-  assert.ok(entries.length >= 6 && entries.length <= 8, `expected 6-8 curated entries, got ${entries.length}`);
+  assert.ok(entries.length === 9, `expected 9 curated entries, got ${entries.length}`);
   for (const entry of entries) assert.ok(['builtin', 'needs-install', 'needs-config', 'unavailable'].includes(entry.status), entry.id);
   const statuses = Object.fromEntries(entries.map(entry => [entry.id, entry.status]));
   assert.equal(statuses['learning-pack'], 'builtin');

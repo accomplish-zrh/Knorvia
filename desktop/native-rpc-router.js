@@ -9,7 +9,7 @@ const MAX_REQUEST_BYTES = 1024 * 1024;
 // Bulk editors have a 3 MiB document cap; reserve room for the RPC envelope.
 // Ordinary methods keep the smaller cap on both Electron and browser paths.
 const MAX_TRANSPORT_BYTES = 4 * 1024 * 1024;
-const BULK_METHODS = new Set(['studio/sequence/create', 'studio/sequence/update', 'studio/template/import']);
+const BULK_METHODS = new Set(['studio/sequence/create', 'studio/sequence/update', 'studio/template/import', 'studio/canvas/create', 'studio/canvas/save']);
 const MAX_JSON_DEPTH = 32;
 const { METHODS: TERMINAL_METHODS } = require('./workspace-terminal');
 const { METHODS: LIBRARY_METHODS } = require('./personal-library');
@@ -19,7 +19,9 @@ const { METHODS: SSH_METHODS } = require('./ssh-session');
 const { METHODS: EXTENSION_METHODS } = require('./extension-manager');
 const { METHODS: WORKTREE_SNAPSHOT_METHODS } = require('./worktree-snapshots');
 const { METHODS: CLI_BACKEND_METHODS } = require('./cli-backends');
-const LEARNING_METHODS = ['learning/sources', 'learning/lecture/read', 'learning/lecture/create', 'learning/quiz/read', 'learning/quiz/create', 'learning/attempt/record', 'learning/attempt/correct', 'learning/mastery/read', 'learning/mastery/rebuild', 'learning/review/due'];
+const LEARNING_METHODS = ['learning/sources', 'learning/lecture/read', 'learning/lecture/create', 'learning/quiz/read', 'learning/quiz/create', 'learning/attempt/record', 'learning/attempt/correct', 'learning/mastery/read', 'learning/mastery/rebuild', 'learning/review/due',
+  'learning/practice/start', 'learning/practice/read', 'learning/practice/answer', 'learning/practice/assess', 'learning/practice/due',
+  'creative/brief/create', 'creative/brief/read', 'creative/brief/review'];
 
 const NATIVE_METHODS = new Set([
   ...LEARNING_METHODS,
@@ -48,6 +50,11 @@ const NATIVE_METHODS = new Set([
   'desktop/open-path',
   'desktop/reveal-path',
   'preview/read',
+  // C19: scoped revocable media-preview capabilities. The names are owned
+  // by the shared transport allow-list; the handlers are registered by each
+  // host (Electron main / dev gateway) alongside preview/read.
+  'preview/revoke',
+  'preview/revokeScope',
   'workspace/create',
   'workspace/read',
   'workspace/list',
@@ -55,8 +62,14 @@ const NATIVE_METHODS = new Set([
   'workspace/path/resolve',
   'workspace/files/list',
   'workspace/files/read',
+  'workspace/files/search',
+  'workspace/files/search/cancel',
   'workspace/git/status',
   'workspace/git/diff',
+  // B05 (night 2026-09-10): read-only delivery review routes (daemon side
+  // integrated by A at 946bc59).
+  'workspace/git/compare',
+  'workspace/git/compare-diff',
   'workspace/worktree/create',
   'workspace/extensions/analyze',
   'workspace/worktree/list',
@@ -72,6 +85,7 @@ const NATIVE_METHODS = new Set([
   'thread/archive',
   'thread/unarchive',
   'turn/start',
+  'turnQueue/enqueue', 'turnQueue/read', 'turnQueue/cancel', 'turnQueue/pause', 'turnQueue/resume',
   'turn/read',
   'turn/steer',
   'turn/interrupt',
@@ -88,6 +102,7 @@ const NATIVE_METHODS = new Set([
   'artifact/create',
   'artifact/read',
   'artifact/list',
+  'artifact/catalog',
   'artifact/content',
   'artifact/stage',
   'artifact/commit',
@@ -176,6 +191,11 @@ const LOCAL_METHODS = new Set([
   'desktop/open-path',
   'desktop/reveal-path',
   'preview/read',
+  // C19: scoped revocable media-preview capabilities. The names are owned
+  // by the shared transport allow-list; the handlers are registered by each
+  // host (Electron main / dev gateway) alongside preview/read.
+  'preview/revoke',
+  'preview/revokeScope',
   ...CLI_BACKEND_METHODS,
 ]);
 
@@ -262,7 +282,9 @@ function createNativeRpcRouter({ rpc, onNotification, handlers = {} }) {
     throw new Error('native RPC router handlers must be an object');
   }
   const listeners = new Set();
+  const inFlight = new Set();
   let disposed = false;
+  let closing = false;
   const removeNotificationListener = typeof onNotification === 'function'
     ? onNotification((message) => {
       if (disposed || !message || typeof message.method !== 'string') return;
@@ -273,9 +295,13 @@ function createNativeRpcRouter({ rpc, onNotification, handlers = {} }) {
     : null;
 
   async function handle(message) {
-    if (disposed) return errorResponse(message?.id, -32000, 'Native connection is closed');
+    if (disposed || closing) return errorResponse(message?.id, -32000, 'Native connection is closing');
     const parsed = validateNativeRequest(message);
     if (parsed.error) return parsed.error;
+    // Admission and registration are synchronous. beginClose() can therefore
+    // freeze the router and capture every request admitted before it without
+    // a gap in which a Home writer can enter untracked.
+    const operation = (async () => {
     try {
       const localHandler = handlers[parsed.value.method];
       if (LOCAL_METHODS.has(parsed.value.method) && typeof localHandler !== 'function') {
@@ -288,6 +314,34 @@ function createNativeRpcRouter({ rpc, onNotification, handlers = {} }) {
     } catch (error) {
       return daemonErrorResponse(parsed.value.id, error);
     }
+    })();
+    inFlight.add(operation);
+    try { return await operation; }
+    finally { inFlight.delete(operation); }
+  }
+
+  async function beginClose(context = {}) {
+    closing = true;
+    const admitted = [...inFlight];
+    if (!admitted.length) return { confirmed: true, admitted: 0, drained: 0, detail: 'native RPC admissions frozen; no requests were in flight' };
+    const drain = Promise.allSettled(admitted);
+    if (context.signal?.aborted) {
+      return { confirmed: false, admitted: admitted.length, drained: 0, detail: 'native RPC admissions frozen; deadline expired before drain' };
+    }
+    let removeAbort;
+    const aborted = new Promise(resolve => {
+      if (!context.signal) return;
+      const onAbort = () => resolve(null);
+      context.signal.addEventListener('abort', onAbort, { once: true });
+      removeAbort = () => context.signal.removeEventListener('abort', onAbort);
+    });
+    const outcome = context.signal ? await Promise.race([drain, aborted]) : await drain;
+    removeAbort?.();
+    if (!outcome) {
+      const drained = admitted.length - admitted.filter(item => inFlight.has(item)).length;
+      return { confirmed: false, admitted: admitted.length, drained, detail: `${inFlight.size} native RPC request(s) remained in flight at the shutdown deadline` };
+    }
+    return { confirmed: true, admitted: admitted.length, drained: admitted.length, detail: 'native RPC admissions frozen and admitted requests drained' };
   }
 
   function subscribe(listener) {
@@ -299,6 +353,7 @@ function createNativeRpcRouter({ rpc, onNotification, handlers = {} }) {
 
   function dispose() {
     if (disposed) return;
+    closing = true;
     disposed = true;
     listeners.clear();
     try { removeNotificationListener?.(); } catch {}
@@ -307,6 +362,8 @@ function createNativeRpcRouter({ rpc, onNotification, handlers = {} }) {
   return {
     methods: NATIVE_METHODS,
     handle,
+    beginClose,
+    get activeCount() { return inFlight.size; },
     subscribe,
     dispose,
   };

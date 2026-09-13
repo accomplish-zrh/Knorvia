@@ -16,9 +16,17 @@ const fail = (message, code = -32602) => { const error = new Error(message); err
 const ENTRIES = [
   {
     id: 'learning-pack',
-    name: '学习基础包（解读/辅导/练习复习）',
+    name: '学习基础包（导学/逐题练习/错题复习）',
     category: 'learning',
-    description: '资料库版本化讲义、练习与掌握度复习；来源证据可定位，未配置模型不伪生成。',
+    description: '版本化讲义与题库、先作答后反馈的逐题练习、错题与到期复习；来源可核对，学习记录可续接。',
+    kind: 'builtin',
+    check: async () => ({ status: 'builtin' }),
+  },
+  {
+    id: 'creative-brief',
+    name: '从资料到作品（简报与评审）',
+    category: 'creative',
+    description: '固定资料来源，明确受众、作品目标与逐项验收要求；关联实际作品和评审记录，支持继续修改。',
     kind: 'builtin',
     check: async () => ({ status: 'builtin' }),
   },
@@ -76,7 +84,7 @@ const ENTRIES = [
     id: 'openmaic-skill-package',
     name: 'OpenMAIC 官方技能包（需安装）',
     category: 'learning',
-    description: 'THU-MAIC/OpenMAIC v1.0.1（根 MIT）的 skills/openmaic SOP 技能；packages/mathml2omml 为 LGPL，不随包分发。仓库体积可能超过 24MB 扩展导入上限。',
+    description: 'THU-MAIC/OpenMAIC v1.0.1（根 MIT）的 skills/openmaic SOP 技能；packages/mathml2omml 为 LGPL，不随包分发。已按固定提交只获取 skills/openmaic 子目录（git trees API），不受整仓 24MB 上限限制。',
     kind: 'needs-install',
     source: { type: 'github', repository: 'THU-MAIC/OpenMAIC', tag: 'v1.0.1', commit: 'f50a25644c9c3893503cf0727ccf613c0ce1e748', subdirectory: 'skills/openmaic' },
     check: async ({ extensionManager }) => {

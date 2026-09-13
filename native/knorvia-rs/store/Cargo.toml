@@ -7,6 +7,8 @@ publish.workspace = true
 description = "Knorvia product store, event journal, artifact and job runtimes."
 
 [dependencies]
+chrono = { workspace = true }
+chrono-tz = { workspace = true }
 knorvia-platform-paths = { workspace = true }
 knorvia-protocol = { workspace = true }
 serde = { workspace = true }
@@ -14,3 +16,6 @@ serde_json = { workspace = true }
 sha2 = { workspace = true }
 hex = { workspace = true }
 thiserror = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security_Authorization", "Win32_Storage_FileSystem"] }

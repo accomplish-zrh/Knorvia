@@ -1,0 +1,20 @@
+/* Worktree delivery review (B-owned, B05). */
+.ht-review-form { display: flex; gap: 8px; margin: 10px 0; }
+.ht-review-form input { flex: 1; border: 1px solid var(--nw-line); border-radius: 9px; padding: 6px 10px; color: inherit; }
+.ht-review-verdict { display: flex; align-items: center; gap: 7px; font-size: 13px; padding: 9px 12px; border-radius: 10px; border: 1px solid var(--nw-line); background: var(--nw-soft, rgba(21, 115, 71, .06)); }
+.ht-review-verdict.is-blocked { color: #b3261e; border-color: #b3261e40; background: #b3261e12; }
+.ht-review-facts { display: grid; grid-template-columns: auto 1fr; gap: 5px 14px; font-size: 12px; margin: 10px 0; }
+.ht-review-facts dt { color: var(--nw-muted); }
+.ht-review-facts dd { margin: 0; overflow-wrap: anywhere; }
+.ht-review-conflict { display: inline-flex; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--nw-line); }
+.ht-review-conflict.is-clean { color: #157347; border-color: #15734740; background: #15734712; }
+.ht-review-conflict.is-conflict { color: #b3261e; border-color: #b3261e40; background: #b3261e12; }
+.ht-review-conflict.is-undetermined { color: #b45309; border-color: #b4530940; background: #b4530912; }
+.ht-review-conflict-files { margin: 6px 0 0; padding-left: 16px; }
+.ht-review-commits, .ht-review-files { list-style: none; margin: 6px 0; padding: 0; display: flex; flex-direction: column; gap: 4px; font-size: 12px; max-height: 220px; overflow: auto; }
+.ht-review-files button { display: inline-flex; align-items: center; gap: 7px; background: transparent; border: 0; color: inherit; font-size: 12px; padding: 3px 6px; border-radius: 7px; text-align: left; }
+.ht-review-files button:hover { background: var(--nw-soft); }
+.ht-review-files button.is-active { outline: 2px solid var(--nw-green); }
+.ht-review-file-status { color: var(--nw-muted); font-variant: all-small-caps; width: 42px; flex-shrink: 0; }
+.ht-review-diff { max-height: 300px; overflow: auto; font-size: 11px; line-height: 1.5; background: var(--nw-soft, #f6f7f8); border: 1px solid var(--nw-line); border-radius: 10px; padding: 10px 12px; overflow-wrap: anywhere; white-space: pre-wrap; }
+.ht-review-actions { display: flex; justify-content: flex-end; margin-top: 14px; }

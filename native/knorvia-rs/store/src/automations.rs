@@ -6,6 +6,7 @@
 //! be resumed after a restart, while a run that reached a real Turn is only
 //! reconciled and is never replayed into the model.
 
+use super::atomic_write;
 use super::{
     ProductStore, ProjectionKind, StoreError, conflict, invalid, new_id, now_rfc3339, read_json,
 };
@@ -14,6 +15,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::fs;
+use std::time::Instant;
+
+/// Tick lateness beyond this window counts as a missed calendar occurrence
+/// rather than an on-time claim.
+const MISSED_OCCURRENCE_GRACE_MS: i64 = 120_000;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const MAX_INTERVAL_MINUTES: u64 = 52_560_000; // one century; keeps ms arithmetic bounded.
@@ -32,10 +38,42 @@ pub fn epoch_millis() -> i64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "camelCase")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 pub enum AutomationSchedule {
-    Interval { minutes: u64 },
-    Once { at: i64 },
+    Interval {
+        minutes: u64,
+    },
+    Once {
+        at: i64,
+    },
+    /// Wall-clock occurrences in an explicit IANA time zone (R03). All
+    /// lists are empty = every value; weekday 0 = Sunday. The zone name,
+    /// not the ambient system zone, decides every occurrence.
+    Calendar {
+        timezone: String,
+        weekdays: Vec<u8>,
+        hour: u8,
+        minute: u8,
+        days_of_month: Vec<u8>,
+        last_day_of_month: bool,
+        months: Vec<u8>,
+        misfire: MisfirePolicy,
+    },
+}
+
+/// What to do with occurrences the scheduler missed while asleep or
+/// restarting. RunLast executes once for the most recent missed occurrence;
+/// Skip records it and continues at the next future occurrence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum MisfirePolicy {
+    #[default]
+    Skip,
+    RunLast,
 }
 
 impl AutomationSchedule {
@@ -52,6 +90,30 @@ impl AutomationSchedule {
                 "automation once.at must be a UTC epoch millisecond",
             )),
             Self::Once { .. } => Ok(()),
+            Self::Calendar {
+                timezone,
+                weekdays,
+                hour,
+                minute,
+                days_of_month,
+                last_day_of_month,
+                months,
+                misfire,
+            } => {
+                let _ = misfire;
+                let _ = misfire;
+                crate::automation_calendar::CalendarSpec {
+                    timezone,
+                    weekdays,
+                    hour: *hour,
+                    minute: *minute,
+                    days_of_month,
+                    last_day_of_month: *last_day_of_month,
+                    months,
+                    misfire: *misfire,
+                }
+                .validate()
+            }
         }
     }
 
@@ -61,7 +123,9 @@ impl AutomationSchedule {
                 .checked_mul(60_000)
                 .and_then(|millis| i64::try_from(millis).ok())
                 .ok_or_else(|| invalid("automation interval is out of range")),
-            Self::Once { .. } => Err(invalid("one-off schedules have no interval")),
+            Self::Once { .. } | Self::Calendar { .. } => {
+                Err(invalid("one-off and calendar schedules have no interval"))
+            }
         }
     }
 
@@ -75,15 +139,127 @@ impl AutomationSchedule {
                 .map(Some)
                 .ok_or_else(|| invalid("automation next run is out of range")),
             Self::Once { at } => Ok(Some(*at)),
+            Self::Calendar {
+                timezone,
+                weekdays,
+                hour,
+                minute,
+                days_of_month,
+                last_day_of_month,
+                months,
+                misfire,
+            } => {
+                let spec = crate::automation_calendar::CalendarSpec {
+                    timezone,
+                    weekdays,
+                    hour: *hour,
+                    minute: *minute,
+                    days_of_month,
+                    last_day_of_month: *last_day_of_month,
+                    months,
+                    misfire: *misfire,
+                };
+                crate::automation_calendar::calendar_next_after(&spec, now)
+            }
         }
     }
 
     fn next_after_claim(&self, now: i64) -> Result<Option<i64>, StoreError> {
         match self {
+            // Calendar occurrences anchor to the wall clock: advancing after
+            // a claim never accumulates drift or missed-occurrence bursts.
+            Self::Calendar { .. } => self.next_after(now),
             Self::Interval { .. } => self.next_after(now),
             Self::Once { .. } => Ok(None),
         }
     }
+
+    /// Future-only occurrences for previews (Once in the past yields none).
+    pub fn next_occurrences_after(&self, from: i64, count: usize) -> Result<Vec<i64>, StoreError> {
+        let mut out = Vec::new();
+        let mut cursor = from;
+        for _ in 0..count.max(1) {
+            let next = match self {
+                Self::Once { at } => {
+                    if *at > cursor {
+                        Some(*at)
+                    } else {
+                        None
+                    }
+                }
+                _ => self.next_after(cursor)?,
+            };
+            match next {
+                Some(at) => {
+                    out.push(at);
+                    cursor = at;
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
+    /// Future occurrences inside the half-open plan lifetime. The underlying
+    /// schedule keeps its existing timezone/DST and interval cadence; the
+    /// lifetime only filters which occurrences may be admitted.
+    pub fn next_occurrences_in_window_after(
+        &self,
+        from: i64,
+        count: usize,
+        valid_from: Option<i64>,
+        valid_until: Option<i64>,
+    ) -> Result<Vec<i64>, StoreError> {
+        validate_window(valid_from, valid_until)?;
+        let floor = valid_from.unwrap_or(i64::MIN);
+        let mut out = Vec::new();
+        let mut next = match self {
+            Self::Interval { .. } => {
+                let step = self.interval_millis()?;
+                let mut candidate = from
+                    .checked_add(step)
+                    .ok_or_else(|| invalid("automation next run is out of range"))?;
+                if candidate < floor {
+                    let distance = floor.saturating_sub(candidate);
+                    let jumps = distance.saturating_add(step - 1) / step;
+                    candidate = candidate
+                        .checked_add(jumps.saturating_mul(step))
+                        .ok_or_else(|| invalid("automation validity window is out of range"))?;
+                }
+                Some(candidate)
+            }
+            Self::Once { at } if *at > from && *at >= floor => Some(*at),
+            Self::Once { .. } => None,
+            Self::Calendar { .. } => self.next_after(from.max(floor.saturating_sub(1)))?,
+        };
+        while out.len() < count.max(1) {
+            let Some(at) = next else { break };
+            if valid_until.is_some_and(|end| at >= end) {
+                break;
+            }
+            if at >= floor {
+                out.push(at);
+            }
+            next = self.next_after_claim(at)?;
+        }
+        Ok(out)
+    }
+}
+
+fn validate_window(valid_from: Option<i64>, valid_until: Option<i64>) -> Result<(), StoreError> {
+    if valid_from.is_some_and(|value| value < 0) || valid_until.is_some_and(|value| value < 0) {
+        return Err(invalid(
+            "automation validFrom and validUntil must be UTC epoch milliseconds",
+        ));
+    }
+    if let (Some(start), Some(end)) = (valid_from, valid_until)
+        && start >= end
+    {
+        return Err(invalid(
+            "automation validFrom must be earlier than validUntil",
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,14 +297,14 @@ pub enum AutomationRunState {
 }
 
 impl AutomationRunState {
-    fn is_active(self) -> bool {
+    pub(super) fn is_active(self) -> bool {
         matches!(
             self,
             Self::Claimed | Self::Materializing | Self::Starting | Self::Running
         )
     }
 
-    fn is_terminal(self) -> bool {
+    pub(super) fn is_terminal(self) -> bool {
         !self.is_active()
     }
 }
@@ -150,6 +326,12 @@ pub struct Automation {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Half-open scheduler lifetime: validFrom <= admission < validUntil.
+    /// Missing fields on old records retain the original unbounded behavior.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_run_at: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -197,6 +379,12 @@ pub struct AutomationRun {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+    /// Snapshot of the plan lifetime at claim. This lets a queued run make an
+    /// honest final admission decision even if the plan later changes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_from: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub valid_until: Option<i64>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -211,6 +399,9 @@ pub struct AutomationUpdate {
     /// unchanged, so the UI can use null to return to the connection default.
     pub model: Option<Option<String>>,
     pub reasoning_effort: Option<Option<String>>,
+    /// Outer None leaves the field unchanged; Some(None) clears it.
+    pub valid_from: Option<Option<i64>>,
+    pub valid_until: Option<Option<i64>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -317,6 +508,36 @@ impl ProductStore {
         reasoning_effort: Option<String>,
         now: i64,
     ) -> Result<Automation, StoreError> {
+        self.create_automation_with_window_at(
+            title,
+            prompt,
+            workspace_id,
+            schedule,
+            status,
+            allow_writes,
+            model,
+            reasoning_effort,
+            None,
+            None,
+            now,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn create_automation_with_window_at(
+        &self,
+        title: &str,
+        prompt: &str,
+        workspace_id: &str,
+        schedule: AutomationSchedule,
+        status: AutomationStatus,
+        allow_writes: bool,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        valid_from: Option<i64>,
+        valid_until: Option<i64>,
+        now: i64,
+    ) -> Result<Automation, StoreError> {
         require_text("title", title)?;
         require_text("prompt", prompt)?;
         if let Some(model) = &model {
@@ -326,6 +547,7 @@ impl ProductStore {
             require_text("reasoningEffort", reasoning_effort)?;
         }
         schedule.validate()?;
+        validate_window(valid_from, valid_until)?;
         let _mutations = self.lock_mutations()?;
         let _journal = self.lock_journal()?;
         self.recover_durable_state_locked()?;
@@ -345,17 +567,33 @@ impl ProductStore {
             .into());
         }
         let _ = self.read_workspace(workspace_id)?;
+        let next_run_at = match &schedule {
+            // Preserve the established due-now semantics for a one-shot plan;
+            // previews remain future-only.
+            AutomationSchedule::Once { at }
+                if valid_from.is_none_or(|start| *at >= start)
+                    && valid_until.is_none_or(|end| *at < end) =>
+            {
+                Some(*at)
+            }
+            _ => schedule
+                .next_occurrences_in_window_after(now, 1, valid_from, valid_until)?
+                .into_iter()
+                .next(),
+        };
         let automation = Automation {
             id: new_id("auto"),
             title: title.to_string(),
             prompt: prompt.to_string(),
             workspace_id: workspace_id.to_string(),
-            next_run_at: schedule.next_after(now)?,
+            next_run_at,
             schedule,
             status,
             allow_writes,
             model,
             reasoning_effort,
+            valid_from,
+            valid_until,
             last_thread_id: None,
             last_run_at: None,
             last_error: None,
@@ -427,6 +665,49 @@ impl ProductStore {
         Ok(runs)
     }
 
+    /// Whether any automation run is still active (A19 quiescence): a run
+    /// that reached a durable claim boundary (Claimed, Materializing,
+    /// Starting) or owns a live Turn (Running). Reads the durable run
+    /// records directly so the answer reflects facts, not index drift.
+    pub fn has_active_automation_run(&self) -> Result<bool, StoreError> {
+        let _mutations = self.lock_mutations()?;
+        let _journal = self.lock_journal()?;
+        self.recover_durable_state_locked()?;
+        Ok(self
+            .all_automation_runs_locked()?
+            .iter()
+            .any(|run| run.state.is_active()))
+    }
+
+    #[cfg(test)]
+    pub fn insert_automation_run_fixture(&self, state: &str) -> Result<(), StoreError> {
+        let run = AutomationRun {
+            id: knorvia_protocol::new_id("run"),
+            automation_id: knorvia_protocol::new_id("auto"),
+            trigger: AutomationTrigger::Scheduled,
+            scheduled_for: None,
+            claimed_at: epoch_millis(),
+            started_at: None,
+            finished_at: None,
+            state: serde_json::from_value(serde_json::Value::String(state.to_string()))
+                .map_err(|_| invalid(format!("unknown automation run state {state}")))?,
+            thread_id: None,
+            turn_id: None,
+            error: None,
+            title: "fixture".into(),
+            prompt: "fixture".into(),
+            workspace_id: knorvia_protocol::new_id("ws"),
+            allow_writes: false,
+            model: None,
+            reasoning_effort: None,
+            valid_from: None,
+            valid_until: None,
+        };
+        let path = self.automation_run_path(&run.id);
+        atomic_write(&path, &serde_json::to_vec_pretty(&run)?)?;
+        Ok(())
+    }
+
     pub fn update_automation(
         &self,
         id: &str,
@@ -478,6 +759,9 @@ impl ProductStore {
         }
 
         let prior = record.automation.clone();
+        let requested_valid_from = update.valid_from.unwrap_or(record.automation.valid_from);
+        let requested_valid_until = update.valid_until.unwrap_or(record.automation.valid_until);
+        validate_window(requested_valid_from, requested_valid_until)?;
         if let Some(title) = update.title {
             record.automation.title = title;
         }
@@ -489,7 +773,28 @@ impl ProductStore {
         }
         if let Some(schedule) = update.schedule {
             record.automation.schedule = schedule;
-            record.automation.next_run_at = record.automation.schedule.next_after(now)?;
+        }
+        if let Some(valid_from) = update.valid_from {
+            record.automation.valid_from = valid_from;
+        }
+        if let Some(valid_until) = update.valid_until {
+            record.automation.valid_until = valid_until;
+        }
+        if record.automation.schedule != prior.schedule
+            || record.automation.valid_from != prior.valid_from
+            || record.automation.valid_until != prior.valid_until
+        {
+            record.automation.next_run_at = record
+                .automation
+                .schedule
+                .next_occurrences_in_window_after(
+                    now,
+                    1,
+                    record.automation.valid_from,
+                    record.automation.valid_until,
+                )?
+                .into_iter()
+                .next();
         }
         if let Some(status) = update.status {
             let resumed =
@@ -503,7 +808,17 @@ impl ProductStore {
                     AutomationSchedule::Interval { .. }
                 )
             {
-                record.automation.next_run_at = record.automation.schedule.next_after(now)?;
+                record.automation.next_run_at = record
+                    .automation
+                    .schedule
+                    .next_occurrences_in_window_after(
+                        now,
+                        1,
+                        record.automation.valid_from,
+                        record.automation.valid_until,
+                    )?
+                    .into_iter()
+                    .next();
             }
         }
         if let Some(allow_writes) = update.allow_writes {
@@ -616,43 +931,17 @@ impl ProductStore {
     }
 
     fn reconcile_automation_runs_locked(&self, now: i64) -> Result<(), StoreError> {
-        let runs = self.all_automation_runs_locked()?;
-        let pre_admission_turns = if runs.iter().any(|run| {
-            matches!(
-                run.state,
-                AutomationRunState::Materializing | AutomationRunState::Starting
-            )
-        }) {
-            let mut by_thread = HashMap::<String, Vec<Turn>>::new();
-            for turn in self.list_turns_locked()? {
-                by_thread
-                    .entry(turn.thread_id.clone())
-                    .or_default()
-                    .push(turn);
-            }
-            Some(by_thread)
-        } else {
-            None
-        };
+        // Only active runs are reconciled: terminal history stays on disk.
+        // The index's low-frequency full scan keeps this honest against any
+        // drift between the index and the durable facts.
+        let runs = self.all_active_automation_runs_locked(Instant::now())?;
         for run in runs {
             match run.state {
                 AutomationRunState::Materializing => {
-                    self.reconcile_materializing_automation_run_locked(
-                        &run,
-                        pre_admission_turns
-                            .as_ref()
-                            .expect("loaded for materializing runs"),
-                        now,
-                    )?;
+                    self.reconcile_materializing_automation_run_locked(&run, now)?;
                 }
                 AutomationRunState::Starting => {
-                    self.reconcile_starting_automation_run_locked(
-                        &run,
-                        pre_admission_turns
-                            .as_ref()
-                            .expect("loaded for starting runs"),
-                        now,
-                    )?;
+                    self.reconcile_starting_automation_run_locked(&run, now)?;
                 }
                 AutomationRunState::Running => {
                     self.reconcile_running_automation_run_locked(&run, now)?;
@@ -669,16 +958,12 @@ impl ProductStore {
     fn reconcile_materializing_automation_run_locked(
         &self,
         run: &AutomationRun,
-        turns_by_thread: &HashMap<String, Vec<Turn>>,
         now: i64,
     ) -> Result<(), StoreError> {
         let Some(thread_id) = run.thread_id.as_deref() else {
             return Ok(());
         };
-        if turns_by_thread
-            .get(thread_id)
-            .is_some_and(|turns| !turns.is_empty())
-        {
+        if self.indexed_turn_count_locked(thread_id)? > 0 {
             self.finish_automation_run_locked(
                 run,
                 AutomationRunState::Interrupted,
@@ -701,7 +986,6 @@ impl ProductStore {
     fn reconcile_starting_automation_run_locked(
         &self,
         run: &AutomationRun,
-        turns_by_thread: &HashMap<String, Vec<Turn>>,
         now: i64,
     ) -> Result<(), StoreError> {
         let Some(thread_id) = run.thread_id.as_deref() else {
@@ -713,11 +997,8 @@ impl ProductStore {
             )?;
             return Ok(());
         };
-        let turns = turns_by_thread
-            .get(thread_id)
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
-        match turns {
+        let turns = self.indexed_turns_for_thread_locked(thread_id)?;
+        match turns.as_slice() {
             // The owner may be between durable Thread materialization and
             // turn/start. Do not terminalize or replay from this background
             // reconciler; the scheduler can safely offer this run later if
@@ -827,6 +1108,56 @@ impl ProductStore {
             {
                 continue;
             }
+            if record
+                .automation
+                .valid_from
+                .is_some_and(|start| now < start)
+            {
+                continue;
+            }
+            if record.automation.valid_until.is_some_and(|end| now >= end) {
+                let expired = self.claim_automation_run_locked(
+                    record,
+                    AutomationTrigger::Scheduled,
+                    now,
+                    true,
+                )?;
+                self.finish_automation_run_locked(
+                    &expired,
+                    AutomationRunState::Skipped,
+                    now,
+                    Some("automation occurrence expired before scheduler claim".into()),
+                )?;
+                continue;
+            }
+            // A calendar plan found far past its due occurrence was missed
+            // while the scheduler was asleep. Skip policy records the latest
+            // missed occurrence durably and continues at the next future
+            // occurrence; RunLast falls through and runs it once.
+            if let AutomationSchedule::Calendar { misfire, .. } = &record.automation.schedule
+                && *misfire == MisfirePolicy::Skip
+                && record
+                    .automation
+                    .next_run_at
+                    .is_some_and(|due_at| now.saturating_sub(due_at) > MISSED_OCCURRENCE_GRACE_MS)
+            {
+                let claimed = self.claim_automation_run_locked(
+                    record,
+                    AutomationTrigger::Scheduled,
+                    now,
+                    true,
+                )?;
+                self.finish_automation_run_locked(
+                    &claimed,
+                    AutomationRunState::Skipped,
+                    now,
+                    Some(
+                        "calendar occurrence missed while the scheduler was asleep; misfire policy skip"
+                            .into(),
+                    ),
+                )?;
+                continue;
+            }
             claimed.push(self.claim_automation_run_locked(
                 record,
                 AutomationTrigger::Scheduled,
@@ -856,8 +1187,7 @@ impl ProductStore {
             .into_iter()
             .map(|record| (record.automation.id.clone(), record))
             .collect::<HashMap<_, _>>();
-        let runs = self.all_automation_runs_locked()?;
-        let turn_count_by_thread = self.turn_count_by_thread_locked()?;
+        let runs = self.all_active_automation_runs_locked(Instant::now())?;
         let mut resumable = runs
             .into_iter()
             .filter(|run| {
@@ -867,7 +1197,7 @@ impl ProductStore {
                 record.deleted_at.is_none()
                     && !(run.trigger == AutomationTrigger::Scheduled
                         && record.automation.status != AutomationStatus::Active)
-                    && is_pre_model_run(run, &turn_count_by_thread)
+                    && self.is_pre_model_run_locked(run).unwrap_or(false)
             })
             .collect::<Vec<_>>();
         resumable.sort_by(|left, right| {
@@ -888,9 +1218,8 @@ impl ProductStore {
             .into_iter()
             .map(|record| (record.automation.id.clone(), record))
             .collect::<HashMap<_, _>>();
-        let turns_by_thread = self.turn_count_by_thread_locked()?;
-        for run in self.all_automation_runs_locked()? {
-            if !is_pre_model_run(&run, &turns_by_thread) {
+        for run in self.all_active_automation_runs_locked(Instant::now())? {
+            if !self.is_pre_model_run_locked(&run)? {
                 continue;
             }
             let Some(record) = records.get(&run.automation_id) else {
@@ -902,6 +1231,10 @@ impl ProductStore {
                 && record.automation.status != AutomationStatus::Active
             {
                 Some("automation was paused before the queued run started")
+            } else if run.valid_from.is_some_and(|start| now < start) {
+                Some("automation occurrence is before its validity window")
+            } else if run.valid_until.is_some_and(|end| now >= end) {
+                Some("automation occurrence expired before the queued run started")
             } else {
                 None
             };
@@ -938,6 +1271,18 @@ impl ProductStore {
         if self.has_active_automation_run_locked(id)? {
             return Err(conflict("automation already has a running or queued run"));
         }
+        if record
+            .automation
+            .valid_from
+            .is_some_and(|start| now < start)
+            || record.automation.valid_until.is_some_and(|end| now >= end)
+        {
+            return Err(ProtocolError::new(
+                ErrorCategory::PreconditionFailed,
+                "automation is outside its validity window",
+            )
+            .into());
+        }
         self.claim_automation_run_locked(record, AutomationTrigger::Manual, now, false)
     }
 
@@ -953,6 +1298,22 @@ impl ProductStore {
         let _journal = self.lock_journal()?;
         self.recover_durable_state_locked()?;
         let mut run = self.read_automation_run(run_id)?;
+        if matches!(
+            run.state,
+            AutomationRunState::Claimed
+                | AutomationRunState::Materializing
+                | AutomationRunState::Starting
+        ) && (run.valid_from.is_some_and(|start| now < start)
+            || run.valid_until.is_some_and(|end| now >= end))
+        {
+            self.finish_automation_run_locked(
+                &run,
+                AutomationRunState::Skipped,
+                now,
+                Some("automation occurrence expired outside its validity window".into()),
+            )?;
+            return Ok(None);
+        }
         match run.state {
             AutomationRunState::Claimed | AutomationRunState::Materializing => {
                 self.materialize_pre_model_automation_run_locked(&mut run, now)
@@ -1035,6 +1396,17 @@ impl ProductStore {
         now: i64,
     ) -> Result<Option<AutomationRun>, StoreError> {
         let record = self.read_automation_record(&run.automation_id)?;
+        if run.valid_from.is_some_and(|start| now < start)
+            || run.valid_until.is_some_and(|end| now >= end)
+        {
+            self.finish_automation_run_locked(
+                run,
+                AutomationRunState::Skipped,
+                now,
+                Some("automation occurrence expired outside its validity window".into()),
+            )?;
+            return Ok(None);
+        }
         if record.deleted_at.is_some()
             || (run.trigger == AutomationTrigger::Scheduled
                 && record.automation.status != AutomationStatus::Active)
@@ -1062,6 +1434,7 @@ impl ProductStore {
                     None,
                     vec![reservation_write],
                 )?;
+                self.record_projected_automation_run(run);
                 reserved_thread_id
             }
             AutomationRunState::Materializing => match run.thread_id.clone() {
@@ -1154,6 +1527,7 @@ impl ProductStore {
             None,
             writes,
         )?;
+        self.record_projected_automation_run(run);
         Ok(Some(run.clone()))
     }
 
@@ -1209,6 +1583,7 @@ impl ProductStore {
             Some(turn_id.to_string()),
             vec![write],
         )?;
+        self.record_projected_automation_run(&run);
         Ok(run)
     }
 
@@ -1244,7 +1619,17 @@ impl ProductStore {
             Some(now)
         };
         if advance_schedule {
-            record.automation.next_run_at = record.automation.schedule.next_after_claim(now)?;
+            record.automation.next_run_at = record
+                .automation
+                .schedule
+                .next_after_claim(now)?
+                .filter(|at| {
+                    record
+                        .automation
+                        .valid_from
+                        .is_none_or(|start| *at >= start)
+                        && record.automation.valid_until.is_none_or(|end| *at < end)
+                });
         }
         record.automation.revision = record
             .automation
@@ -1270,6 +1655,8 @@ impl ProductStore {
             allow_writes: record.automation.allow_writes,
             model: record.automation.model.clone(),
             reasoning_effort: record.automation.reasoning_effort.clone(),
+            valid_from: record.automation.valid_from,
+            valid_until: record.automation.valid_until,
         };
         let writes = vec![
             self.projection_write(ProjectionKind::Automation, &record.automation.id, &record)?,
@@ -1282,6 +1669,7 @@ impl ProductStore {
             None,
             writes,
         )?;
+        self.record_projected_automation_run(&run);
         Ok(run)
     }
 
@@ -1327,6 +1715,7 @@ impl ProductStore {
             run.turn_id.clone(),
             writes,
         )?;
+        self.record_projected_automation_run(&run);
         Ok(run)
     }
 
@@ -1375,7 +1764,7 @@ impl ProductStore {
         Ok(records)
     }
 
-    fn all_automation_runs_locked(&self) -> Result<Vec<AutomationRun>, StoreError> {
+    pub(super) fn all_automation_runs_locked(&self) -> Result<Vec<AutomationRun>, StoreError> {
         let directory = self.product_dir().join("automation-runs");
         if !directory.exists() {
             return Ok(Vec::new());
@@ -1410,10 +1799,29 @@ impl ProductStore {
     }
 
     fn has_active_automation_run_locked(&self, automation_id: &str) -> Result<bool, StoreError> {
-        Ok(self
-            .list_automation_runs_locked(automation_id)?
-            .into_iter()
-            .any(|run| run.state.is_active()))
+        // Index lookup: O(active) memory, no history IO on scheduler ticks.
+        let index_now = Instant::now();
+        let runs = self.active_automation_runs_for_locked(automation_id, index_now)?;
+        Ok(runs.iter().any(|run| run.state.is_active()))
+    }
+
+    /// Pre-model check against the in-memory turn index for the one thread
+    /// this run reserved, instead of counting every Turn in the Home.
+    fn is_pre_model_run_locked(&self, run: &AutomationRun) -> Result<bool, StoreError> {
+        match run.state {
+            AutomationRunState::Claimed => Ok(true),
+            AutomationRunState::Materializing | AutomationRunState::Starting => {
+                match run.thread_id.as_deref() {
+                    None => Ok(true),
+                    Some(thread_id) => Ok(self.indexed_turn_count_locked(thread_id)? == 0),
+                }
+            }
+            AutomationRunState::Running
+            | AutomationRunState::Succeeded
+            | AutomationRunState::Failed
+            | AutomationRunState::Interrupted
+            | AutomationRunState::Skipped => Ok(false),
+        }
     }
 
     /// Surface the durable executor diagnostic when one exists. It remains
@@ -1453,6 +1861,7 @@ fn is_terminal_turn(status: &str) -> bool {
 
 /// A durable product Turn is the point at which a retry might duplicate model
 /// work. Before that point, a run can be offered again with its original id.
+#[allow(dead_code)]
 fn is_pre_model_run(run: &AutomationRun, turn_count_by_thread: &HashMap<String, usize>) -> bool {
     match run.state {
         AutomationRunState::Claimed => true,

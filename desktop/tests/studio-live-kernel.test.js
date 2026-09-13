@@ -38,6 +38,8 @@ const SCENARIOS = {
   },
 };
 
+SCENARIOS.canvas = { ...SCENARIOS.image, tool: 'media_canvas', canvas: true };
+
 function fakeSafeStorage() {
   return {
     isEncryptionAvailable: () => true,
@@ -125,10 +127,10 @@ function startMediaModelFixture(scenario) {
       return;
     }
     // Namespace tools are called with separate `namespace` and `name` fields.
-    const args = { profileId: scenario.profileId, prompt: scenario.prompt, idempotencyKey: `live-${scenario.tool}-1` };
+    const args = scenario.canvas ? { action: 'generate', ...scenario.canvasInput, idempotencyKey: 'live-canvas-generate-1' } : { profileId: scenario.profileId, prompt: scenario.prompt, idempotencyKey: `live-${scenario.tool}-1` };
     if (scenario.aspect) args.aspect = scenario.aspect;
     if (scenario.seconds) args.seconds = scenario.seconds;
-    Object.assign(args, scenario.inputs || {});
+    if (!scenario.canvas) Object.assign(args, scenario.inputs || {});
     sse([
       { type: 'response.created', response: { id: 'resp-1' } },
       { type: 'response.output_item.done', item: { type: 'function_call', call_id: 'fixture-media-1', namespace: mediaTool.name, name: scenario.tool, arguments: JSON.stringify(args) } },
@@ -196,8 +198,16 @@ async function runMediaScenario(name) {
       inputEntries.push(await library.put(file, `references/${filename}`));
     }
     const pinned = inputEntries.map(entry => ({ id: entry.id, version: entry.sha256 }));
-    scenario.inputs = name === 'image' ? { references: pinned } : { firstFrame: pinned[0], lastFrame: pinned[1] };
+    scenario.inputs = scenario.kind === 'image' ? { references: pinned } : { firstFrame: pinned[0], lastFrame: pinned[1] };
 
+    if (scenario.canvas) {
+      const canvas = await studio.handlers['studio/canvas/create']({ title: 'Kernel canvas', globalPrompt: 'quiet documentary scene', nodes: [
+        { id: 'brief', kind: 'text', title: 'Brief', prompt: 'warm afternoon', x: 0, y: 0 },
+        ...pinned.map((reference, i) => ({ id: `ref${i}`, kind: 'asset', title: `Reference ${i}`, reference, x: 0, y: 200 + i * 200 })),
+        { id: 'output', kind: 'image', title: 'Output', prompt: scenario.prompt, profileId: scenario.profileId, x: 400, y: 0 },
+      ], edges: [{ id: 'context', from: 'brief', to: 'output', role: 'context' }, ...pinned.map((_, i) => ({ id: `reference${i}`, from: `ref${i}`, to: 'output', role: 'reference' }))] });
+      scenario.canvasInput = { id: canvas.id, revision: canvas.revision, nodeId: 'output' };
+    }
     const ws = await rpc('workspace/create', { title: 'studio live', cwd: workspace });
     const thread = await rpc('thread/start', { workspaceId: ws.id, title: `${scenario.tool} live`, cwd: workspace });
     const admitted = await rpc('turn/start', { threadId: thread.id, input: `[${scenario.tool}] generate with the live fixture`, tools: { write: true }, cwd: workspace });
@@ -255,8 +265,18 @@ async function runMediaScenario(name) {
     assert.equal(manifest.studioJobId, jobId);
     assert.equal(manifest.outputs[0].name, outputs[0]);
     assert.equal(manifest.outputs[0].size, bytes.length);
-    if (name === 'image') { assert.equal(manifest.source.references.length, 2); assert.equal(manifest.source.references[1].version, inputEntries[1].sha256); }
+    if (scenario.kind === 'image') { assert.equal(manifest.source.references.length, 2); assert.equal(manifest.source.references[1].version, inputEntries[1].sha256); }
     else { assert.equal(manifest.source.firstFrame.version, inputEntries[0].sha256); assert.equal(manifest.source.lastFrame.version, inputEntries[1].sha256); }
+    if (scenario.canvas) {
+      const board = await studio.handlers['studio/canvas/read']({ id: scenario.canvasInput.id });
+      assert.equal(board.nodes.find(n => n.id === 'output').jobId, jobId);
+      assert.equal(board.nodes.find(n => n.id === 'output').job.source, 'agent');
+      const again = await studio.handlers['studio/canvas/generate']({ ...scenario.canvasInput, idempotencyKey: 'live-canvas-generate-1', agentRequested: true });
+      assert.equal(again.job.id, jobId);
+      assert.equal(media.hits.image, 1, 'retry must not create a second provider request');
+      assert.equal(board.nodes.find(n => n.id === 'output').job.input.prompt, 'quiet documentary scene\n\nwarm afternoon\n\n' + scenario.prompt);
+    }
+
   } finally {
     await studio.close().catch(() => {});
     await studioMcp.close().catch(() => {});
@@ -278,3 +298,7 @@ test('a real kernel turn executes imagegen through studio MCP into a durable job
 test('a real kernel turn executes videogen through the fal-style queue into a durable job and artifact', {
   skip: !fs.existsSync(daemonBin) || !fs.existsSync(kernelBin), timeout: 240_000,
 }, async () => { await runMediaScenario('video'); });
+
+test('a real Kernel calls media_canvas and sees its durable graph, references and image job', {
+  skip: !fs.existsSync(daemonBin) || !fs.existsSync(kernelBin), timeout: 240_000,
+}, async () => { await runMediaScenario('canvas'); });

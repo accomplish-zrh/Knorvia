@@ -29,3 +29,27 @@ test('preview links reject active schemes and out-of-project local paths', () =>
   assert.equal(workspaceLink('../image.png', 'D:/project', 'docs'), 'image.png');
   assert.equal(workspaceLink('../../private', 'D:/project', 'docs'), null);
 });
+
+// --- B16: file references with position --------------------------------------
+
+import { workspaceLinkTarget } from '../lib/native-panel';
+
+test('file references keep line and column positions through decoding', () => {
+  assert.deepEqual(workspaceLinkTarget('docs/read%20me.md:24', 'D:/project'), { path: 'docs/read me.md', line: 24, column: undefined });
+  assert.deepEqual(workspaceLinkTarget('src/app.tsx:12:5', 'D:/project'), { path: 'src/app.tsx', line: 12, column: 5 });
+  assert.deepEqual(workspaceLinkTarget('D:/project/src/app.tsx:12:5', 'D:/project'), { path: 'src/app.tsx', line: 12, column: 5 });
+  assert.deepEqual(workspaceLinkTarget('file:///D:/project/docs/a.md', 'D:/project'), { path: 'docs/a.md', line: undefined, column: undefined });
+});
+
+test('illegal positions and hostile references are rejected outright', () => {
+  // Zero, huge, and non-numeric line "numbers" are not positions; the zero
+  // one must not silently pass, huge ones exceed the bounded range.
+  assert.equal(workspaceLinkTarget('docs/a.md:0', 'D:/project')?.line, undefined);
+  assert.equal(workspaceLinkTarget('docs/a.md:99999', 'D:/project')?.line, 99999);
+  assert.equal(workspaceLinkTarget('docs/%ZZ.md', 'D:/project'), null);
+  assert.equal(workspaceLinkTarget('../secret:3', 'D:/project'), null);
+  assert.equal(workspaceLinkTarget('%2e%2e/private:1', 'D:/project'), null);
+  assert.equal(workspaceLinkTarget('D:/project2/private.txt:1', 'D:/project'), null);
+  assert.equal(workspaceLinkTarget('https://example.com/a.md:2', 'D:/project'), null);
+  assert.deepEqual(workspaceLinkTarget('a.md', 'D:/project', 'notes'), { path: 'notes/a.md', line: undefined, column: undefined });
+});

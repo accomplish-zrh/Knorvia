@@ -2,8 +2,8 @@
 //! These go through `handle_json`, the exact production entry the daemon
 //! exposes, so the contract tested here is what Desktop/CLI see.
 
-use super::*;
 use super::turn_exec::WriteTurnStream;
+use super::*;
 use knorvia_platform_paths::layout;
 use serde_json::json;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -54,7 +54,11 @@ impl TurnExecutor for NoopExecutor {
         Ok(false)
     }
 
-    fn await_turn_done(&mut self, _thread_id: &str, _timeout: Duration) -> Result<(), ProtocolError> {
+    fn await_turn_done(
+        &mut self,
+        _thread_id: &str,
+        _timeout: Duration,
+    ) -> Result<(), ProtocolError> {
         Err(ProtocolError::new(
             ErrorCategory::CapabilityUnavailable,
             "no kernel in bots rpc tests",
@@ -73,8 +77,9 @@ fn plane() -> (ControlPlane, std::path::PathBuf) {
         HOME_SEQ.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&base).unwrap();
-    let plane = ControlPlane::open_with_executor(layout(base.clone()), Box::new(NoopExecutor::new()))
-        .unwrap();
+    let plane =
+        ControlPlane::open_with_executor(layout(base.clone()), Box::new(NoopExecutor::new()))
+            .unwrap();
     (plane, base)
 }
 
@@ -168,14 +173,22 @@ fn bot_create_rename_and_soul_revisions_via_rpc_persist() {
         json!({"botId": bot_id, "name": "Renamed Tutor", "expectedRevision": updated["revision"]}),
     ));
     assert_eq!(renamed["name"], "Renamed Tutor");
-    assert_eq!(renamed["soulRevision"], 2, "rename never bumps soul revision");
+    assert_eq!(
+        renamed["soulRevision"], 2,
+        "rename never bumps soul revision"
+    );
 
     // Reopen the whole control plane over the same Home and re-read.
     drop(plane);
     let mut reopened =
         ControlPlane::open_with_executor(layout(home), Box::new(NoopExecutor::new())).unwrap();
     init(&mut reopened);
-    let reread = result_of(&rpc(&mut reopened, "4", "bot/read", json!({"botId": bot_id})));
+    let reread = result_of(&rpc(
+        &mut reopened,
+        "4",
+        "bot/read",
+        json!({"botId": bot_id}),
+    ));
     assert_eq!(reread["name"], "Renamed Tutor");
     assert_eq!(reread["soul"], "v2 soul");
     assert_eq!(reread["soulHistory"].as_array().unwrap().len(), 1);
@@ -207,7 +220,10 @@ fn ten_rounds_one_group_keeps_one_session_across_rpc() {
                 "canonicalCwd": "D:/work"
             }),
         ));
-        assert_eq!(resolved["action"], if round == 1 { "created" } else { "reused" });
+        assert_eq!(
+            resolved["action"],
+            if round == 1 { "created" } else { "reused" }
+        );
         if round == 1 {
             binding_id = resolved["binding"]["id"].as_str().unwrap().to_string();
             let workspace_id = ensure_workspace(&mut plane);
@@ -281,7 +297,12 @@ fn two_groups_and_dm_stay_separated_and_cwd_change_regenerates() {
         "room/create",
         json!({"kind": "group", "title": "G1", "botIds": [bot_id]}),
     ));
-    let dm = result_of(&rpc(&mut plane, "dm", "room/ensureDm", json!({"botId": bot_id})));
+    let dm = result_of(&rpc(
+        &mut plane,
+        "dm",
+        "room/ensureDm",
+        json!({"botId": bot_id}),
+    ));
 
     let mut thread_ids = Vec::new();
     for (tag, room) in [("g1", &g1), ("g2", &g2), ("dm", &dm)] {

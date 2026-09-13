@@ -56,7 +56,13 @@ function createWorktreeSnapshots({ home, rpc, statfs = fs.statfsSync }) {
   if (!path.isAbsolute(home || '') || typeof rpc !== 'function') throw new Error('Worktree snapshots require application Home and RPC');
   const root = path.join(home, 'worktree-snapshots'); fs.mkdirSync(root, { recursive: true });
   let queue = Promise.resolve();
-  const serial = work => { const next = queue.then(work); queue = next.catch(() => {}); return next; };
+  let closing = false;
+  const serial = work => {
+    if (closing) fail(-32000, 'Worktree snapshots are closing; reopen the application before changing snapshots');
+    const next = queue.then(work);
+    queue = next.catch(() => {});
+    return next;
+  };
   const scopeFor = p => ({ workspaceId: p.workspaceId, ...(p.threadId ? { threadId: p.threadId } : {}), path: '' });
   const resolve = async scope => { const value = verifyResolvedPath(await rpc('workspace/path/resolve', scope), scope); if (value.kind !== 'directory') fail(-32602, 'Select a project directory'); return value.target; };
   const checkSpace = required => {
@@ -150,6 +156,15 @@ function createWorktreeSnapshots({ home, rpc, statfs = fs.statfsSync }) {
       }
     }),
   };
-  return { handlers, async close() { await queue; } };
+  async function close(context = {}) {
+    closing = true;
+    if (context.signal?.aborted) return { confirmed: false, ownedPids: [], detail: 'worktree snapshot operation remained queued at shutdown deadline' };
+    if (!context.signal) { await queue; return { confirmed: true, ownedPids: [], detail: 'snapshot admissions frozen and queue drained' }; }
+    const aborted = new Promise(resolve => context.signal.addEventListener('abort', () => resolve(false), { once: true }));
+    const settled = queue.then(() => true, () => true);
+    if (!await Promise.race([settled, aborted])) return { confirmed: false, ownedPids: [], detail: 'worktree snapshot operation remained queued at shutdown deadline' };
+    return { confirmed: true, ownedPids: [], detail: 'snapshot admissions frozen and queue drained' };
+  }
+  return { handlers, close };
 }
 module.exports = { createWorktreeSnapshots, METHODS, capture };

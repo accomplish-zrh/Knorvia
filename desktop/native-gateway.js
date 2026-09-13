@@ -12,6 +12,13 @@ const { createKernelEngine } = require('./kernel-engine');
 const { MAX_TRANSPORT_BYTES, createNativeRpcRouter, errorResponse } = require('./native-rpc-router');
 const { createNativeRuntime } = require('./native-runtime');
 const { createWorkspacePreview } = require('./workspace-preview');
+// C18/C19: lane D delivers these modules; a tree without them keeps the
+// pre-existing gateway behaviour instead of failing to start.
+let createWorkspaceMediaPreview = null;
+let createTerminalProfiles = null;
+try { ({ createWorkspaceMediaPreview } = require('./workspace-media-preview')); } catch { /* D module absent */ }
+try { ({ createTerminalProfiles } = require('./terminal-profiles')); } catch { /* D module absent */ }
+const { createPreviewRevocationHandlers } = require('./preview-revoke');
 const { createPersonalLibrary } = require('./personal-library');
 const { createMediaStudio } = require('./media-studio');
 const { createStudioMcp } = require('./studio-mcp');
@@ -21,9 +28,18 @@ const { createOpenmaicCourse } = require('./openmaic-course');
 const { createLibraryImageOps } = require('./library-image-ops');
 const { createCliBackendHandlers } = require('./cli-backends');
 const { createCliDispatchBridge } = require('./cli-dispatch');
+const { createShutdownController, asShutdownStep, monotonicNow, raceWithTimer } = require('./shutdown-controller');
 const { createCuratedCatalog } = require('./curated-catalog');
 const { createWorkspaceTerminal } = require('./workspace-terminal');
 const { createTurnNotifier } = require('./turn-notifications');
+const { createRuntimeDiagnostics, knownEnvSecretValues, METHODS: RUNTIME_DIAGNOSTICS_METHODS } = require('./runtime-diagnostics');
+const { NATIVE_METHODS, LOCAL_METHODS } = require('./native-rpc-router');
+// C05: explicit allow-list registration for the diagnostics RPC (named
+// methods only, no generic passthrough).
+for (const diagnosticsMethod of RUNTIME_DIAGNOSTICS_METHODS) {
+  NATIVE_METHODS.add(diagnosticsMethod);
+  LOCAL_METHODS.add(diagnosticsMethod);
+}
 const { createExtensionManager, extensionConnectionHandlers } = require('./extension-manager');
 const { createSshSessions } = require('./ssh-session');
 const { createWorktreeSnapshots } = require('./worktree-snapshots');
@@ -209,6 +225,7 @@ function createNativeGateway({
   });
   let runtime;
   let terminals;
+  let workspaceMediaPreview = null;
   let router;
   let removeRouterNotification;
   let started = false;
@@ -322,8 +339,8 @@ function createNativeGateway({
     });
   });
 
-  let mediaStudio; let studioMcp; let personalLibrary; let extensionManager; let sshSessions; let worktreeSnapshots; let creativeCliService; let cliDispatch;
-  let starting; let closing;
+  let mediaStudio; let studioMcp; let personalLibrary; let extensionManager; let sshSessions; let worktreeSnapshots; let creativeCliService; let cliDispatch; let cliBackends;
+  let starting; let closing; let abandonedShutdown = null;
   function start() {
     if (closed) throw new Error('Native gateway is closed');
     if (started) return Promise.resolve(address());
@@ -357,19 +374,58 @@ function createNativeGateway({
     if (closed) throw new Error('Native gateway is closed');
     personalLibrary = createPersonalLibrary({ home, rpc: runtime.rpc });
     mediaStudio = createMediaStudio({ home, rpc: runtime.rpc, library: personalLibrary });
-    terminals = createWorkspaceTerminal({ rpc: runtime.rpc });
+    terminals = createWorkspaceTerminal({
+      rpc: runtime.rpc,
+      ...(createTerminalProfiles ? { home, profiles: createTerminalProfiles({ home }) } : {}),
+    });
+    // C19: scoped revocable stream URLs when lane D's module is present.
+    workspaceMediaPreview = createWorkspaceMediaPreview ? createWorkspaceMediaPreview({}) : null;
     sshSessions = createSshSessions({ home, rpc: runtime.rpc });
     worktreeSnapshots = createWorktreeSnapshots({ home, rpc: runtime.rpc });
-    extensionManager = createExtensionManager({ home, rpc: runtime.rpc });
+    extensionManager = createExtensionManager({
+      home,
+      rpc: runtime.rpc,
+      getBuiltinSkills: () => runtime.engine?.builtinSkills || [],
+    });
     await extensionManager.restore();
+    if (closed) throw new Error('Native gateway is closed');
     learningPack ??= createLearningPack({ home, library: personalLibrary, studio: mediaStudio, rpc: runtime.rpc });
     curatedCatalog ??= createCuratedCatalog({ home, library: personalLibrary, studio: mediaStudio, extensionManager, rpc: runtime.rpc });
     creativeCliService = createCreativeCliService({ home, rpc: runtime.rpc, library: personalLibrary, studio: mediaStudio, extensionManager, learning: learningPack, catalog: curatedCatalog, course: createOpenmaicCourse({ library: personalLibrary }), imageOps: createLibraryImageOps({ library: personalLibrary }), version });
     await creativeCliService.listen();
+    if (closed) throw new Error('Native gateway is closed');
     const turnNotifier = createTurnNotifier({ home, browser: true });
-    const cliBackends = createCliBackendHandlers({ env });
+    cliBackends = createCliBackendHandlers({ env });
     cliDispatch = createCliDispatchBridge({ rpc: runtime.rpc, handlers: cliBackends.handlers, backendIds: () => cliBackends.host.availableBackendIds() });
     void cliDispatch.start();
+    const diagnostics = createRuntimeDiagnostics({
+      identity: { appVersion: version, channel: 'browser-gateway', electron: null, chrome: null, runtimeComponents: 'knorvia-daemon engine + fixed Kernel app-server (dev gateway)' },
+      pathRoots: [{ label: '~', path: home }, { label: '[temp]', path: require('os').tmpdir() }],
+      secretValues: knownEnvSecretValues(env),
+      collectors: {
+        components: async () => {
+          let daemon = 'offline';
+          try { await runtime.rpc('system/health'); daemon = 'ready'; } catch { daemon = 'offline'; }
+          return [
+            { name: 'daemon-engine', status: daemon, detail: daemon === 'ready' ? 'system/health responded' : 'system/health failed' },
+            { name: 'gateway', status: 'ready', detail: 'loopback browser gateway' },
+            { name: 'extensions', status: extensionManager ? 'ready' : 'offline', detail: 'extension manager instance' },
+          ];
+        },
+        capabilities: async () => [
+          { name: 'terminal', available: Boolean(terminals) },
+          { name: 'ssh', available: Boolean(sshSessions) },
+          { name: 'extensions', available: Boolean(extensionManager) },
+          { name: 'cliBackends', available: cliBackends.host.availableBackendIds().length > 0 },
+        ],
+        ports: async () => {
+          const bound = server ? (typeof server.address() === 'object' && server.address() ? server.address().port : null) : null;
+          return [{ label: 'gateway', port: bound, state: bound ? 'listening' : 'closed', host: '127.0.0.1' }];
+        },
+        recentErrors: async () => [],
+        checks: async () => [{ name: 'gateway-loopback', passed: Boolean(server) }],
+      },
+    });
     router = createNativeRpcRouter({
       rpc: runtime.rpc,
       onNotification: runtime.onNotification,
@@ -386,12 +442,14 @@ function createNativeGateway({
         ...sshSessions.handlers,
         ...worktreeSnapshots.handlers,
         ...browserDesktopPathHandlers(),
-        ...createWorkspacePreview({ rpc: runtime.rpc }),
+        ...createWorkspacePreview({ rpc: runtime.rpc, ...(workspaceMediaPreview ? { mediaPreview: workspaceMediaPreview } : {}) }),
+        ...(workspaceMediaPreview ? createPreviewRevocationHandlers(workspaceMediaPreview).handlers : {}),
         ...personalLibrary.handlers,
         ...mediaStudio.handlers,
         ...terminals.handlers,
         ...learningPack.commands,
         ...cliBackends.handlers,
+        ...diagnostics.handlers,
       },
     });
     removeRouterNotification = router.subscribe((notification) => {
@@ -409,7 +467,17 @@ function createNativeGateway({
       return address();
     } catch (error) {
       closed = true;
-      await disposeServices();
+      if (abandonedShutdown && closing) {
+        // close() already returned (or is returning) its bounded report. A
+        // startup dependency may still resolve after that report, so perform a
+        // second idempotent sweep only after the bounded close has finished.
+        // It retains the original absolute deadline; late cleanup may signal
+        // work, but it never opens a new host budget.
+        const shutdown = abandonedShutdown;
+        void Promise.resolve(closing).catch(() => {}).then(() => disposeServices(shutdown)).catch(() => {});
+      } else if (!closing) {
+        await disposeServices();
+      }
       throw error;
     }
   }
@@ -430,47 +498,115 @@ function createNativeGateway({
     if (closing) return closing;
     closed = true;
     closing = (async () => {
-      try { await starting; } catch {}
-      await disposeServices();
+      const began = monotonicNow();
+      const totalBudgetMs = Number(env.KNORVIA_SHUTDOWN_BUDGET_MS) || 15_000;
+      const deadline = began + totalBudgetMs;
+      let startupTimedOut = false;
+      if (starting) {
+        // Startup is part of the same host budget. Reserve most of the budget
+        // for closing resources that may already have been created.
+        const waitMs = Math.min(
+          Math.max(0, deadline - monotonicNow()),
+          Math.max(1, Math.floor(totalBudgetMs / 4)),
+        );
+        const startup = await raceWithTimer(Promise.resolve(starting), waitMs);
+        startupTimedOut = startup.timedOut;
+        if (startupTimedOut) abandonedShutdown = { startedAt: began, deadline, totalBudgetMs };
+      }
+      const report = await disposeServices({ startedAt: began, deadline, totalBudgetMs });
+      if (startupTimedOut) {
+        report.steps.unshift({
+          name: 'gateway-startup', status: 'unconfirmed', ms: Math.max(0, monotonicNow() - began),
+          detail: 'gateway startup did not settle before its shutdown slice expired',
+        });
+        report.unconfirmed.unshift('gateway-startup');
+        report.totalMs = Math.max(0, monotonicNow() - began);
+        report.withinBudget = monotonicNow() <= deadline;
+      }
+      return report;
     })();
     return closing;
   }
 
-  async function disposeServices() {
-    try { await cliDispatch?.close(); } catch {}
-    cliDispatch = undefined;
-    try { await creativeCliService?.close(); } catch {}
-    creativeCliService = undefined;
+  async function disposeServices(options = {}) {
     clearInterval(tokenSweep);
     tokens.clear();
-    for (const peer of peers) {
-      try { peer.terminate(); } catch {}
-    }
-    peers.clear();
-    try { removeRouterNotification?.(); } catch {}
+    const began = Number.isFinite(options.startedAt) ? options.startedAt : monotonicNow();
+    const totalBudgetMs = Number.isFinite(options.totalBudgetMs)
+      ? Math.max(0, options.totalBudgetMs)
+      : (Number(env.KNORVIA_SHUTDOWN_BUDGET_MS) || 15_000);
+    const deadline = Number.isFinite(options.deadline) ? options.deadline : began + totalBudgetMs;
+    const alive = pid => { try { process.kill(pid, 0); return true; } catch { return false; } };
+    const reapOwned = async (pending, context) => {
+      const reaped = [];
+      for (const item of pending) {
+        if (!Number.isInteger(item?.pid) || item.pid <= 0) continue;
+        if (!alive(item.pid)) { reaped.push(item); continue; }
+        if (context.signal.aborted || context.now() >= context.deadline) break;
+        if (process.platform === 'win32') {
+          await new Promise(resolve => {
+            const child = require('node:child_process').spawn('taskkill', ['/pid', String(item.pid), '/t', '/f'], { windowsHide: true, stdio: 'ignore' });
+            const finish = () => resolve();
+            child.once('exit', finish); child.once('error', finish);
+            context.signal.addEventListener('abort', () => { try { child.kill(); } catch {} finish(); }, { once: true });
+          });
+        } else { try { process.kill(item.pid, 'SIGKILL'); } catch {} }
+        while (alive(item.pid) && !context.signal.aborted && context.now() < context.deadline) await new Promise(resolve => setTimeout(resolve, 10));
+        if (!alive(item.pid)) reaped.push(item);
+      }
+      return reaped;
+    };
+    const transportClose = async () => {
+      for (const peer of peers) { try { peer.terminate(); } catch {} }
+      peers.clear();
+      try { removeRouterNotification?.(); } catch {}
+      try { webSocketServer.close(); } catch {}
+      if (started) {
+        started = false;
+        server.closeAllConnections?.();
+        await new Promise(resolve => server.close(() => resolve()));
+      }
+    };
+    const report = await createShutdownController({
+      totalBudgetMs, now: monotonicNow, startedAt: began, deadline, reapPids: reapOwned,
+      steps: [
+        asShutdownStep('native-rpc-router', ctx => router?.beginClose?.(ctx)),
+        asShutdownStep('gateway-transports', transportClose),
+        asShutdownStep('cli-dispatch', ctx => cliDispatch?.close?.(ctx)),
+        asShutdownStep('creative-cli-service', ctx => creativeCliService?.close?.(ctx)),
+        asShutdownStep('studio-mcp', ctx => studioMcp?.close?.(ctx)),
+        asShutdownStep('media-studio', ctx => mediaStudio?.close?.(ctx)),
+        asShutdownStep('workspace-terminals', ctx => terminals?.dispose?.(ctx), { ownedPids: () => terminals?.activePids?.() || [] }),
+        asShutdownStep('cli-backends', async ctx => {
+          const timeoutMs = Number.isFinite(ctx.remainingMs) ? Math.max(0, ctx.remainingMs) : 0;
+          const result = await cliBackends?.host?.closeAll?.({ timeoutMs, signal: ctx.signal });
+          return result?.exitedWithinTimeout === false
+            ? { confirmed: false, ownedPids: cliBackends?.host?.activePids?.() || [], detail: 'gateway CLI processes did not confirm exit' }
+            : { confirmed: true };
+        }, { ownedPids: () => cliBackends?.host?.activePids?.() || [] }),
+        asShutdownStep('ssh-sessions', ctx => sshSessions?.dispose?.(ctx)),
+        asShutdownStep('worktree-snapshots', ctx => worktreeSnapshots?.close?.(ctx)),
+        asShutdownStep('extension-manager', ctx => extensionManager?.close?.(ctx)),
+        asShutdownStep('personal-library', ctx => personalLibrary?.close?.(ctx)),
+        asShutdownStep('workspace-media-preview', ctx => workspaceMediaPreview?.close?.(ctx)),
+        asShutdownStep('native-runtime', ctx => runtime?.close?.(ctx), { ownedPids: () => [runtime?.pid].filter(Boolean) }),
+      ],
+    }).run();
     try { router?.dispose(); } catch {}
-    try { webSocketServer.close(); } catch {}
-    if (started) {
-      started = false;
-      server.closeAllConnections?.();
-      await new Promise((resolve) => server.close(() => resolve()));
-    }
-    // Reject new Agent calls before aborting media work, and leave the durable
-    // daemon available until workers have settled their checkpoints.
-    try { await studioMcp?.close(); } catch {}
+    cliDispatch = undefined;
+    workspaceMediaPreview = null;
+    creativeCliService = undefined;
     studioMcp = undefined;
-    try { await mediaStudio?.close(); } catch {}
     mediaStudio = undefined;
-    terminals?.dispose();
     terminals = undefined;
-    sshSessions?.dispose(); sshSessions = undefined;
-    try { await worktreeSnapshots?.close(); } catch {}
+    cliBackends = undefined;
+    sshSessions = undefined;
     worktreeSnapshots = undefined;
-    try { await extensionManager?.close(); } catch {}
     extensionManager = undefined;
-    try { await runtime?.close?.(); } catch {}
+    personalLibrary = undefined;
     runtime = undefined;
     router = undefined;
+    return report;
   }
 
   return {

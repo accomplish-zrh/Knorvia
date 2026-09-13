@@ -1,0 +1,23 @@
+/* History bulk actions (B-owned): selection toolbar + per-item run results. */
+/* In bulk mode a row is [checkbox][link]; keep the classic row layout on the link. */
+.nw-task-row .nw-task-row-link { flex: 1; min-width: 0; display: flex; gap: 20px; align-items: center; color: inherit; text-decoration: none; }
+.nw-task-row .nw-task-row-link > div { min-width: 0; flex: 1; display: flex; flex-direction: column; }
+.nw-task-row .nw-task-row-link > svg { color: var(--nw-muted); }
+.hw-bulk-select { display: inline-flex; align-items: center; gap: 8px; }
+.hw-bulk-toolbar { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 8px 12px; border: 1px solid var(--nw-line); border-radius: 10px; background: var(--nw-panel, transparent); }
+.hw-bulk-toolbar .hw-count-selected { font-weight: 550; }
+.hw-task-row .hw-bulk-check { flex-shrink: 0; align-self: center; }
+.hw-task-row .hw-bulk-check input { width: 15px; height: 15px; accent-color: var(--nw-green); }
+.hw-bulk-note { display: flex; flex-direction: column; gap: 6px; font-size: 13px; padding: 10px 12px; border: 1px solid var(--nw-line); border-radius: 10px; opacity: .9; }
+.hw-bulk-note ul { margin: 0; padding-left: 18px; }
+.hw-bulk-actions { display: flex; justify-content: flex-end; gap: 9px; margin-top: 18px; }
+.hw-bulk-summary { display: flex; flex-wrap: wrap; gap: 7px; margin-bottom: 12px; }
+.hw-bulk-results { list-style: none; margin: 0; padding: 0; max-height: 320px; overflow: auto; display: flex; flex-direction: column; gap: 6px; }
+.hw-bulk-row { display: flex; align-items: baseline; gap: 8px; font-size: 13px; padding: 7px 10px; border: 1px solid var(--nw-line); border-radius: 9px; }
+.hw-bulk-row strong { font-weight: 550; overflow-wrap: anywhere; }
+.hw-bulk-detail { color: var(--nw-mute, #6b7280); font-size: 12px; overflow-wrap: anywhere; }
+.hw-chip { display: inline-flex; align-items: center; gap: 4px; padding: 2px 8px; border-radius: 999px; font-size: 12px; border: 1px solid var(--nw-line); flex-shrink: 0; }
+.hw-chip-succeeded { color: #157347; border-color: #15734740; background: #15734714; }
+.hw-chip-skipped { color: #8a6d1d; border-color: #8a6d1d40; background: #8a6d1d14; }
+.hw-chip-conflict { color: #b45309; border-color: #b4530940; background: #b4530914; }
+.hw-chip-failed { color: #b3261e; border-color: #b3261e40; background: #b3261e14; }

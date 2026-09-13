@@ -11,35 +11,41 @@ use knorvia_protocol::{
     RpcFailure, RpcNotification, RpcRequest, RpcSuccess, SERVER_NAME, write_frame,
 };
 use knorvia_provider_gateway::{self, CanonicalRequest, ProviderKind};
-use knorvia_store::{GoalUpdate, ProductStore, WorkspaceCwdUpdate};
+use knorvia_store::{ArtifactCatalogQuery, GoalUpdate, ProductStore, WorkspaceCwdUpdate};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::Path;
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::AtomicBool;
+use std::sync::{Arc, Mutex};
 #[cfg(test)]
 use std::time::Duration;
 
 mod automations;
+mod message_queue;
 mod bots;
 #[cfg(test)]
 mod bots_rpc_tests;
 mod extensions;
 mod goals;
 mod project_context;
+mod project_search;
 mod restart;
 mod room_dispatch;
+mod room_mentions;
 // C-001/C-002 wiring (A-integrated): memory + auth-link RPC surfaces.
-mod memory_rpc;
 mod auth_links_rpc;
+mod memory_rpc;
 #[cfg(test)]
 mod room_dispatch_tests;
 mod sessions;
+mod pack_dispatch;
 pub mod turn_exec;
 mod turns;
 mod usage_summary;
+// B05 (night 2026-09-10): read-only delivery pre-checks for worktrees.
+mod worktree_review;
 pub use automations::{AutomationScheduler, serve_stdio_with_automations};
 
 #[cfg(test)]
@@ -55,19 +61,64 @@ pub struct ControlPlane {
     packs: Arc<PackHost>,
     executor: Arc<Mutex<Box<dyn TurnExecutor>>>,
     admissions_paused: Arc<AtomicBool>,
+    /// Serializes the scheduler's final pause check with state-transition
+    /// quiescence. Once paused and synchronized through this barrier, no
+    /// background scheduler code can touch the swappable state tree.
+    state_writer_barrier: Arc<Mutex<()>>,
     /// Active room dispatches keyed by conversation id; the value cancels.
     /// Shared with the dispatch thread so it can deregister on completion.
     room_dispatches: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
     /// Production: the supervised pack worker process. Tests may install an
-    /// in-process runner via `open_with_pack_runner_factory`.
+    /// in-process runner via `open_with_pack_runner_factory`. Shared with
+    /// background execution threads (A05), hence the mutex.
     pack_runner_factory: PackRunnerFactory,
+    /// Live background pack invocations (A05) keyed by invocation id: the
+    /// cancel handle reaches the registered worker; `done` lets a cancel
+    /// wait for the reclaim instead of answering with a blind record flip.
+    live_packs: Arc<Mutex<HashMap<String, LivePackHandle>>>,
+    pack_requests: Arc<std::sync::atomic::AtomicUsize>,
+    /// Live project-search sessions (P01). Sliced and resumed on the single
+    /// control thread; cancellation simply removes the session.
+    project_search: project_search::ProjectSearchRegistry,
+    queue_driver: message_queue::QueueDriver,
     // Drop last, after executor shutdown. A second writer cannot recover a
     // live owner's turns; the lock file is never deleted as a locking scheme.
     _ownership: Option<Arc<std::fs::File>>,
 }
 
-type PackRunnerFactory =
-    Box<dyn Fn() -> Result<Box<dyn knorvia_packs::PackRunner + Send>, ProtocolError> + Send>;
+/// The factory is called from background execution threads as well as the
+/// control thread, so it is shared behind a mutex instead of a bare box.
+type PackRunnerFactory = std::sync::Arc<std::sync::Mutex<
+    Box<dyn Fn() -> Result<Box<dyn knorvia_packs::PackRunner + Send>, ProtocolError> + Send>,
+>>;
+
+/// One admitted, currently-executing background pack invocation.
+struct LivePackHandle {
+    cancel: knorvia_packs::InvocationCancel,
+    job_id: String,
+    pack_id: String,
+    /// Set (with notify) when the execution thread finished — successfully
+    /// or not — so a cancel can report a real reclaim instead of a guess.
+    done: Arc<(Mutex<bool>, std::sync::Condvar)>,
+}
+
+impl LivePackHandle {
+    /// Bounded wait for the execution thread to observe the cancel and exit.
+    fn wait_reclaimed(&self, timeout: std::time::Duration) -> bool {
+        let (lock, cvar) = &*self.done;
+        let Ok(mut guard) = lock.lock() else {
+            return false;
+        };
+        if *guard {
+            return true;
+        }
+        let outcome = cvar.wait_timeout_while(guard, timeout, |finished| !*finished);
+        match outcome {
+            Ok((guard, _)) => *guard,
+            Err(poisoned) => *poisoned.into_inner().0,
+        }
+    }
+}
 
 /// Production runner: renders in the supervised `knorvia-pack-worker`
 /// process (one spawn per render; the worker holds no ambient authority).
@@ -79,6 +130,9 @@ struct WorkerPackRunner {
     /// product pack id → worker runtime ("native" | "python"), read from the
     /// installed manifests at construction.
     pack_runtimes: HashMap<String, String>,
+    /// A05: latched before the render starts so a cancel that lands during
+    /// the spawn/handshake still reaches the worker once it exists.
+    cancel: Option<knorvia_packs::InvocationCancel>,
 }
 
 impl WorkerPackRunner {
@@ -100,11 +154,16 @@ impl WorkerPackRunner {
         Ok(Self {
             store,
             pack_runtimes,
+            cancel: None,
         })
     }
 }
 
 impl knorvia_packs::PackRunner for WorkerPackRunner {
+    fn bind_cancel(&mut self, cancel: knorvia_packs::InvocationCancel) {
+        self.cancel = Some(cancel);
+    }
+
     fn render(
         &mut self,
         ctx: &knorvia_packs::RenderContext,
@@ -120,6 +179,12 @@ impl knorvia_packs::PackRunner for WorkerPackRunner {
             .map_err(|e| knorvia_packs::PackExecError::Msg(format!("pack worker: {e}")))?;
         let mut client = knorvia_capability_host::worker::PackWorkerClient::spawn_spec(&spec)
             .map_err(|e| knorvia_packs::PackExecError::Msg(format!("pack worker: {e}")))?;
+        // A05: a cancel that fired before the worker existed (latched) or
+        // lands from now on reclaims this exact worker process tree.
+        if let Some(cancel) = &self.cancel {
+            let killer = client.kill_handle();
+            cancel.register_reclaimer(Arc::new(move || killer.kill()));
+        }
         // Worker progress notifications update the running job's checkpoint.
         let store = Arc::clone(&self.store);
         let job_id = ctx.job_id.clone();
@@ -169,7 +234,10 @@ impl ControlPlane {
             .truncate(false)
             .read(true)
             .write(true)
-            .open(paths.state.join("daemon.lock"))
+            // The ownership credential must survive state-directory swaps.
+            // `run/` is stable while migration rollback moves `state/`, so a
+            // crash/recovery can never accidentally admit a second writer.
+            .open(paths.run.join("daemon.lock"))
             .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))?;
         ownership.try_lock().map_err(|error| match error {
             std::fs::TryLockError::WouldBlock => ProtocolError::new(ErrorCategory::Conflict, "Knorvia Home already has an active daemon; connect to its owner instead of opening another writer"),
@@ -190,13 +258,41 @@ impl ControlPlane {
             paths,
             lock: ownership,
         } = ownership;
-        let executor = KernelTurnExecutor::with_ownership(paths.clone(), Arc::clone(&ownership));
-        let mut plane = Self::open_with_executor(paths, Box::new(executor))?;
+        // A crash between rollback renames is repaired while the stable Home
+        // lock is held and before ProductStore can bootstrap or expose the
+        // temporarily absent state path.
+        Migrator::recover_pending_rollback(&paths)
+            .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))?;
+        // The store is opened first so the production executor shares one
+        // instance: Kernel bindings become durable product records written
+        // through the same store the control plane uses.
+        let store = Arc::new(ProductStore::open(paths.clone()).map_err(|e| e.into_protocol())?);
+        let executor = KernelTurnExecutor::with_ownership_and_store(
+            paths.clone(),
+            Arc::clone(&ownership),
+            Arc::clone(&store),
+        );
+        let mut plane = Self::open_with_executor_and_store(paths, Box::new(executor), store)?;
         plane._ownership = Some(ownership);
         plane
             .store
             .recover_incomplete_turns()
             .map_err(|e| e.into_protocol())?;
+        // Same batch semantics for Pack/Job work: a restart must never leave
+        // a forever-`running` Job or Invocation. Recovery only records the
+        // terminal fact; resuming the recorded identity stays explicit.
+        plane
+            .store
+            .recover_incomplete_jobs()
+            .map_err(|e| e.into_protocol())?;
+        plane
+            .packs
+            .recover_incomplete()
+            .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))?;
+        // Bounded expiry sweep for Auth Connect: ops that expired while no
+        // process owned this Home are closed with their temporary secrets
+        // scrubbed, so a restart never re-advertises a dead login window.
+        let _ = plane.auth_links().sweep_expired();
         Ok(plane)
     }
 
@@ -205,6 +301,14 @@ impl ControlPlane {
         executor: Box<dyn TurnExecutor>,
     ) -> Result<Self, ProtocolError> {
         let store = Arc::new(ProductStore::open(paths.clone()).map_err(|e| e.into_protocol())?);
+        Self::open_with_executor_and_store(paths, executor, store)
+    }
+
+    fn open_with_executor_and_store(
+        paths: KnorviaPaths,
+        executor: Box<dyn TurnExecutor>,
+        store: Arc<ProductStore>,
+    ) -> Result<Self, ProtocolError> {
         let packs = Arc::new(
             PackHost::open(&paths)
                 .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))?,
@@ -217,9 +321,9 @@ impl ControlPlane {
             store,
             packs,
             executor,
-            Box::new(move || {
+            Arc::new(Mutex::new(Box::new(move || {
                 worker_pack_runner_factory(Arc::clone(&store_for_factory), &packs_for_factory)
-            }),
+            }))),
         ))
     }
 
@@ -258,8 +362,13 @@ impl ControlPlane {
             packs,
             executor: Arc::new(Mutex::new(executor)),
             pack_runner_factory,
+            live_packs: Arc::new(Mutex::new(HashMap::new())),
+            pack_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             admissions_paused: Arc::new(AtomicBool::new(false)),
+            state_writer_barrier: Arc::new(Mutex::new(())),
             room_dispatches: Arc::new(Mutex::new(HashMap::new())),
+            project_search: project_search::ProjectSearchRegistry::default(),
+            queue_driver: message_queue::QueueDriver::default(),
         }
     }
 
@@ -267,7 +376,9 @@ impl ControlPlane {
     /// executor is internally synchronized; the mutex only protects its
     /// mutable façade, never across a blocking wait.
     fn executor_lock(&self) -> std::sync::MutexGuard<'_, Box<dyn TurnExecutor>> {
-        self.executor.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        self.executor
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
     /// Attach the streamed-turn notification sink (serve_stdio installs this
@@ -295,6 +406,14 @@ impl ControlPlane {
         }
         let req: RpcRequest = serde_json::from_value(v)
             .map_err(|e| ProtocolError::new(ErrorCategory::InvalidArgument, e.to_string()))?;
+        if serde_json::to_vec(&req.id).expect("request ID").len() > 128 {
+            let fail = RpcFailure::from_category(req.id, ErrorCategory::InvalidArgument, "request ID exceeds 128 encoded bytes");
+            let encoded = serde_json::to_string(&fail).expect("rpc");
+            if encoded.len() > knorvia_protocol::MAX_FRAME_BYTES {
+                return Err(ProtocolError::new(ErrorCategory::InvalidArgument, "request ID exceeds response frame budget"));
+            }
+            return Ok(Some(encoded));
+        }
         if req.jsonrpc != JSONRPC_VERSION {
             let fail = RpcFailure::from_category(
                 req.id,
@@ -326,7 +445,7 @@ impl ControlPlane {
     }
 
     fn handle_request(&mut self, req: &RpcRequest) -> Result<Value, ProtocolError> {
-        if req.method != "initialize" {
+        if req.method != "initialize" && !self.queue_driver.admitting {
             self.handshake.require_ready()?;
         }
         let params = &req.params;
@@ -334,24 +453,34 @@ impl ControlPlane {
             .get("idempotencyKey")
             .and_then(|v| v.as_str())
             .map(str::to_string);
+        // These operations own their durable, operation-specific receipts.
+        // A generic marker would hide resumable work after admission and
+        // would prevent room/send from restarting a queued worker.
+        if matches!(req.method.as_str(), "memory/import" | "room/send") {
+            return self.dispatch_request(req, params);
+        }
         if let Some(key) = &idem {
+            // The idempotency identity is (key, method, request fingerprint).
             // Marks the attempt pending (or returns the durable outcome of a
             // finished attempt). A crash between a method's side effects and
             // its completion therefore replays as a typed "outcome unknown"
-            // instead of a silent duplicate execution.
+            // instead of a silent duplicate execution; a recycled key with a
+            // different payload is a typed conflict instead of a foreign hit.
+            let fingerprint = idempotency_fingerprint(&req.method, params);
             if let Some(cached) = self
                 .store
-                .begin_idempotent(key, &req.method)
+                .begin_idempotent(key, &req.method, &fingerprint)
                 .map_err(|e| e.into_protocol())?
             {
                 return Ok(cached);
             }
-        }
-        let outcome = self.dispatch_request(req, params);
-        if let Some(key) = &idem {
+            let outcome = self.dispatch_request(req, params);
             match &outcome {
                 Ok(result) => {
-                    if let Err(e) = self.store.remember_idempotent(key, &req.method, result) {
+                    if let Err(e) =
+                        self.store
+                            .remember_idempotent(key, &req.method, &fingerprint, result)
+                    {
                         return Err(e.into_protocol());
                     }
                 }
@@ -366,12 +495,19 @@ impl ControlPlane {
                     let _ = if side_effect_free {
                         self.store.clear_idempotent(key)
                     } else {
-                        self.store.fail_idempotent(key, &req.method, &error.message)
+                        self.store
+                            .fail_idempotent(
+                                key,
+                                &req.method,
+                                &fingerprint,
+                                &knorvia_protocol::sanitize_diagnostic(&error.message),
+                            )
                     };
                 }
             }
+            return outcome;
         }
-        outcome
+        self.dispatch_request(req, params)
     }
 
     fn dispatch_request(
@@ -379,7 +515,7 @@ impl ControlPlane {
         req: &RpcRequest,
         params: &Value,
     ) -> Result<Value, ProtocolError> {
-        if req.method != "initialize" {
+        if req.method != "initialize" && !self.queue_driver.admitting {
             self.handshake.require_ready()?;
         }
         let result = match req.method.as_str() {
@@ -411,11 +547,16 @@ impl ControlPlane {
             "workspace/update" => self.rpc_workspace_update(params),
             "workspace/files/list" => self.rpc_workspace_files_list(params),
             "workspace/files/read" => self.rpc_workspace_files_read(params),
+            "workspace/files/search" => self.rpc_workspace_files_search(params),
+            "workspace/files/search/cancel" => self.rpc_workspace_files_search_cancel(params),
             "workspace/path/resolve" => self.rpc_workspace_path_resolve(params),
             "workspace/git/status" => self.rpc_workspace_git_status(params),
             "workspace/git/diff" => self.rpc_workspace_git_diff(params),
             "workspace/worktree/create" => self.rpc_workspace_worktree_create(params),
             "workspace/worktree/list" => self.rpc_workspace_worktree_list(params),
+            // B05: read-only delivery review between frozen SHAs.
+            "workspace/git/compare" => self.rpc_workspace_git_compare(params),
+            "workspace/git/compare-diff" => self.rpc_workspace_git_compare_diff(params),
             "workspace/worktree/lock" => self.rpc_workspace_worktree_lock(params, true),
             "workspace/worktree/unlock" => self.rpc_workspace_worktree_lock(params, false),
             "workspace/worktree/remove" => self.rpc_workspace_worktree_remove(params),
@@ -424,11 +565,13 @@ impl ControlPlane {
             "automation/update" => self.rpc_automation_update(params),
             "automation/delete" => self.rpc_automation_delete(params),
             "automation/run" => self.rpc_automation_run(params),
+            "automation/preview" => self.rpc_automation_preview(params),
             "goal/create" => self.rpc_goal_create(params),
             "goal/read" => self.rpc_goal_read(params),
             "goal/list" => self.rpc_goal_list(params),
             "goal/update" => self.rpc_goal_update(params),
             "goal/run" => self.rpc_goal_run(params),
+            "goal/run/read" => self.rpc_goal_run_read(params),
             "goal/evidence/add" => self.rpc_goal_evidence(params),
             "task/create" => self.rpc_task_create(params),
             "task/read" => {
@@ -456,6 +599,9 @@ impl ControlPlane {
             "room/addMember" => self.rpc_room_add_member(params),
             "room/removeMember" => self.rpc_room_remove_member(params),
             "room/send" => self.rpc_room_send(params),
+            "room/send/status" => self.rpc_room_send_status(params, false),
+            "room/send/resume" => self.rpc_room_send_status(params, true),
+            "room/mentions" => self.rpc_room_mentions(params),
             "room/messages" => self.rpc_room_messages(params),
             "room/interrupt" => self.rpc_room_interrupt(params),
             "room/checkpoint" => self.rpc_room_checkpoint(params),
@@ -486,7 +632,10 @@ impl ControlPlane {
             "memory/import" => self.rpc_memory_import(params),
             "auth/link/list" => self.rpc_auth_link_list(params),
             "auth/link/refresh" => self.rpc_auth_link_refresh(params),
+            "auth/link/refresh/read" => self.rpc_auth_link_refresh_read(params),
+            "auth/link/refresh/cancel" => self.rpc_auth_link_refresh_cancel(params),
             "auth/link/connect-start" => self.rpc_auth_link_connect_start(params),
+            "auth/link/connect-complete" => self.rpc_auth_link_connect_complete(params),
             "auth/link/connect-cancel" => self.rpc_auth_link_connect_cancel(params),
             "auth/link/disconnect" => self.rpc_auth_link_disconnect(params),
             "thread/start" => self.rpc_thread_start(params),
@@ -498,6 +647,7 @@ impl ControlPlane {
             "thread/archive" => self.rpc_thread_archive(params),
             "thread/unarchive" => self.rpc_thread_unarchive(params),
             "turn/start" => self.rpc_turn_start(params),
+            "turnQueue/enqueue" | "turnQueue/read" | "turnQueue/cancel" | "turnQueue/pause" | "turnQueue/resume" => self.rpc_message_queue(req.method.as_str(), params),
             "turn/read" => self.rpc_turn_read(params),
             "turn/steer" => self.rpc_turn_steer(params),
             "turn/interrupt" => self.rpc_turn_interrupt(params),
@@ -522,19 +672,56 @@ impl ControlPlane {
                 )
                 .map_err(json_err)
             }
+            // P02: one paginated catalog query across every workspace. First
+            // screen cost is independent of workspace count, corrupt metadata
+            // is skipped-and-counted, and filters apply server-side.
+            "artifact/catalog" => {
+                let query = ArtifactCatalogQuery {
+                    workspace_id: params.get("workspaceId").and_then(Value::as_str),
+                    title_contains: params.get("query").and_then(Value::as_str),
+                    artifact_type: params.get("type").and_then(Value::as_str),
+                };
+                let cursor = params.get("cursor").and_then(Value::as_str);
+                let limit = params
+                    .get("limit")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(50)
+                    .clamp(1, 500) as usize;
+                let page = self
+                    .store
+                    .list_artifacts_catalog(query, cursor, limit)
+                    .map_err(|e| e.into_protocol())?;
+                serde_json::to_value(page).map_err(json_err)
+            }
             "artifact/stage" => self.rpc_artifact_stage(params),
             "artifact/content" => self.rpc_artifact_content(params),
             "artifact/commit" => {
                 let id = required_str(params, "id")?;
-                self.store
-                    .verify_artifact(id)
-                    .map_err(|e| e.into_protocol())?;
-                serde_json::to_value(
-                    self.store
-                        .publish_artifact(id)
+                // P03: with `stagedRevisionId` the commit publishes exactly
+                // that staged revision in one durable transaction, or fails
+                // with a typed conflict when another writer staged since.
+                // Absent keeps the legacy verify→publish pair for old callers.
+                let artifact = match params.get("stagedRevisionId") {
+                    None | Some(Value::Null) => {
+                        self.store
+                            .verify_artifact(id)
+                            .map_err(|e| e.into_protocol())?;
+                        self.store
+                            .publish_artifact(id)
+                            .map_err(|e| e.into_protocol())?
+                    }
+                    Some(Value::String(staged_revision_id)) => self
+                        .store
+                        .commit_staged_artifact(id, staged_revision_id)
                         .map_err(|e| e.into_protocol())?,
-                )
-                .map_err(json_err)
+                    Some(_) => {
+                        return Err(ProtocolError::new(
+                            ErrorCategory::InvalidArgument,
+                            "stagedRevisionId must be a revision id",
+                        ));
+                    }
+                };
+                serde_json::to_value(artifact).map_err(json_err)
             }
             "artifact/diff" => {
                 let id = required_str(params, "id")?;
@@ -621,6 +808,8 @@ impl ControlPlane {
             "policy/evaluate" => self.rpc_policy_evaluate(params),
             "capability/list" => self.rpc_capability_list(),
             "capability/invoke" => self.rpc_capability_invoke(params),
+            "capability/invokeBackground" => self.rpc_capability_invoke_background(params),
+            "capability/status" => self.rpc_capability_status(params),
             "capability/cancel" => self.rpc_capability_cancel(params),
             "capability/resume" => self.rpc_capability_resume(params),
             "provider/list" => self.rpc_provider_list(),
@@ -638,6 +827,7 @@ impl ControlPlane {
             "provider/translate" => self.rpc_provider_translate(params),
             "provider/execute" => self.rpc_provider_execute(params),
             "migration/discover" => self.rpc_migration_discover(params),
+            "migration/preflight" => self.rpc_migration_preflight(params),
             "migration/run" => self.rpc_migration_run(params),
             "migration/read" => self.rpc_migration_read(params),
             "migration/rollback" => self.rpc_migration_rollback(params),
@@ -824,7 +1014,8 @@ impl ControlPlane {
                 settings.cwd = Some(cwd);
             }
         }
-        self.executor_lock().configure_thread(&thread.id, &settings)?;
+        self.executor_lock()
+            .configure_thread(&thread.id, &settings)?;
         self.rpc_thread_read(&json!({"id": thread.id}))
     }
 
@@ -851,9 +1042,23 @@ impl ControlPlane {
     fn rpc_artifact_stage(&self, params: &Value) -> Result<Value, ProtocolError> {
         let id = required_str(params, "id")?;
         let text = required_str(params, "content")?;
+        // P03: an explicit `expectedCurrentRevision` (string, or null for a
+        // fresh artifact) binds staging to the base the client actually read;
+        // absent keeps the legacy unchecked behavior for old callers.
+        let expected_current = match params.get("expectedCurrentRevision") {
+            None => None,
+            Some(Value::Null) => Some(None),
+            Some(Value::String(revision)) => Some(Some(revision.as_str())),
+            Some(_) => {
+                return Err(ProtocolError::new(
+                    ErrorCategory::InvalidArgument,
+                    "expectedCurrentRevision must be a revision id or null",
+                ));
+            }
+        };
         let rev = self
             .store
-            .stage_artifact(id, text.as_bytes(), "user")
+            .stage_artifact_at_revision(id, text.as_bytes(), "user", expected_current)
             .map_err(|e| e.into_protocol())?;
         serde_json::to_value(rev).map_err(json_err)
     }
@@ -912,20 +1117,29 @@ impl ControlPlane {
         serde_json::to_value(job).map_err(json_err)
     }
 
+    /// Both replay methods are bounded even when called without paging options.
     fn rpc_event_replay(&self, params: &Value) -> Result<Value, ProtocolError> {
         let stream = required_str(params, "streamId")?;
-        let after = params.get("afterSeq").and_then(|v| v.as_u64()).unwrap_or(0);
-        let events = self
-            .store
-            .replay(stream, after)
-            .map_err(|e| e.into_protocol())?;
-        Ok(json!({"events": events}))
+        let number = |name: &str, default: u64| -> Result<u64, ProtocolError> {
+            match params.get(name) {
+                None => Ok(default),
+                Some(value) => value.as_u64().ok_or_else(|| ProtocolError::new(ErrorCategory::InvalidArgument, format!("{name} must be an unsigned integer"))),
+            }
+        };
+        let after = number("afterSeq", 0)?;
+        let limit = number("limit", 100)?.min(500) as usize;
+        let max_bytes = number("maxBytes", knorvia_store::DEFAULT_REPLAY_PAGE_BYTES as u64)?.min(knorvia_store::MAX_REPLAY_PAGE_BYTES as u64) as usize;
+        let upper = params.get("upperSeq").map(|_| number("upperSeq", 0)).transpose()?;
+        let cursor = match params.get("cursor") {
+            None => None,
+            Some(value) => Some(value.as_str().ok_or_else(|| ProtocolError::new(ErrorCategory::InvalidArgument, "cursor must be a string"))?),
+        };
+        let page = self.store.replay_page_snapshot(stream, after, limit, max_bytes, upper, cursor).map_err(|e| e.into_protocol())?;
+        serde_json::to_value(page).map_err(json_err)
     }
 
     fn rpc_activity(&self, params: &Value) -> Result<Value, ProtocolError> {
-        let stream = required_str(params, "streamId")?;
-        let events = self.store.activity(stream).map_err(|e| e.into_protocol())?;
-        Ok(json!({"events": events}))
+        self.rpc_event_replay(params)
     }
 
     fn rpc_capability_list(&self) -> Result<Value, ProtocolError> {
@@ -941,7 +1155,10 @@ impl ControlPlane {
             &mut dyn knorvia_packs::PackRunner,
         ) -> Result<knorvia_packs::PackOutcome, knorvia_packs::PackExecError>,
     ) -> Result<Value, ProtocolError> {
-        let mut runner = (self.pack_runner_factory)()?;
+        let mut runner = (self
+            .pack_runner_factory
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()))()?;
         let out = op(runner.as_mut()).map_err(pack_err)?;
         serde_json::to_value(out).map_err(json_err)
     }
@@ -950,25 +1167,144 @@ impl ControlPlane {
         let pack_id = required_str(params, "packId")?;
         let ws = required_str(params, "workspaceId")?;
         let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        self.with_pack_runner(|runner| {
-            knorvia_packs::invoke(&self.packs, &self.store, pack_id, ws, &input, runner)
-        })
+        let admitted = knorvia_packs::admit_invocation(&self.packs, &self.store, pack_id, ws, &input).map_err(pack_err)?;
+        let cancel = knorvia_packs::InvocationCancel::default();
+        let _live = self.register_pack(&admitted, cancel.clone())?;
+        let result = self.with_pack_runner(|runner| knorvia_packs::execute_admitted(&self.packs, &self.store, &admitted, runner, cancel));
+        if let Err(error) = &result {
+            let _ = self.store.finish_job(&admitted.job_id, "failed");
+            let _ = self.packs.fail(&admitted.invocation_id, &error.message);
+        }
+        result
+    }
+
+    /// A05: run a pack in the background. Admission (semantic validation,
+    /// invocation record, Job, durable link) happens synchronously so the
+    /// caller gets a stable invocation/job identity back immediately; the
+    /// render then proceeds on a worker thread, so the control read loop
+    /// keeps answering health/approval/cancel while a long pack runs.
+    ///
+    /// Validation failures are side-effect-free typed invalid-argument
+    /// errors: the generic idempotency layer clears the key so the SAME key
+    /// can legally retry. Failures after admission leave durable records and
+    /// a failed marker (never a silent key clear), attributable via
+    /// `capability/status` and resumable through `capability/resume`.
+    fn rpc_capability_invoke_background(&mut self, params: &Value) -> Result<Value, ProtocolError> {
+        let permit = self.pack_permit()?;
+        let pack_id = required_str(params, "packId")?;
+        let ws = required_str(params, "workspaceId")?;
+        let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
+        let admitted = knorvia_packs::admit_invocation(&self.packs, &self.store, pack_id, ws, &input).map_err(pack_err)?;
+        let cancel = knorvia_packs::InvocationCancel::default();
+        let live = self.register_pack(&admitted, cancel.clone())?;
+        let store = Arc::clone(&self.store);
+        let packs = Arc::clone(&self.packs);
+        let work = admitted.clone();
+        let factory = Arc::clone(&self.pack_runner_factory);
+        let spawned = std::thread::Builder::new().name(format!("pack-render-{}", admitted.invocation_id)).spawn(move || {
+            let _permit = permit;
+            let _live = live;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(), ProtocolError> {
+                let mut runner = (factory.lock().unwrap_or_else(|e| e.into_inner()))()?;
+                knorvia_packs::execute_admitted(&packs, &store, &work, runner.as_mut(), cancel).map_err(pack_err)?;
+                Ok(())
+            }));
+            let error = match result { Ok(Ok(())) => None, Ok(Err(error)) => Some(error.message), Err(_) => Some("pack execution panicked".into()) };
+            if let Some(error) = error {
+                let _ = store.finish_job(&work.job_id, "failed");
+                let _ = packs.fail(&work.invocation_id, &error);
+                let _ = store.append_event(&work.job_id, "pack.backgroundFailed", json!({"error":error}), None);
+            }
+        });
+        if let Err(error) = spawned {
+            let _ = self.store.finish_job(&admitted.job_id, "failed");
+            let _ = self.packs.fail(&admitted.invocation_id, &error.to_string());
+            return Err(ProtocolError::new(ErrorCategory::Internal, format!("pack thread could not start; invocation {} job {}: {error}", admitted.invocation_id, admitted.job_id)));
+        }
+        Ok(json!({"invocationId":admitted.invocation_id,"jobId":admitted.job_id,"packId":admitted.pack_id,"workspaceId":admitted.workspace_id,"status":"running"}))
+    }
+
+    /// A05: read the durable state of one invocation, including its job and
+    /// publish outcome. Accepted-but-unfinished work stays visible here
+    /// across restarts.
+    fn rpc_capability_status(&self, params: &Value) -> Result<Value, ProtocolError> {
+        let invocation_id = required_str(params, "invocationId")?;
+        let inv = self.packs.read_invocation(invocation_id).map_err(|e| {
+            ProtocolError::new(ErrorCategory::CapabilityUnavailable, e.to_string())
+        })?;
+        let job = inv
+            .job_id
+            .as_deref()
+            .and_then(|job_id| self.store.read_job(job_id).ok());
+        let live = self
+            .live_packs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .contains_key(invocation_id);
+        Ok(json!({
+            "invocationId": inv.id,
+            "packId": inv.pack_id,
+            "status": inv.status,
+            "jobId": inv.job_id,
+            "jobStatus": job.as_ref().map(|job| job.status.as_str()),
+            "artifactId": inv.output.as_ref().and_then(|o| o.get("artifactId").cloned()),
+            "checkpoint": inv.checkpoint,
+            "receipt": inv.receipt,
+            "live": live,
+        }))
     }
 
     fn rpc_capability_cancel(&self, params: &Value) -> Result<Value, ProtocolError> {
         let id = required_str(params, "invocationId")?;
         let job_id = params.get("jobId").and_then(|v| v.as_str());
+        if let Some(job_id) = job_id {
+            let invocation = self.packs.read_invocation(id).map_err(|e| pack_err(e.into()))?;
+            if invocation.job_id.as_deref() != Some(job_id) { return Err(ProtocolError::new(ErrorCategory::InvalidArgument, "job does not belong to this invocation")); }
+        }
+        // Reach the LIVE worker first (A05): the cancel handle kills the
+        // registered worker process tree; the durable cancel then records
+        // the same fact for the invocation and its job. A worker racing its
+        // own registration still sees the latched cancel at registration.
+        let mut reclaimed = None;
+        let live_handle = self
+            .live_packs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(id)
+            .map(|handle| LivePackHandle {
+                cancel: handle.cancel.clone(),
+                job_id: handle.job_id.clone(),
+                pack_id: handle.pack_id.clone(),
+                done: Arc::clone(&handle.done),
+            });
+        if let Some(handle) = live_handle {
+            handle.cancel.cancel();
+            // Bounded wait: the render thread observes the killed worker and
+            // finishes its cancelled-job bookkeeping. Answer honestly even
+            // if it needs longer; the latch cannot be un-fired.
+            reclaimed = Some(handle.wait_reclaimed(std::time::Duration::from_secs(2)) && handle.cancel.all_reclaimed());
+        }
         let inv = knorvia_packs::cancel(&self.packs, &self.store, id, job_id).map_err(pack_err)?;
-        serde_json::to_value(inv).map_err(json_err)
+        let mut value = serde_json::to_value(&inv).map_err(json_err)?;
+        if let Some(reclaimed) = reclaimed {
+            if let Some(object) = value.as_object_mut() {
+                object.insert("reclaimed".into(), json!(reclaimed));
+                object.insert("live".into(), json!(!reclaimed));
+            }
+        }
+        Ok(value)
     }
+
 
     fn rpc_capability_resume(&mut self, params: &Value) -> Result<Value, ProtocolError> {
         let id = required_str(params, "invocationId")?;
         let ws = required_str(params, "workspaceId")?;
         let input = params.get("input").cloned().unwrap_or_else(|| json!({}));
-        self.with_pack_runner(|runner| {
-            knorvia_packs::resume(&self.packs, &self.store, id, ws, &input, runner)
-        })
+        let inv = self.packs.read_invocation(id).map_err(|e| pack_err(e.into()))?;
+        let admitted = knorvia_packs::AdmittedInvocation { invocation_id:id.into(), job_id:inv.job_id.clone().ok_or_else(|| ProtocolError::new(ErrorCategory::PreconditionFailed,"invocation has no job to resume"))?, pack_id:inv.pack_id, workspace_id:ws.into() };
+        let cancel = knorvia_packs::InvocationCancel::default();
+        let _live = self.register_pack(&admitted, cancel.clone())?;
+        self.with_pack_runner(|runner| knorvia_packs::resume_with_cancel(&self.packs, &self.store, id, ws, &input, runner, cancel))
     }
 
     fn rpc_provider_execute(&self, params: &Value) -> Result<Value, ProtocolError> {
@@ -997,15 +1333,46 @@ impl ControlPlane {
             .filter(|s| !s.trim().is_empty());
         let cfg = knorvia_provider_gateway::ExecuteConfig { base_url, api_key };
         let result = knorvia_provider_gateway::execute(&tx, &cfg).map_err(|e| {
-            let category = match &e {
-                knorvia_provider_gateway::ExecuteError::MissingKey => ErrorCategory::ProviderAuth,
-                knorvia_provider_gateway::ExecuteError::MissingBaseUrl => {
-                    ErrorCategory::CapabilityUnavailable
+            // Same classification contract the Kernel bridge path applies:
+            // transport failures classify (timeout vs connection) instead of
+            // collapsing into a generic Transient catch-all.
+            match &e {
+                knorvia_provider_gateway::ExecuteError::MissingKey => {
+                    ProtocolError::new(ErrorCategory::ProviderAuth, e.to_string())
                 }
-                _ => ErrorCategory::Transient,
-            };
-            ProtocolError::new(category, e.to_string())
+                knorvia_provider_gateway::ExecuteError::MissingBaseUrl => {
+                    ProtocolError::new(ErrorCategory::CapabilityUnavailable, e.to_string())
+                }
+                knorvia_provider_gateway::ExecuteError::Protocol(_) => {
+                    ProtocolError::new(ErrorCategory::Transient, e.to_string())
+                }
+                knorvia_provider_gateway::ExecuteError::Transport(_) => {
+                    let failure = knorvia_provider_gateway::classify_transport(&e.to_string());
+                    typed_provider_error(
+                        failure.category,
+                        &failure.message,
+                        failure.retryable,
+                        failure.retry_after_secs,
+                    )
+                }
+            }
         })?;
+        // A classified provider failure (HTTP >= 400, in-band stream error,
+        // or truncated stream) is a typed RPC failure, not an Ok payload —
+        // clients branch on category / retryable / retryAfter.
+        if let Some(message) = result.error.clone() {
+            let category = result
+                .error_category
+                .as_deref()
+                .and_then(category_from_name)
+                .unwrap_or(ErrorCategory::Transient);
+            return Err(typed_provider_error(
+                category,
+                &message,
+                result.retryable.unwrap_or(false),
+                result.retry_after,
+            ));
+        }
         serde_json::to_value(result).map_err(json_err)
     }
 
@@ -1023,6 +1390,15 @@ impl ControlPlane {
         Ok(json!({
             "paths": found.iter().map(|p| p.to_string_lossy().to_string()).collect::<Vec<_>>()
         }))
+    }
+
+    fn rpc_migration_preflight(&self, params: &Value) -> Result<Value, ProtocolError> {
+        let source = required_str(params, "source")?;
+        let pre = self
+            .migrator()?
+            .preflight(Path::new(source))
+            .map_err(|e| ProtocolError::new(ErrorCategory::InvalidArgument, e.to_string()))?;
+        serde_json::to_value(pre).map_err(json_err)
     }
 
     fn rpc_migration_run(&self, params: &Value) -> Result<Value, ProtocolError> {
@@ -1043,13 +1419,22 @@ impl ControlPlane {
         serde_json::to_value(run).map_err(json_err)
     }
 
-    fn rpc_migration_rollback(&self, params: &Value) -> Result<Value, ProtocolError> {
+    fn rpc_migration_rollback(&mut self, params: &Value) -> Result<Value, ProtocolError> {
         let id = required_str(params, "id")?;
-        let run = self
-            .migrator()?
-            .rollback(id)
-            .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))?;
-        serde_json::to_value(run).map_err(json_err)
+        // A19 quiescence gate: a rollback swaps the live `state/` directory,
+        // so it must not race a running Turn, a Goal runner between rounds,
+        // a claimed automation, or a live dispatch path. Admission freezes
+        // first; a refusal restores the previous admission state.
+        self.prepare_state_transition("migration rollback")?;
+        let outcome = self.migrator().and_then(|migrator| {
+            migrator
+                .rollback(id)
+                .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))
+        });
+        // Success and every preflight/copy/verification failure release the
+        // pause. A refused rollback must never wedge the daemon.
+        self.cancel_restart()?;
+        serde_json::to_value(outcome?).map_err(json_err)
     }
 
     fn rpc_provider_list(&self) -> Result<Value, ProtocolError> {
@@ -1063,7 +1448,12 @@ impl ControlPlane {
         let kind = ProviderKind::parse(required_str(params, "kind")?)
             .map_err(|e| ProtocolError::new(ErrorCategory::InvalidArgument, e))?;
         let model = required_str(params, "model")?;
-        let capabilities = knorvia_provider_gateway::negotiate(kind, model);
+        let execution_path = params.get("executionPath").and_then(Value::as_str).unwrap_or("direct");
+        let capabilities = match execution_path {
+            "direct" => knorvia_provider_gateway::negotiate(kind, model),
+            "responsesBridge" => knorvia_provider_gateway::negotiate_bridge(kind, model),
+            _ => return Err(ProtocolError::new(ErrorCategory::InvalidArgument, "unknown executionPath")),
+        };
         knorvia_provider_gateway::require_not_silent(
             &capabilities,
             knorvia_provider_gateway::TRACKED_CAPABILITIES,
@@ -1133,7 +1523,47 @@ fn json_err(e: serde_json::Error) -> ProtocolError {
 }
 
 fn pack_err(e: PackExecError) -> ProtocolError {
-    ProtocolError::new(ErrorCategory::CapabilityUnavailable, e.to_string())
+    ProtocolError::new(
+        ErrorCategory::CapabilityUnavailable,
+        knorvia_protocol::sanitize_diagnostic(&e.to_string()),
+    )
+}
+
+/// Build a provider-failure error carrying the full classification contract
+/// (category, retryability, normalized Retry-After seconds) so workbench
+/// clients can branch without parsing message text.
+fn typed_provider_error(
+    category: ErrorCategory,
+    message: &str,
+    retryable: bool,
+    retry_after_secs: Option<u64>,
+) -> ProtocolError {
+    let mut error = ProtocolError::new(category, message);
+    error.retryable = retryable;
+    error.retry_after = retry_after_secs;
+    error
+}
+
+/// Inverse of the gateway's category wire name (`PROVIDER_RATE_LIMIT`).
+fn category_from_name(name: &str) -> Option<ErrorCategory> {
+    serde_json::from_value(json!(name)).ok()
+}
+
+/// Hash a keyed request's identity: method + params with the idempotency key
+/// itself removed. Stored alongside the key so recycling a key for a
+/// different payload is detectable (typed conflict, never a foreign replay).
+/// `serde_json` maps serialize with sorted keys, so the rendering is stable
+/// for equal params regardless of client field order.
+fn idempotency_fingerprint(method: &str, params: &Value) -> String {
+    let mut canonical = params.clone();
+    if let Some(obj) = canonical.as_object_mut() {
+        obj.remove("idempotencyKey");
+    }
+    let mut h = Sha256::new();
+    h.update(method.as_bytes());
+    h.update([0]);
+    h.update(canonical.to_string().as_bytes());
+    hex::encode(h.finalize())
 }
 
 pub fn action_digest(action: &str, input: &str) -> String {
@@ -1180,6 +1610,10 @@ where
                 ));
             }
         };
+        let pack_output = Arc::clone(&output);
+        if plane.defer_pack_request(&plane.handshake, &body, Arc::new(move |response| {
+            if let Ok(mut out) = pack_output.lock() { let _ = write_frame(&mut *out, &response); }
+        }))? { continue; }
         if let Some(resp) = plane.handle_json(&body)? {
             let mut out = output
                 .lock()
@@ -1188,6 +1622,7 @@ where
                 .map_err(|e| ProtocolError::new(ErrorCategory::Internal, e.to_string()))?;
         }
     }
+    plane.wait_pack_replies();
     Ok(())
 }
 
@@ -1195,6 +1630,112 @@ where
 mod tests {
     use super::*;
     use knorvia_platform_paths::layout;
+    fn mk_a08(id: &str, method: &str, params: Value) -> String {
+        json!({"jsonrpc":"2.0","id": id, "method": method, "params": params}).to_string()
+    }
+
+    fn parse_a08(s: String) -> Value {
+        serde_json::from_str(&s).unwrap()
+    }
+
+    #[test]
+    fn event_replay_and_activity_page_through_frozen_snapshots() {
+        let mut p = plane();
+        let init = json!({
+            "jsonrpc": "2.0",
+            "id": "init",
+            "method": "initialize",
+            "params": {
+                "protocol": {"major": 1, "minor": 0},
+                "client": {"name": "knorvia_test", "version": "0.0.1", "platform": "windows"},
+                "capabilities": ["thread", "artifact", "job", "approval", "reconnect"]
+            }
+        });
+        p.handle_json(&init.to_string()).unwrap().unwrap();
+        p.handle_json(
+            &json!({"jsonrpc":"2.0","method":"initialized"}).to_string(),
+        )
+        .unwrap();
+        let ws = parse_a08(
+            p.handle_json(&mk_a08("ws", "workspace/create", json!({"title": "replay"})))
+                .unwrap()
+                .unwrap(),
+        )["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let thread = parse_a08(
+            p.handle_json(&mk_a08(
+                "th",
+                "thread/start",
+                json!({"workspaceId": ws, "title": "replay"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        )["result"]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        for i in 0..120 {
+            p.store
+                .append_event(
+                    &thread,
+                    "test.appended",
+                    json!({"i": i, "filler": "y".repeat(3_000)}),
+                    None,
+                )
+                .unwrap();
+        }
+
+        // Protocol-level fixture, not evidence of production UI consumption.
+        let mut cursor = 0u64;
+        let mut seen = 0usize;
+        let mut final_upper = 0u64;
+        for _round in 0..100 {
+            let result = parse_a08(
+                p.handle_json(&mk_a08(
+                    "page",
+                    "activity/list",
+                    json!({
+                        "streamId": thread,
+                        "afterSeq": cursor,
+                        "limit": 25,
+                        "maxBytes": 262_144,
+                    }),
+                ))
+                .unwrap()
+                .unwrap(),
+            )["result"]
+                .clone();
+            let events = result["events"].as_array().unwrap();
+            assert!(events.len() <= 25);
+            seen += events.len();
+            cursor = result["nextSeq"].as_u64().unwrap();
+            final_upper = result["upperSeq"].as_u64().unwrap();
+            if !result["hasMore"].as_bool().unwrap() {
+                break;
+            }
+        }
+        assert_eq!(cursor, final_upper);
+
+        // Legacy small-result fields remain; large omitted-limit calls paginate.
+        let full = parse_a08(
+            p.handle_json(&mk_a08(
+                "full",
+                "event/replay",
+                json!({"streamId": thread}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        let total = full["result"]["events"].as_array().unwrap().len();
+        assert_eq!(total, 100, "omitted limit still has a bounded default");
+        assert_eq!(full["result"]["hasMore"], true);
+        assert_eq!(seen, p.store.replay(&thread, 0).unwrap().len());
+    }
+
+    fn mk_a08_unused() {}
+
     use knorvia_protocol::{encode_frame, read_frame};
     use std::io::Cursor;
     use std::sync::Mutex;
@@ -1203,7 +1744,7 @@ mod tests {
     static PROVIDER_ENV_LOCK: Mutex<()> = Mutex::new(());
 
     pub(super) fn plane() -> ControlPlane {
-        plane_with_runner_factory(Box::new(|| {
+        plane_with_runner_factory(Arc::new(Mutex::new(Box::new(|| {
             // Tests render in-process (deterministic, no worker binary
             // dependency). The worker path is covered by packs::tests::worker_rpc.
             // Both env-aware choices are unit variants, so the runner is
@@ -1217,7 +1758,7 @@ mod tests {
             Ok(Box::new(knorvia_packs::InProcessRunner::<'static>::new(
                 choice,
             )))
-        }))
+        }))))
     }
 
     fn plane_with_runner_factory(factory: PackRunnerFactory) -> ControlPlane {
@@ -1838,6 +2379,73 @@ mod tests {
     }
 
     #[test]
+    fn migration_preflight_rpc_inventories_blocked_and_unknown_categories() {
+        let mut p = plane();
+        init(&mut p);
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let src = std::env::temp_dir().join(format!("knorvia-preflight-{stamp}"));
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(
+            src.join("legacy.json"),
+            serde_json::json!({
+                "sessions": [{"id": "s1", "title": "S"}],
+                "memory": [{"content": "likes tea"}],
+                "automations": [{"id": "a1"}],
+                "whatsit": [{"x": 1}, {"x": 2}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mk = |id: &str, method: &str, params: Value| {
+            json!({"jsonrpc":"2.0","id": id, "method": method, "params": params}).to_string()
+        };
+        let parse = |s: String| -> Value { serde_json::from_str(&s).unwrap() };
+        let pre = parse(
+            p.handle_json(&mk(
+                "mp",
+                "migration/preflight",
+                json!({"source": src.to_string_lossy()}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(pre.get("error").is_none(), "{pre}");
+        let inventory = pre["result"]["inventory"].as_array().unwrap();
+        let entry = |name: &str| {
+            inventory
+                .iter()
+                .find(|e| e["category"] == json!(name))
+                .cloned()
+                .unwrap_or_else(|| panic!("missing {name}: {inventory:?}"))
+        };
+        assert_eq!(entry("sessions")["mapping"], json!("imported"));
+        assert_eq!(entry("memory")["mapping"], json!("imported"));
+        assert_eq!(entry("automations")["mapping"], json!("blocked"));
+        assert_eq!(entry("whatsit")["mapping"], json!("unknown"));
+        assert_eq!(entry("whatsit")["count"], json!(2));
+        let run = parse(
+            p.handle_json(&mk(
+                "mrp",
+                "migration/run",
+                json!({"source": src.to_string_lossy()}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(
+            run["result"]["phase"],
+            json!("verified"),
+            "blocked run stays verified"
+        );
+        assert!(!run["result"]["blocked"].as_array().unwrap().is_empty());
+        let _ = std::fs::remove_dir_all(src);
+        let _ = std::fs::remove_dir_all(&p.store.paths().home);
+    }
+
+    #[test]
     fn unknown_major_is_typed_error() {
         let mut p = plane();
         let req = json!({
@@ -1853,8 +2461,8 @@ mod tests {
     /// Scripted executor: read-only outcomes from a stack; write turns emit
     /// one scripted approval bridge and, after the decision, finalize the
     /// product turn as completed (emulating the kernel runner contract).
-    struct Scripted {
-        outcomes: Vec<Result<TurnOutcome, ProtocolError>>,
+    pub(super) struct Scripted {
+        pub(super) outcomes: Vec<Result<TurnOutcome, ProtocolError>>,
     }
 
     impl TurnExecutor for Scripted {
@@ -2124,6 +2732,184 @@ mod tests {
             }
         });
         (format!("http://127.0.0.1:{port}/v1"), handle)
+    }
+
+    #[test]
+    fn provider_execute_surfaces_typed_provider_failures() {
+        use std::io::{Read as _, Write as _};
+        let _lock = PROVIDER_ENV_LOCK.lock().unwrap();
+        // Local HTTP fixture: HTTP 429 with a `Retry-After` seconds header
+        // and a JSON error body. The RPC must surface category,
+        // retryability and the normalized retry seconds — never the raw body.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut head = Vec::new();
+            let mut byte = [0u8; 1];
+            while !head.ends_with(b"\r\n\r\n") {
+                if stream.read(&mut byte).unwrap_or(0) == 0 {
+                    return;
+                }
+                head.push(byte[0]);
+            }
+            let head_str = String::from_utf8_lossy(&head).to_string();
+            let mut length = 0usize;
+            for line in head_str.lines() {
+                let lower = line.to_ascii_lowercase();
+                if let Some(rest) = lower.strip_prefix("content-length:") {
+                    length = rest.trim().parse().unwrap_or(0);
+                }
+            }
+            if length > 0 {
+                let mut buf = vec![0u8; length];
+                let _ = stream.read_exact(&mut buf);
+            }
+            let body = r#"{"error":{"message":"slow down and retry"}}"#;
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\nContent-Type: application/json\r\nRetry-After: 21\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+        let guard = ProviderEnvGuard::set(&[
+            ("KNORVIA_PROVIDER_MODEL", "llama-3"),
+            (
+                "KNORVIA_PROVIDER_BASE_URL",
+                Box::leak(format!("http://127.0.0.1:{port}/v1").into_boxed_str()),
+            ),
+            ("KNORVIA_PROVIDER_API_KEY", "lk-test"),
+        ]);
+        let mut p = plane();
+        init(&mut p);
+        let req = json!({
+            "model": "llama-3",
+            "messages": [{"role": "user", "text": "hi"}],
+            "stream": false,
+            "maxTokens": 64
+        });
+        let resp: Value = serde_json::from_str(
+            &p.handle_json(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "pe1",
+                    "method": "provider/execute",
+                    "params": {"kind": "openai_compatible", "request": req}
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .unwrap(),
+        )
+        .unwrap();
+        let error = &resp["error"];
+        assert_eq!(error["data"]["category"], "PROVIDER_RATE_LIMIT", "{resp}");
+        assert_eq!(error["data"]["retryable"], true);
+        assert_eq!(error["data"]["retryAfter"], 21);
+        assert_eq!(error["message"], "slow down and retry");
+        drop(guard);
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&p.store.paths().home);
+    }
+
+    #[test]
+    fn idempotency_key_recycled_for_a_different_request_is_a_typed_conflict() {
+        let mut p = plane();
+        init(&mut p);
+        let mk = |id: &str, params: Value| {
+            json!({"jsonrpc":"2.0","id": id, "method": "workspace/create", "params": params})
+                .to_string()
+        };
+        let parse = |s: String| -> Value { serde_json::from_str(&s).unwrap() };
+        let first = parse(
+            p.handle_json(&mk(
+                "w1",
+                json!({"title": "One", "idempotencyKey": "recycled-1"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert!(first.get("error").is_none(), "{first}");
+        let ws_a = first["result"]["id"].as_str().unwrap().to_string();
+
+        // Genuine replay: same key, same payload -> the cached result.
+        let replay = parse(
+            p.handle_json(&mk(
+                "w2",
+                json!({"title": "One", "idempotencyKey": "recycled-1"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(
+            replay["result"]["id"],
+            json!(ws_a),
+            "no duplicate workspace"
+        );
+
+        // Recycled key, different payload -> typed conflict, no execution.
+        let conflict = parse(
+            p.handle_json(&mk(
+                "w3",
+                json!({"title": "A different workspace", "idempotencyKey": "recycled-1"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(
+            conflict["error"]["data"]["category"],
+            json!("CONFLICT"),
+            "{conflict}"
+        );
+        let count = parse(
+            p.handle_json(
+                &json!({"jsonrpc":"2.0","id":"w4","method":"workspace/list"}).to_string(),
+            )
+            .unwrap()
+            .unwrap(),
+        );
+        let names: Vec<&str> = count["result"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|w| w["title"].as_str())
+            .collect();
+        assert!(
+            !names.contains(&"A different workspace"),
+            "conflicting replay must not execute: {names:?}"
+        );
+        let _ = std::fs::remove_dir_all(&p.store.paths().home);
+    }
+
+    #[test]
+    fn failed_idempotent_error_is_sanitized_before_rpc_and_persistence() {
+        let mut p = plane();
+        init(&mut p);
+        let response = p
+            .handle_json(
+                &json!({
+                    "jsonrpc": "2.0",
+                    "id": "a15",
+                    "method": "workspace/read",
+                    "params": {"id": "sk-secret", "idempotencyKey": "a15-failed"}
+                })
+                .to_string(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(!response.contains("sk-secret"), "RPC leaked: {response}");
+        assert!(response.contains("[redacted]"), "{response}");
+
+        let records = p.store.paths().state.join("idempotency/records");
+        let persisted = std::fs::read_dir(records)
+            .unwrap()
+            .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!persisted.contains("sk-secret"), "disk leaked: {persisted}");
+        assert!(persisted.contains("[redacted]"), "{persisted}");
+        let _ = std::fs::remove_dir_all(&p.store.paths().home);
     }
 
     /// Scripted mock provider: each POST consumes the next queued SSE body.
@@ -2621,5 +3407,287 @@ mod tests {
             Some(explicit.to_string_lossy().as_ref())
         );
         let _ = std::fs::remove_dir_all(&p.store.paths().home);
+    }
+
+    /// P03 harness: a control plane over a known home so the test can reopen
+    /// a second plane on the same durable state (daemon-restart semantics).
+    fn reopenable_plane(prefix: &str) -> (ControlPlane, std::path::PathBuf) {
+        let base = std::env::temp_dir().join(format!(
+            "{prefix}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        let factory: PackRunnerFactory = Arc::new(Mutex::new(Box::new(|| {
+            let choice = if knorvia_packs::gateway::GatewayModel::from_env().is_some() {
+                knorvia_packs::ModelChoice::GatewayFromEnv
+            } else {
+                knorvia_packs::ModelChoice::None
+            };
+            Ok(Box::new(knorvia_packs::InProcessRunner::<'static>::new(
+                choice,
+            )))
+        })));
+        let executor = KernelTurnExecutor::new(layout(base.clone()));
+        let plane =
+            ControlPlane::open_full(layout(base.clone()), Box::new(executor), factory).unwrap();
+        (plane, base)
+    }
+
+    #[test]
+    fn artifact_bound_commit_replays_idempotently_and_rejects_stale_revision_after_restart() {
+        let mk = |id: &str, method: &str, params: Value| {
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
+        };
+        let parse = |raw: String| -> Value { serde_json::from_str(&raw).unwrap() };
+        let (mut p, home) = reopenable_plane("knorvia-artxn-replay");
+        let init = |p: &mut ControlPlane| {
+            let req = json!({
+                "jsonrpc": "2.0",
+                "id": "init",
+                "method": "initialize",
+                "params": {
+                    "protocol": {"major": 1, "minor": 0},
+                    "client": {"name": "knorvia_test", "version": "0.0.1", "platform": "windows"},
+                    "capabilities": ["thread", "artifact"]
+                }
+            });
+            let resp: Value =
+                serde_json::from_str(&p.handle_json(&req.to_string()).unwrap().unwrap()).unwrap();
+            assert!(resp.get("error").is_none(), "{resp}");
+            p.handle_json(&json!({"jsonrpc":"2.0","method":"initialized"}).to_string())
+                .unwrap();
+        };
+        init(&mut p);
+
+        let ws = parse(
+            p.handle_json(&mk("w", "workspace/create", json!({"title": "txn"})))
+                .unwrap()
+                .unwrap(),
+        );
+        let ws_id = ws["result"]["id"].as_str().unwrap().to_string();
+        let art = parse(
+            p.handle_json(&mk(
+                "a",
+                "artifact/create",
+                json!({"workspaceId": ws_id, "title": "brief.md", "type": "text/markdown"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        let art_id = art["result"]["id"].as_str().unwrap().to_string();
+
+        // Stage bound to the fresh base and commit bound to the staged
+        // revision. Keys stay fixed so a transport retry replays, not repeats.
+        let staged = parse(
+            p.handle_json(&mk(
+                "s1",
+                "artifact/stage",
+                json!({
+                    "id": art_id,
+                    "content": "# v1",
+                    "expectedCurrentRevision": null,
+                    "idempotencyKey": "stage-key-1"
+                }),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        let staged_id = staged["result"]["id"].as_str().unwrap().to_string();
+        let committed = parse(
+            p.handle_json(&mk(
+                "c1",
+                "artifact/commit",
+                json!({"id": art_id, "stagedRevisionId": staged_id, "idempotencyKey": "commit-key-1"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(committed["result"]["lifecycle"], "published");
+        assert_eq!(
+            committed["result"]["currentRevision"].as_str(),
+            Some(staged_id.as_str())
+        );
+
+        // Response-lost retry with the same key replays the recorded outcome.
+        let replay = parse(
+            p.handle_json(&mk(
+                "c2",
+                "artifact/commit",
+                json!({"id": art_id, "stagedRevisionId": staged_id, "idempotencyKey": "commit-key-1"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        assert_eq!(replay["result"], committed["result"]);
+
+        // Daemon restart over the same home: the stale staged revision is a
+        // typed conflict, the fresh base stages and commits cleanly.
+        let mut restarted = {
+            let factory: PackRunnerFactory = Arc::new(Mutex::new(Box::new(|| {
+                let choice = if knorvia_packs::gateway::GatewayModel::from_env().is_some() {
+                    knorvia_packs::ModelChoice::GatewayFromEnv
+                } else {
+                    knorvia_packs::ModelChoice::None
+                };
+                Ok(Box::new(knorvia_packs::InProcessRunner::<'static>::new(
+                    choice,
+                )))
+            })));
+            let executor = KernelTurnExecutor::new(layout(home.clone()));
+            ControlPlane::open_full(layout(home.clone()), Box::new(executor), factory).unwrap()
+        };
+        init(&mut restarted);
+        let stale = restarted
+            .handle_json(&mk(
+                "c3",
+                "artifact/commit",
+                json!({"id": art_id, "stagedRevisionId": "rev_does_not_exist"}),
+            ))
+            .unwrap()
+            .unwrap();
+        assert!(stale.contains("error"), "{stale}");
+        assert!(
+            stale.contains("CONFLICT") || stale.contains("conflict"),
+            "{stale}"
+        );
+
+        let v2 = parse(
+            restarted
+                .handle_json(&mk(
+                    "s2",
+                    "artifact/stage",
+                    json!({
+                        "id": art_id,
+                        "content": "# v2",
+                        "expectedCurrentRevision": staged_id,
+                        "idempotencyKey": "stage-key-2"
+                    }),
+                ))
+                .unwrap()
+                .unwrap(),
+        );
+        let v2_id = v2["result"]["id"].as_str().unwrap().to_string();
+        let committed2 = parse(
+            restarted
+                .handle_json(&mk(
+                    "c4",
+                    "artifact/commit",
+                    json!({"id": art_id, "stagedRevisionId": v2_id, "idempotencyKey": "commit-key-2"}),
+                ))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(
+            committed2["result"]["currentRevision"].as_str(),
+            Some(v2_id.as_str())
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn artifact_catalog_rpc_paginates_globally_and_reports_skipped_metadata() {
+        let mk = |id: &str, method: &str, params: Value| {
+            json!({"jsonrpc": "2.0", "id": id, "method": method, "params": params}).to_string()
+        };
+        let parse = |raw: String| -> Value { serde_json::from_str(&raw).unwrap() };
+        let mut p = plane();
+        init(&mut p);
+        // 3 workspaces x 40 artifacts: the first screen is one RPC, not one
+        // per workspace.
+        let mut ws_ids = Vec::new();
+        for w in 0..3 {
+            let ws = parse(
+                p.handle_json(&mk(
+                    "w",
+                    "workspace/create",
+                    json!({"title": format!("ws-{w}")}),
+                ))
+                .unwrap()
+                .unwrap(),
+            );
+            ws_ids.push(ws["result"]["id"].as_str().unwrap().to_string());
+        }
+        for w in &ws_ids {
+            for i in 0..40 {
+                p.handle_json(&mk(
+                    "a",
+                    "artifact/create",
+                    json!({
+                        "workspaceId": w,
+                        "title": format!("out {i:03}"),
+                        "type": "text/markdown"
+                    }),
+                ))
+                .unwrap()
+                .unwrap();
+            }
+        }
+        let page1 = parse(
+            p.handle_json(&mk("c1", "artifact/catalog", json!({"limit": 50})))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(page1["result"]["artifacts"].as_array().unwrap().len(), 50);
+        assert_eq!(page1["result"]["totalMatching"], 120);
+        assert_eq!(page1["result"]["skippedUnreadable"], 0);
+        let cursor = page1["result"]["nextCursor"].as_str().unwrap().to_string();
+
+        let mut seen: Vec<String> = page1["result"]["artifacts"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|a| a["id"].as_str().unwrap().to_string())
+            .collect();
+        let page2 = parse(
+            p.handle_json(&mk(
+                "c2",
+                "artifact/catalog",
+                json!({"limit": 50, "cursor": cursor}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        for artifact in page2["result"]["artifacts"].as_array().unwrap() {
+            let id = artifact["id"].as_str().unwrap().to_string();
+            assert!(!seen.contains(&id), "cursor page repeated {id}");
+            seen.push(id);
+        }
+        assert_eq!(seen.len(), 100);
+
+        // Server-side filter narrows the same catalog.
+        let filtered = parse(
+            p.handle_json(&mk(
+                "c3",
+                "artifact/catalog",
+                json!({"limit": 500, "workspaceId": ws_ids[0], "query": "out 00"}),
+            ))
+            .unwrap()
+            .unwrap(),
+        );
+        let filtered_rows = filtered["result"]["artifacts"].as_array().unwrap();
+        assert_eq!(
+            filtered["result"]["totalMatching"], 10,
+            "out 000..009 match"
+        );
+        assert!(
+            filtered_rows
+                .iter()
+                .all(|a| a["workspaceId"] == ws_ids[0].as_str())
+        );
+
+        // Corrupt metadata is skipped and counted, not fatal.
+        let bad_dir = p.store.paths().state.join("product/artifacts");
+        std::fs::write(bad_dir.join("broken.json"), "{oops").unwrap();
+        let resilient = parse(
+            p.handle_json(&mk("c4", "artifact/catalog", json!({"limit": 500})))
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(resilient["result"]["totalMatching"], 120);
+        assert_eq!(resilient["result"]["skippedUnreadable"], 1);
     }
 }

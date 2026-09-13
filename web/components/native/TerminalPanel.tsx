@@ -2,6 +2,7 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { Accessibility, Copy, Eraser, Plus, RefreshCw, Square, TerminalSquare, Trash2 } from 'lucide-react';
+import { TerminalLogTools } from './TerminalLogTools';
 import type { ITheme, Terminal } from '@xterm/xterm';
 import type { TerminalRead, TerminalSession } from '@/lib/native-terminal';
 import { useWorkbench } from './NativeWorkbenchProvider';
@@ -37,6 +38,8 @@ export function TerminalPanel({ threadId, sessionId, restore = false, active, on
   const [attempt, setAttempt] = useState(0);
   const [trimmed, setTrimmed] = useState(false);
   const [screenReader, setScreenReader] = useState(false);
+  // B13: buffer resets (clear, server truncation, reconnect) invalidate search matches.
+  const [searchReset, setSearchReset] = useState(0);
   useEffect(() => { if (terminal.current) terminal.current.options.screenReaderMode = screenReader; }, [screenReader, session?.sessionId]);
   useEffect(() => { activeRef.current = active; if (active) { const timer = requestAnimationFrame(() => terminal.current?.focus()); return () => cancelAnimationFrame(timer); } }, [active]);
   useEffect(() => {
@@ -115,7 +118,7 @@ export function TerminalPanel({ threadId, sessionId, restore = false, active, on
         try {
           const value = await request<TerminalRead>('terminal/read', { ...scope, cursor });
           if (disposed || fault || !term) return;
-          if (value.truncated) { term.reset(); setTrimmed(true); }
+          if (value.truncated) { term.reset(); setTrimmed(true); setSearchReset(value => value + 1); }
           if (value.data) await new Promise<void>(resolve => term!.write(value.data, resolve));
           if (disposed || fault) return;
           cursor = value.cursor;
@@ -140,7 +143,8 @@ export function TerminalPanel({ threadId, sessionId, restore = false, active, on
     <header className="nw-terminal-toolbar"><TerminalSquare size={15} /><span title={session?.cwd}>{session?.shell ?? t('终端', 'Terminal')}<small>{session?.cwd ?? t('正在连接…', 'Connecting…')}</small></span>
       <button className="nw-icon" onClick={() => setScreenReader(value => !value)} aria-pressed={screenReader} title={t('屏幕阅读支持', 'Screen reader support')} aria-label={t('屏幕阅读支持', 'Screen reader support')}><Accessibility size={14} /></button>
       <button className="nw-icon" onClick={() => { const value = terminal.current?.getSelection(); if (value) void navigator.clipboard.writeText(value).catch(() => {}); }} title={t('复制选中内容', 'Copy selection')} aria-label={t('复制选中内容', 'Copy selection')}><Copy size={14} /></button>
-      <button className="nw-icon" onClick={() => terminal.current?.clear()} title={t('清屏', 'Clear screen')} aria-label={t('清屏', 'Clear screen')}><Eraser size={14} /></button>
+      <TerminalLogTools getTerminal={() => terminal.current} sessionId={sessionId} truncated={trimmed} resetSignal={searchReset} />
+      <button className="nw-icon" onClick={() => { terminal.current?.clear(); setSearchReset(value => value + 1); }} title={t('清屏', 'Clear screen')} aria-label={t('清屏', 'Clear screen')}><Eraser size={14} /></button>
       <button className="nw-icon" disabled={failure || session?.status !== 'running'} onClick={() => { input.current('\x03'); terminal.current?.focus(); }} title={t('中断命令 · Ctrl+C', 'Interrupt command · Ctrl+C')} aria-label={t('中断命令', 'Interrupt command')}><Square size={12} /></button>
       <button className="nw-icon" onClick={onNew} title={t('新终端', 'New terminal')} aria-label={t('新终端', 'New terminal')}><Plus size={15} /></button>
       <button className="nw-icon" onClick={onClose} title={t('结束并关闭终端', 'End and close terminal')} aria-label={t('结束并关闭终端', 'End and close terminal')}><Trash2 size={14} /></button>

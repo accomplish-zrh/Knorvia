@@ -1,0 +1,14 @@
+/* Per-turn usage ledger (B-owned, B04). */
+.ht-ledger-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 9px; margin-bottom: 9px; }
+.ht-ledger-table td, .ht-ledger-table th { padding: 6px 9px; }
+.ht-ledger-task { color: var(--nw-green); text-decoration: none; }
+.ht-ledger-task:hover { text-decoration: underline; }
+.ht-ledger-badge { display: inline-flex; align-items: center; padding: 2px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--nw-line); }
+.ht-ledger-badge.is-known { color: #157347; border-color: #15734740; background: #15734712; }
+.ht-ledger-badge.is-zero { color: #157347; border-color: #15734740; background: #15734712; }
+.ht-ledger-badge.is-partial { color: #b45309; border-color: #b4530940; background: #b4530912; }
+.ht-ledger-badge.is-unknown { color: #6b7280; border-color: #6b728040; background: #6b728012; }
+.ht-ledger-paging { display: flex; align-items: center; gap: 12px; justify-content: flex-end; margin-top: 9px; font-size: 12px; }
+/* Custom date range inputs (B04). */
+.nw-usage-custom-range { display: flex; align-items: center; gap: 7px; font-size: 12px; }
+.nw-usage-custom-range input { border: 1px solid var(--nw-line); border-radius: 8px; padding: 3px 7px; color: inherit; }

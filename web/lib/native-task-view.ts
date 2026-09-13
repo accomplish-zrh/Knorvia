@@ -1,7 +1,7 @@
 import { panelKey, previewUrl, type PanelState, type PanelTab, type PanelTarget } from './native-panel';
 
 export type ReadingPosition = { top: number; anchor?: string; offset?: number; bottom: boolean };
-export type TaskViewMemory = { panel: { open: boolean; content: PanelState }; contextFiles: string[]; reading?: ReadingPosition };
+export type TaskViewMemory = { panel: { open: boolean; content: PanelState }; contextFiles: string[]; canvasContext?: string; reading?: ReadingPosition };
 export const emptyTaskView = (): TaskViewMemory => ({ panel: { open: false, content: { tabs: [], active: null } }, contextFiles: [] });
 const prefix = 'knorvia-task-view-v1:';
 const text = (value: unknown, max = 4096): value is string => typeof value === 'string' && value.length <= max && !value.includes('\0');
@@ -20,6 +20,7 @@ export function parseTaskView(raw: string): TaskViewMemory {
       if (!rawTarget) continue;
       let target: PanelTarget | undefined;
       if (rawTarget.kind === 'files') target = { kind: 'files', ...(text(rawTarget.folder) ? { folder: rawTarget.folder } : {}) };
+      else if (rawTarget.kind === 'canvas' && (!rawTarget.id || uuid(rawTarget.id))) target = { kind: 'canvas', ...(rawTarget.id ? { id: rawTarget.id } : {}) };
       else if (rawTarget.kind === 'file' && text(rawTarget.path) && rawTarget.path) target = { kind: 'file', path: rawTarget.path };
       else if (rawTarget.kind === 'changes' || rawTarget.kind === 'activity') target = { kind: rawTarget.kind };
       else if (rawTarget.kind === 'browser' && (!rawTarget.url || (text(rawTarget.url) && previewUrl(rawTarget.url)))) target = { kind: 'browser', ...(rawTarget.url ? { url: previewUrl(rawTarget.url)! } : {}) };
@@ -42,6 +43,7 @@ export function parseTaskView(raw: string): TaskViewMemory {
     return {
       panel: { open: value.panel?.open === true, content: { tabs, active: keys.has(active) ? active : null } },
       contextFiles: Array.isArray(value.contextFiles) ? [...new Set<string>(value.contextFiles.filter((path: unknown): path is string => text(path) && Boolean(path)))].slice(0, 20) : [],
+      ...(text(value.canvasContext, 4000) ? { canvasContext: value.canvasContext } : {}),
       ...(reading ? { reading: { top: position(reading.top), bottom: reading.bottom === true, ...(text(reading.anchor, 200) ? { anchor: reading.anchor } : {}), offset: typeof reading.offset === 'number' && Number.isFinite(reading.offset) ? reading.offset : 0 } } : {}),
     };
   } catch { return emptyTaskView(); }

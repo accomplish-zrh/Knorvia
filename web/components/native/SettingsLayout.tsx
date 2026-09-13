@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
-import { ArrowLeft, Bell, Gauge, Info, Keyboard, Menu, Palette, PlugZap, Search, Server, Settings2, X } from "lucide-react";
+import { ArrowLeft, Bell, DatabaseBackup, Download, Gauge, HardDrive, Info, Keyboard, Menu, Palette, PlugZap, Search, Server, Settings2, ShieldCheck, SquareTerminal, X, Zap } from "lucide-react";
 import { useDrawerFocus } from "./useDrawerFocus";
 import { useWorkbench } from "./NativeWorkbenchProvider";
 
@@ -15,6 +15,12 @@ export const settingSections = [
   { id: "connection", zh: "模型与连接", en: "Models and connection", group: "workspace", icon: PlugZap, keywords: "api 服务 密钥 模型 model key runtime provider 运行环境" },
   { id: "usage", zh: "用量", en: "Usage", group: "workspace", icon: Gauge, keywords: "token 用量 仪表盘 统计 usage dashboard model 模型 趋势 trend" },
   { id: "ssh", zh: "远程连接", en: "Remote connections", group: "workspace", icon: Server, keywords: "ssh sftp 服务器 终端 文件 远程 remote server" },
+  { id: "terminal", zh: "终端", en: "Terminal", group: "workspace", icon: SquareTerminal, keywords: "终端 shell 配置 默认 terminal profiles shell bash powershell" },
+  { id: "storage", zh: "资料库空间", en: "Library storage", group: "workspace", icon: HardDrive, keywords: "资料库 空间 回收站 历史版本 清理 library storage trash history cleanup disk 磁盘" },
+  { id: "update", zh: "更新", en: "Updates", group: "workspace", icon: Download, keywords: "更新 升级 下载 校验 安装包 version update upgrade download digest installer 新版本" },
+  { id: "backup", zh: "备份与恢复", en: "Backup and restore", group: "workspace", icon: DatabaseBackup, keywords: "备份 恢复 迁移 home backup restore migrate 迁移到新目录 数据" },
+  { id: "integrity", zh: "组件完整性", en: "Runtime integrity", group: "workspace", icon: ShieldCheck, keywords: "完整性 校验 组件 清单 integrity manifest tampered 被替换 混包 engine kernel" },
+  { id: "power", zh: "电源与长任务", en: "Power and long tasks", group: "personal", icon: Zap, keywords: "电源 休眠 唤醒 电池 长任务 power sleep awake battery prevent-app-suspension 防休眠" },
   { id: "about", zh: "关于 Knorvia", en: "About Knorvia", group: "workspace", icon: Info, keywords: "版本 version 工作台" },
 ];
 

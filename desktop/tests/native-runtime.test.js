@@ -5,7 +5,7 @@ const test = require('node:test');
 const { createNativeRuntime } = require('../native-runtime');
 
 function fixtureEngine({ active = false, prepareResult, prepareError, shutdownError } = {}) {
-  const state = { calls: [], shutdowns: 0, cancelledRestarts: 0, notification: null };
+  const state = { calls: [], shutdowns: 0, shutdownOptions: [], cancelledRestarts: 0, notification: null };
   return {
     state,
     rpc: async (method, params) => {
@@ -40,8 +40,9 @@ function fixtureEngine({ active = false, prepareResult, prepareError, shutdownEr
       state.notification = listener;
       return () => { state.notification = null; };
     },
-    shutdown: async () => {
+    shutdown: async options => {
       state.shutdowns += 1;
+      state.shutdownOptions.push(options);
       if (shutdownError && state.shutdowns === 1) throw shutdownError;
     },
   };
@@ -263,4 +264,14 @@ test('empty apiKey is an explicit clear while omission preserves the configured 
   } finally {
     await runtime.close();
   }
+});
+
+test('shutdown propagates an explicit zero remaining budget instead of restoring the default timeout', async () => {
+  const engine = fixtureEngine();
+  const runtime = await createNativeRuntime({
+    home: 'C:\\fixture-home', mode: 'browser', engineFactory: async () => engine,
+  });
+  const receipt = await runtime.close({ remainingMs: 0 });
+  assert.equal(receipt.confirmed, true);
+  assert.deepEqual(engine.state.shutdownOptions, [{ timeoutMs: 0 }]);
 });

@@ -278,6 +278,9 @@ impl ControlPlane {
                 source,
                 target,
                 params["expectedRevision"].as_u64(),
+                // B03 (night 2026-09-10): preview-then-execute needs the
+                // survivor's revision pinned, not just the source's.
+                params["expectedTargetRevision"].as_u64(),
                 params["actor"].as_str().unwrap_or("user"),
             )
             .map_err(memory_error)?;
@@ -435,14 +438,55 @@ impl ControlPlane {
     }
 
     pub(crate) fn rpc_memory_import(&self, params: &Value) -> Result<Value, ProtocolError> {
-        let bundle = params
-            .get("bundle")
-            .ok_or_else(|| invalid("bundle is required"))?;
-        let (created, applied, kept) = self
-            .memory()
-            .import(bundle, params["actor"].as_str().unwrap_or("user"))
-            .map_err(memory_error)?;
-        Ok(json!({ "created": created, "applied": applied, "kept": kept }))
+        let memory = self.memory();
+        let actor = params["actor"].as_str().unwrap_or("user");
+        let action = params["action"].as_str().unwrap_or("import");
+        let result = match action {
+            "receipt" => serde_json::to_value(
+                memory
+                    .import_receipt(required_str(params, "operationId")?)
+                    .map_err(memory_error)?,
+            ),
+            "resume" => serde_json::to_value(
+                memory
+                    .resume_import(required_str(params, "operationId")?)
+                    .map_err(memory_error)?,
+            ),
+            "plan" => serde_json::to_value(
+                memory
+                    .plan_import(
+                        params
+                            .get("bundle")
+                            .ok_or_else(|| invalid("bundle is required"))?,
+                    )
+                    .map_err(memory_error)?,
+            ),
+            "apply" => serde_json::to_value(
+                memory
+                    .apply_import(
+                        params
+                            .get("bundle")
+                            .ok_or_else(|| invalid("bundle is required"))?,
+                        required_str(params, "planHash")?,
+                        required_str(params, "operationId")?,
+                        actor,
+                    )
+                    .map_err(memory_error)?,
+            ),
+            "import" => {
+                let bundle = params
+                    .get("bundle")
+                    .ok_or_else(|| invalid("bundle is required"))?;
+                return serde_json::to_value(
+                    memory
+                        .import_with_receipt(bundle, actor)
+                        .map_err(memory_error)?,
+                )
+                .map_err(|e| invalid(e.to_string()));
+            }
+            _ => return Err(invalid("unknown memory import action")),
+        };
+        result.map_err(|e| invalid(e.to_string()))
     }
 }
 
@@ -469,6 +513,34 @@ mod memory_rpc_tests {
                 "clientToken": format!("{conversation}:{content}"),
             }))
             .unwrap()
+    }
+
+    #[test]
+    fn import_plan_apply_and_receipt_roundtrip_retains_original_operation() {
+        let plane = crate::tests::plane();
+        create(&plane, "g1", "original");
+        let bundle = plane
+            .rpc_memory_export(&json!({"scope":{"owner":"local"}}))
+            .unwrap();
+        let target = crate::tests::plane();
+        let plan = target
+            .rpc_memory_import(&json!({"action":"plan","bundle":bundle}))
+            .unwrap();
+        assert_eq!(plan["items"][0]["action"], "create");
+        let receipt=target.rpc_memory_import(&json!({"action":"apply","bundle":bundle,"planHash":plan["planHash"],"operationId":"rpc_import"})).unwrap();
+        assert_eq!(receipt["created"], 1);
+        assert_eq!(
+            target
+                .rpc_memory_import(&json!({"action":"receipt","operationId":"rpc_import"}))
+                .unwrap(),
+            receipt
+        );
+        assert_eq!(
+            target
+                .rpc_memory_import(&json!({"action":"resume","operationId":"rpc_import"}))
+                .unwrap(),
+            receipt
+        );
     }
 
     #[test]

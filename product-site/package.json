@@ -4,9 +4,9 @@
   "private": true,
   "description": "The static product website at knorvia.xyz",
   "scripts": {
-    "build": "node scripts/build.cjs",
+    "build": "node scripts/build-orbit.cjs",
     "preview": "node scripts/serve.cjs",
-    "check": "node scripts/check.cjs"
+    "check": "node scripts/check-orbit.cjs"
   },
   "dependencies": {
     "gsap": "3.13.0",

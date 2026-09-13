@@ -8,11 +8,12 @@ const os = require('node:os');
 const { createHash } = require('node:crypto');
 const { connectionError } = require('./connection-config');
 const { verifyResolvedPath } = require('./desktop-path-actions');
+const { createTerminalProfiles } = require('./terminal-profiles');
 
 const MAX_BUFFER = 512 * 1024;
 const MAX_READ = 32 * 1024;
 const MAX_INPUT = 16 * 1024;
-const METHODS = ['terminal/open', 'terminal/list', 'terminal/read', 'terminal/write', 'terminal/resize', 'terminal/close'];
+const METHODS = ['terminal/open', 'terminal/list', 'terminal/read', 'terminal/write', 'terminal/resize', 'terminal/close', 'terminal/profiles/list', 'terminal/profiles/default'];
 const fail = (code, message) => { throw connectionError(code, message); };
 
 function paramsFor(params, extras = [], session = true) {
@@ -35,9 +36,16 @@ function terminalEnvironment(env) {
   return { ...result, TERM: 'xterm-256color', COLORTERM: 'truecolor', TERM_PROGRAM: 'Knorvia' };
 }
 
-function createWorkspaceTerminal({ rpc, spawn, env = process.env, maxSessions = 24, maxPerThread = 8 } = {}) {
+function createWorkspaceTerminal({ rpc, spawn, env = process.env, home, profiles, maxSessions = 24, maxPerThread = 8, maxExitedPerThread = 4, maxExitedTotal = 32, exitedRetentionMs = 300_000, exitedBufferMax = 64 * 1024, disposeTimeoutMs = 5000 } = {}) {
   if (typeof rpc !== 'function') throw new Error('Terminal requires scoped daemon RPC');
+  // C18: shell choice comes from a host-managed profile directory; without
+  // the injected service (or an app Home to persist the preference) the
+  // platform default shell is used exactly as before.
+  const profileService = profiles ?? (home ? createTerminalProfiles({ home, env }) : undefined);
   const sessions = new Map();
+  let exitSeqCounter = 0;
+  // `live` counts only terminals still holding a PTY (running or closing), so
+  // quota is a resource count, not a record count.
   const live = new Set();
   // Closing also invalidates an in-flight open. A delayed retry cannot silently
   // start another shell after the user has closed its tab.
@@ -49,9 +57,39 @@ function createWorkspaceTerminal({ rpc, spawn, env = process.env, maxSessions = 
     closed.set(key, true);
     if (closed.size > 1024) closed.delete(closed.keys().next().value);
   }
+  // Exited terminals are kept as a bounded, expiring history: the newest
+  // exits stay readable (tail output + exit code) up to per-thread, global
+  // and time caps; eviction marks the key closed so cursors and retries get
+  // the same honest "session has ended" answer instead of a resurrection.
+  // `history` indexes the settled records because `sessions` stores promises.
+  const history = new Map();
+  function evictExited(key) {
+    history.delete(key);
+    sessions.delete(key);
+    rememberClosed(key);
+  }
+  function sweepExited(now = Date.now()) {
+    const all = [];
+    for (const [key, value] of history) {
+      if (now - value.exitedAt > exitedRetentionMs) evictExited(key);
+      else all.push([key, value]);
+    }
+    // Newest first: the most recent exits are the ones worth keeping.
+    // Newest first by a monotonic sequence (timestamps alone tie within a
+    // millisecond and would make eviction order nondeterministic).
+    all.sort((a, b) => b[1].exitSeq - a[1].exitSeq);
+    const perThread = new Map();
+    let total = 0;
+    for (const [key, value] of all) {
+      const count = perThread.get(value.threadId) ?? 0;
+      if (count >= maxExitedPerThread || total >= maxExitedTotal) evictExited(key);
+      else { perThread.set(value.threadId, count + 1); total += 1; }
+    }
+  }
   function describe(s) {
-    return { sessionId: s.sessionId, threadId: s.threadId, cwd: s.cwd, shell: s.shell, pid: s.pty.pid,
-      status: s.status, exitCode: s.exitCode, cols: s.cols, rows: s.rows, inputSeq: s.inputSeq,
+    return { sessionId: s.sessionId, threadId: s.threadId, cwd: s.cwd, shell: s.shell, profileId: s.profileId, pid: s.pty.pid,
+      status: s.status, exitCode: s.exitCode, exitedAt: s.exitedAt ? new Date(s.exitedAt).toISOString() : null,
+      cols: s.cols, rows: s.rows, inputSeq: s.inputSeq,
       platform: process.platform, windowsBuild: Number(os.release().split('.')[2]) || 0 };
   }
   async function find(p) {
@@ -61,27 +99,46 @@ function createWorkspaceTerminal({ rpc, spawn, env = process.env, maxSessions = 
     return s;
   }
   function stop(s) {
+    // A closing terminal still owns its PTY until the exit event confirms,
+    // so it keeps occupying the running quota for exactly that window.
     if (s.status === 'running') { s.pty.kill(); s.status = 'closing'; }
-    live.delete(s);
   }
+  // Quota reservations for opens that are still resolving their directory:
+  // without them, two concurrent opens both pass the check while `live` is
+  // still empty and the quota is bypassed. key -> threadId.
+  const pendingReservations = new Map();
+  const reservationsFor = threadId => { let n = 0; for (const tid of pendingReservations.values()) if (tid === threadId) n += 1; return n; };
   async function open(params) {
-    const p = paramsFor(params, ['cols', 'rows']); const size = dimensions(p); const key = keyOf(p);
+    const p = paramsFor(params, ['cols', 'rows', 'profileId']); const size = dimensions(p); const key = keyOf(p);
     if (disposed || closed.has(key)) fail(-32044, 'This terminal session has ended; open a new terminal');
     if (sessions.has(key)) return describe(await sessions.get(key));
-    if (sessions.size >= maxSessions || [...sessions.keys()].filter(k => inThread(k, p.threadId)).length >= maxPerThread) fail(-32045, 'Close an existing terminal before opening another');
+    sweepExited();
+    // Quota counts terminals that still hold a PTY (running or closing) plus
+    // in-flight reservations, so concurrent opens cannot slip past the cap.
+    if (live.size + pendingReservations.size >= maxSessions || ([...live].filter(s => s.threadId === p.threadId).length + reservationsFor(p.threadId)) >= maxPerThread) fail(-32045, 'Close an existing terminal before opening another');
+    pendingReservations.set(key, p.threadId);
+    try {
     const pending = (async () => {
       const scope = { threadId: p.threadId, path: '' };
       const resolved = verifyResolvedPath(await rpc('workspace/path/resolve', scope), scope);
       if (resolved.kind !== 'directory') fail(-32041, 'The task folder is not a directory');
       if (disposed || closed.has(key)) fail(-32044, 'This terminal session has ended');
       const windows = process.platform === 'win32';
-      const executable = windows ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : '/bin/bash';
+      // Shell selection (C18): a host-managed profile chosen by ID, the saved
+      // default, or the platform fallback. The renderer never names an
+      // executable; a selected profile that is not installed is an explicit
+      // error, never a silent switch to another shell.
+      let profile;
+      if (profileService) profile = profileService.resolve(p.profileId);
+      const executable = profile?.executable ?? (windows ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : '/bin/bash');
+      const args = profile?.args ?? (windows ? ['-NoLogo', '-NoProfile'] : ['--noprofile', '--norc']);
+      const shellLabel = profile?.name ?? (windows ? 'PowerShell' : 'Bash');
       const launch = spawn ?? require('node-pty').spawn;
       let pty;
-      try { pty = launch(executable, windows ? ['-NoLogo', '-NoProfile'] : ['--noprofile', '--norc'], {
+      try { pty = launch(executable, args, {
         ...size, name: 'xterm-256color', cwd: resolved.target, env: terminalEnvironment(env), useConpty: true, useConptyDll: true,
       }); } catch { fail(-32046, 'The local terminal could not start'); }
-      const s = { ...p, ...size, cwd: resolved.target, shell: windows ? 'PowerShell' : 'Bash', pty,
+      const s = { ...p, ...size, cwd: resolved.target, shell: shellLabel, profileId: profile?.id, pty,
         status: 'running', exitCode: null, buffer: '', offset: 0, inputSeq: 0, receipts: new Map() };
       live.add(s);
       pty.onData(data => {
@@ -92,15 +149,36 @@ function createWorkspaceTerminal({ rpc, spawn, env = process.env, maxSessions = 
           s.buffer = s.buffer.slice(trim); s.offset += trim;
         }
       });
-      pty.onExit(({ exitCode }) => { s.status = 'exited'; s.exitCode = exitCode; live.delete(s); });
+      pty.onExit(({ exitCode }) => {
+        s.status = 'exited'; s.exitCode = exitCode; s.exitedAt = Date.now(); s.exitSeq = ++exitSeqCounter;
+        // Shutdown confirmation (C15): the exit event releases this PTY from
+        // the pending-ownership set whatever dispose is waiting on.
+        pendingExit.delete(s);
+        // History keeps the recent tail only, so bounded retention can never
+        // add up to unbounded memory across many exited terminals.
+        if (s.buffer.length > exitedBufferMax) {
+          let trim = s.buffer.length - exitedBufferMax;
+          if (s.buffer.charCodeAt(trim) >= 0xDC00 && s.buffer.charCodeAt(trim) <= 0xDFFF) trim++;
+          s.buffer = s.buffer.slice(trim); s.offset += trim;
+        }
+        live.delete(s);
+        // A record the user already closed (or a host being disposed) never
+        // returns as readable history.
+        if (!closed.has(keyOf(s)) && !disposed) {
+          history.set(keyOf(s), s);
+          sweepExited();
+        }
+      });
       return s;
     })();
     sessions.set(key, pending);
     try { return describe(await pending); } catch (error) { sessions.delete(key); throw error; }
+    } finally { pendingReservations.delete(key); }
   }
   async function list(params) {
     const p = paramsFor(params, [], false);
     if (disposed) return [];
+    sweepExited();
     const entries = await Promise.allSettled([...sessions.entries()].filter(([key]) => inThread(key, p.threadId)).map(([, value]) => value));
     return entries.filter(entry => entry.status === 'fulfilled' && !closed.has(keyOf(entry.value))).map(entry => describe(entry.value));
   }
@@ -144,18 +222,88 @@ function createWorkspaceTerminal({ rpc, spawn, env = process.env, maxSessions = 
   }
   async function close(params) {
     const p = paramsFor(params); const key = keyOf(p); const pending = sessions.get(key);
-    rememberClosed(key); sessions.delete(key);
+    rememberClosed(key); sessions.delete(key); history.delete(key);
     if (pending) {
       let s; try { s = await pending; } catch { /* Open cancelled before spawn. */ }
       if (s) try { stop(s); } catch (error) { closed.delete(key); sessions.set(key, pending); throw error; }
     }
     return { closed: true };
   }
-  function dispose() {
-    if (disposed) return; disposed = true;
-    for (const s of live) { try { stop(s); } catch {} }
-    sessions.clear();
+  // C15 shutdown contract: kill() is issued synchronously for every PTY this
+  // service owns, so shutdown is confirmed; the owned pids travel with the
+  // result and the OS-level exit lands asynchronously via onExit.
+  // C15 shutdown contract: dispose() only reports confirmed once every owned
+  // PTY's exit event has actually been observed (bounded wait). "kill was
+  // called" or "callback has not arrived yet" is never success — unresolved
+  // terminals stay listed with their pids and reasons for C's shutdown
+  // controller, and a repeat dispose re-checks them instead of trusting the
+  // disposed flag.
+  const pendingExit = new Map();
+  function activePids() {
+    const pids = new Set();
+    for (const s of live) if (Number.isInteger(s.pty?.pid) && s.pty.pid > 0) pids.add(s.pty.pid);
+    for (const entry of pendingExit.values()) if (Number.isInteger(entry.pid) && entry.pid > 0) pids.add(entry.pid);
+    return [...pids];
   }
-  return { handlers: { 'terminal/open': open, 'terminal/list': list, 'terminal/read': read, 'terminal/write': write, 'terminal/resize': resize, 'terminal/close': close }, dispose };
+  async function drainPendingExit(context, timeoutMs) {
+    const clock = typeof context?.now === 'function' ? context.now : Date.now;
+    const deadline = Number.isFinite(context?.deadline) ? context.deadline : clock() + timeoutMs;
+    while (pendingExit.size && clock() < deadline && !context?.signal?.aborted) {
+      const delay = Math.min(25, Math.max(1, deadline - clock()));
+      await new Promise(resolve => {
+        let settled = false;
+        const finish = () => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          context?.signal?.removeEventListener('abort', finish);
+          resolve();
+        };
+        const timer = setTimeout(finish, delay);
+        timer.unref?.();
+        context?.signal?.addEventListener('abort', finish, { once: true });
+      });
+    }
+  }
+  async function dispose(context = {}) {
+    if (!disposed) {
+      disposed = true;
+      for (const s of live) {
+        const pid = Number.isInteger(s.pty?.pid) ? s.pty.pid : null;
+        const entry = { pid, reason: 'terminated by dispose' };
+        // Registered before the kill: a PTY whose exit event lands
+        // synchronously during stop() must end up released, not re-added.
+        pendingExit.set(s, entry);
+        try { stop(s); } catch (error) { entry.reason = `kill failed: ${error?.message || 'unknown error'}`; }
+      }
+      live.clear();
+      sessions.clear();
+      history.clear();
+      pendingReservations.clear();
+    }
+    const timeoutMs = Number.isFinite(context.remainingMs) ? Math.max(0, context.remainingMs) : disposeTimeoutMs;
+    await drainPendingExit(context, timeoutMs);
+    const unconfirmed = [...pendingExit.values()];
+    if (!unconfirmed.length) {
+      return { confirmed: true, ownedPids: [], detail: 'all owned PTYs confirmed exit' };
+    }
+    return {
+      confirmed: false,
+      ownedPids: unconfirmed.map(entry => entry.pid).filter(pid => pid !== null),
+      detail: `${unconfirmed.length} terminal(s) did not confirm exit within ${timeoutMs}ms: ${unconfirmed.map(entry => entry.reason).join('; ')}`,
+    };
+  }
+  // C18 profile directory: read-only detection plus the persisted default.
+  function profileCatalog() {
+    if (!profileService) return { available: false, profiles: [], defaultProfileId: undefined };
+    const detection = profileService.detect();
+    return { available: true, profiles: detection.profiles, defaultProfileId: detection.defaultProfileId, defaultMissing: detection.defaultMissing };
+  }
+  function setDefaultProfile(params) {
+    if (!profileService) fail(-32013, 'Terminal shell selection needs the host wiring; restart the app with the terminal profile directory');
+    if (!params || typeof params !== 'object' || Array.isArray(params)) fail(-32602, 'Terminal params must be an object');
+    return profileService.setDefault(params.profileId ?? null);
+  }
+  return { handlers: { 'terminal/open': open, 'terminal/list': list, 'terminal/read': read, 'terminal/write': write, 'terminal/resize': resize, 'terminal/close': close, 'terminal/profiles/list': async () => profileCatalog(), 'terminal/profiles/default': async params => setDefaultProfile(params) }, dispose, activePids };
 }
 module.exports = { createWorkspaceTerminal, METHODS, MAX_BUFFER, MAX_READ, MAX_INPUT, terminalEnvironment };
